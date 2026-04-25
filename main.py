@@ -909,12 +909,13 @@ async def debug_bankrupt(inn: str):
     return data
 
 @app.get("/debug/passport")
-async def debug_passport(series: str, number: str):
+async def debug_passport(series: str, number: str, lastname: str):
     params = {
         "method": "passport_mvd",
         "series": series.strip(),
         "seria": series.strip(),
         "number": number.strip(),
+        "lastname": lastname.strip(),
     }
 
     data = await newdb_post(params)
