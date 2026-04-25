@@ -43,10 +43,11 @@ async def newdb_post(params: dict) -> dict:
 # --- ФССП ---
 async def check_fssp(last: str, first: str, middle: str, dob: str, region: int):
     try:
+        # Внимание: в API newdb firstname = фамилия, lastname = имя (их специфика)
         params = {
             "method": "fssp_person",
-            "lastname": last,
-            "firstname": first,
+            "firstname": last,    # фамилия
+            "lastname": first,    # имя
             "regioncode": region if region else 0,
         }
         if middle:
