@@ -36,11 +36,28 @@ class PropertyRequest(BaseModel):
     address: str
 
 
+def fix_mojibake(text: str) -> str:
+    """
+    Исправляет частую проблему кодировки вида:
+    Р”РµР№СЃС‚РІРёС‚РµР»СЊРЅС‹Р№ -> Действительный
+    """
+    if not isinstance(text, str):
+        return ""
+
+    if "Р" not in text and "С" not in text:
+        return text
+
+    try:
+        return text.encode("latin1").decode("utf-8")
+    except Exception:
+        return text
+
+
 def safe_error(e: Exception) -> str:
     text = str(e)
     if NEWDB_TOKEN:
         text = text.replace(NEWDB_TOKEN, "***")
-    return text[:300]
+    return fix_mojibake(text)[:300]
 
 
 def convert_dob(dob: str) -> str:
@@ -139,7 +156,6 @@ async def check_fssp(last, first, middle, dob, region):
             params["dob"] = convert_dob(dob)
 
         data = await newdb_post(params)
-
         raw = data.get("results", {}).get("fssp_person", {}).get("result", {})
 
         if is_service_unavailable(raw):
@@ -167,7 +183,10 @@ async def check_fssp(last, first, middle, dob, region):
 
         for item in items:
             subject = item.get("SubjectAndDebtAmount", "") or ""
+            subject = fix_mojibake(subject)
+
             completed = item.get("CompletionDateOrReason", "") or ""
+            completed = fix_mojibake(completed)
 
             sums = re.findall(
                 r"Сумма долга:\s*([\d\s.,]+)\s*руб",
@@ -178,12 +197,12 @@ async def check_fssp(last, first, middle, dob, region):
             item_amount = sum(normalize_money(s) for s in sums)
 
             rec = {
-                "debtor": item.get("Debtor", ""),
-                "proceeding": item.get("EnforcementProceeding", ""),
-                "writ": item.get("WritDetails", ""),
+                "debtor": fix_mojibake(item.get("Debtor", "")),
+                "proceeding": fix_mojibake(item.get("EnforcementProceeding", "")),
+                "writ": fix_mojibake(item.get("WritDetails", "")),
                 "subject": subject,
-                "department": item.get("BailiffDepartment", ""),
-                "officer": item.get("BailiffOfficer", ""),
+                "department": fix_mojibake(item.get("BailiffDepartment", "")),
+                "officer": fix_mojibake(item.get("BailiffOfficer", "")),
                 "phone": item.get("Phone", ""),
                 "completed": completed,
                 "amount": item_amount,
@@ -253,7 +272,6 @@ async def check_bankrupt(inn):
         }
 
         data = await newdb_post(params)
-
         raw = data.get("results", {}).get("bankrot_person", {}).get("result", {})
 
         if is_service_unavailable(raw):
@@ -286,25 +304,25 @@ async def check_bankrupt(inn):
                 messages = bk.get("messages", []) or []
 
                 details.append({
-                    "name": common.get("name_or_fio", ""),
+                    "name": fix_mojibake(common.get("name_or_fio", "")),
                     "inn": common.get("inn", inn.strip()),
-                    "case": bk.get("case_number", ""),
+                    "case": fix_mojibake(bk.get("case_number", "")),
                     "case_url": bk.get("case_url", ""),
-                    "status": bk.get("status", ""),
-                    "address": common.get("address", ""),
+                    "status": fix_mojibake(bk.get("status", "")),
+                    "address": fix_mojibake(common.get("address", "")),
                     "details_url": common.get("details_url", ""),
                     "messages": [
                         {
-                            "type": m.get("type", ""),
-                            "info": m.get("message_info", ""),
+                            "type": fix_mojibake(m.get("type", "")),
+                            "info": fix_mojibake(m.get("message_info", "")),
                             "url": m.get("url", ""),
                         }
                         for m in messages[:10]
                     ],
                     "publications": [
                         {
-                            "title": p.get("title", ""),
-                            "date": p.get("number_date", ""),
+                            "title": fix_mojibake(p.get("title", "")),
+                            "date": fix_mojibake(p.get("number_date", "")),
                             "url": p.get("url", ""),
                         }
                         for p in publications[:5]
@@ -348,7 +366,6 @@ async def check_courts(last, first, middle):
         }
 
         data = await newdb_post(params)
-
         raw = data.get("results", {}).get("pravo_search", {}).get("result", {})
 
         if is_service_unavailable(raw):
@@ -380,21 +397,21 @@ async def check_courts(last, first, middle):
             person_roles = []
 
             for p in parties:
-                name = (p.get("party_name", "") or "").lower()
-                role = p.get("role_text", "") or ""
+                name = fix_mojibake(p.get("party_name", "") or "").lower()
+                role = fix_mojibake(p.get("role_text", "") or "")
 
                 if last_l in name and first_l in name and (not middle_l or middle_l in name):
                     person_roles.append(role)
 
             details.append({
-                "case_number": item.get("case_number", item.get("delo_case_number", "")),
-                "category": item.get("category_text", ""),
-                "result": item.get("result_text", ""),
-                "date": item.get("review_date", item.get("hearing_date", "")),
-                "region": item.get("region_name", ""),
+                "case_number": fix_mojibake(item.get("case_number", item.get("delo_case_number", ""))),
+                "category": fix_mojibake(item.get("category_text", "")),
+                "result": fix_mojibake(item.get("result_text", "")),
+                "date": fix_mojibake(item.get("review_date", item.get("hearing_date", ""))),
+                "region": fix_mojibake(item.get("region_name", "")),
                 "person_roles": person_roles,
                 "all_parties": [
-                    f"{p.get('party_name', '')} ({p.get('role_text', '')})"
+                    f"{fix_mojibake(p.get('party_name', ''))} ({fix_mojibake(p.get('role_text', ''))})"
                     for p in parties
                 ][:8],
                 "case_url": item.get("case_url", ""),
@@ -471,7 +488,6 @@ async def check_passport(series, number, last, first, middle, dob):
             params["dob"] = convert_dob(dob)
 
         data = await newdb_post(params)
-
         raw = data.get("results", {}).get("passport_mvd", {}).get("result", {})
 
         if is_service_unavailable(raw):
@@ -492,23 +508,26 @@ async def check_passport(series, number, last, first, middle, dob):
             result_data = {}
 
         valid = result_data.get("valid", result_data.get("is_valid"))
+
         status_raw = (
-            result_data.get("status")
+            result_data.get("doc_status")
+            or result_data.get("status")
             or result_data.get("message")
             or result_data.get("description")
             or ""
         )
 
-        status_l = str(status_raw).lower()
+        status_raw = fix_mojibake(str(status_raw))
+        status_l = status_raw.lower()
 
-        if valid is True or valid == 1 or "действител" in status_l and "недейств" not in status_l:
+        if valid is True or valid == 1 or ("действител" in status_l and "недейств" not in status_l):
             verdict = "Действителен"
             risk = "low"
         elif valid is False or valid == 0 or "недейств" in status_l:
             verdict = "Недействителен"
             risk = "high"
         elif status_raw:
-            verdict = str(status_raw)
+            verdict = status_raw
             risk = "medium"
         else:
             verdict = "Статус неизвестен"
@@ -547,7 +566,6 @@ async def check_pledge_person(last, first, middle, dob):
             params["dob"] = convert_dob(dob)
 
         data = await newdb_post(params)
-
         raw = data.get("results", {}).get("pledge_person", {}).get("result", {})
 
         if is_service_unavailable(raw):
@@ -571,21 +589,21 @@ async def check_pledge_person(last, first, middle, dob):
         for item in items:
             for f in (item.get("fnp", []) or []):
                 fnp_all.append({
-                    "type": f.get("message_type", ""),
-                    "pledgor": f.get("pledgor", ""),
-                    "pledgee": f.get("pledgee", ""),
-                    "date": f.get("message_number_and_date", ""),
-                    "subject": f.get("pledge_subject_ids_raw", ""),
+                    "type": fix_mojibake(f.get("message_type", "")),
+                    "pledgor": fix_mojibake(f.get("pledgor", "")),
+                    "pledgee": fix_mojibake(f.get("pledgee", "")),
+                    "date": fix_mojibake(f.get("message_number_and_date", "")),
+                    "subject": fix_mojibake(f.get("pledge_subject_ids_raw", "")),
                     "url": f.get("fnp_url", ""),
                 })
 
             for f in (item.get("fedresurs", []) or []):
                 fed_all.append({
-                    "type": f.get("message_type", ""),
-                    "date": f.get("message_number_and_date", ""),
-                    "lessee": f.get("lessee", ""),
-                    "lessor": f.get("lessor", ""),
-                    "subject": f.get("found_in_message", "")[:250],
+                    "type": fix_mojibake(f.get("message_type", "")),
+                    "date": fix_mojibake(f.get("message_number_and_date", "")),
+                    "lessee": fix_mojibake(f.get("lessee", "")),
+                    "lessor": fix_mojibake(f.get("lessor", "")),
+                    "subject": fix_mojibake(f.get("found_in_message", ""))[:250],
                     "url": f.get("message_url", ""),
                 })
 
@@ -630,7 +648,6 @@ async def check_terrorist(last, first, middle, dob):
             params["dob"] = convert_dob(dob)
 
         data = await newdb_post(params)
-
         raw = data.get("results", {}).get("terrorist", {}).get("result", {})
 
         if is_service_unavailable(raw):
@@ -653,6 +670,7 @@ async def check_terrorist(last, first, middle, dob):
             if isinstance(item, dict):
                 suggestions.extend(item.get("suggestions", []) or [])
 
+        suggestions = [fix_mojibake(str(s)) for s in suggestions]
         found = bool(suggestions)
 
         return {
@@ -683,7 +701,6 @@ async def check_rosreestr(address: str):
         }
 
         data = await newdb_post(params)
-
         raw = data.get("results", {}).get("rosreestr", {}).get("result", {})
 
         if is_service_unavailable(raw):
@@ -710,29 +727,29 @@ async def check_rosreestr(address: str):
             readable_address = address_obj.get("readableAddress", "") if isinstance(address_obj, dict) else ""
 
             objects.append({
-                "cad_number": obj.get("cadNumber", ""),
-                "address": readable_address or address.strip(),
+                "cad_number": fix_mojibake(obj.get("cadNumber", "")),
+                "address": fix_mojibake(readable_address or address.strip()),
                 "area": obj.get("area", ""),
-                "obj_type": obj.get("objType_text", ""),
-                "purpose": obj.get("purpose_text", ""),
-                "status": obj.get("status", ""),
-                "reg_date": obj.get("regDate", ""),
+                "obj_type": fix_mojibake(obj.get("objType_text", "")),
+                "purpose": fix_mojibake(obj.get("purpose_text", "")),
+                "status": fix_mojibake(obj.get("status", "")),
+                "reg_date": fix_mojibake(obj.get("regDate", "")),
                 "cad_cost": obj.get("cadCost", ""),
                 "floor": obj.get("levelFloor", ""),
                 "rights": [
                     {
-                        "type": r.get("rightTypeDesc", ""),
-                        "date": r.get("rightRegDate", ""),
-                        "number": r.get("rightNumber", ""),
+                        "type": fix_mojibake(r.get("rightTypeDesc", "")),
+                        "date": fix_mojibake(r.get("rightRegDate", "")),
+                        "number": fix_mojibake(r.get("rightNumber", "")),
                         "shared": r.get("sharedOwnershipType", False),
                     }
                     for r in rights
                 ],
                 "encumbrances": [
                     {
-                        "type": e.get("typeDesc", ""),
-                        "date": e.get("startDate", ""),
-                        "number": e.get("encumbranceNumber", ""),
+                        "type": fix_mojibake(e.get("typeDesc", "")),
+                        "date": fix_mojibake(e.get("startDate", "")),
+                        "number": fix_mojibake(e.get("encumbranceNumber", "")),
                     }
                     for e in encumbrances
                 ],
@@ -822,7 +839,6 @@ async def check_person(req: PersonRequest):
 @app.post("/check/property")
 async def check_property(req: PropertyRequest):
     rosreestr = await check_rosreestr(req.address)
-
     objects = rosreestr.get("objects", [])
 
     if not rosreestr.get("checked"):
@@ -901,12 +917,14 @@ async def debug_bankrupt(inn: str):
         "method": "bankrot_person",
         "innfiz": inn.strip(),
     }
+
     data = await newdb_post(params)
 
     if "balance" in data:
         data["balance"] = "***"
 
     return data
+
 
 @app.get("/debug/passport")
 async def debug_passport(
