@@ -909,14 +909,28 @@ async def debug_bankrupt(inn: str):
     return data
 
 @app.get("/debug/passport")
-async def debug_passport(series: str, number: str, lastname: str):
+async def debug_passport(
+    series: str,
+    number: str,
+    lastname: str,
+    firstname: str,
+    secondname: str = "",
+    dob: str = "",
+):
     params = {
         "method": "passport_mvd",
         "series": series.strip(),
         "seria": series.strip(),
         "number": number.strip(),
         "lastname": lastname.strip(),
+        "firstname": firstname.strip(),
     }
+
+    if secondname:
+        params["secondname"] = secondname.strip()
+
+    if dob:
+        params["dob"] = convert_dob(dob)
 
     data = await newdb_post(params)
 
