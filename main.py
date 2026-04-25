@@ -26,6 +26,8 @@ class CheckRequest(BaseModel):
     dob: str = ""
     inn: str = ""
     region: int = 0
+    passport_series: str = ""
+    passport_number: str = ""
 
 
 async def newdb_post(params: dict) -> dict:
@@ -39,14 +41,13 @@ async def newdb_post(params: dict) -> dict:
         "params": {**params, "country": "ru"},
         "requestId": request_id,
     }
-    # Для повторных запросов — только requestId без params
     poll_body = {"requestId": request_id}
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(NEWDB_URL, json=body, headers=headers)
         r.raise_for_status()
         data = r.json()
-        print(f"  Первый ответ: state={data.get('state')}")
+        print(f"  [{params.get('method')}] Первый ответ: state={data.get('state')}")
 
         attempts = 0
         while data.get("state") in ("queued", "processing", "in progress") and attempts < 15:
@@ -55,15 +56,24 @@ async def newdb_post(params: dict) -> dict:
             r2 = await client.post(NEWDB_URL, json=poll_body, headers=headers)
             r2.raise_for_status()
             data = r2.json()
-            print(f"  Попытка {attempts}: state={data.get('state')}")
+            print(f"  [{params.get('method')}] Попытка {attempts}: state={data.get('state')}")
 
         return data
+
+
+def convert_dob(dob: str) -> str:
+    """DD.MM.YYYY → YYYY-MM-DD"""
+    parts = dob.replace("-", ".").split(".")
+    if len(parts) == 3:
+        if len(parts[0]) == 4:
+            return dob
+        return f"{parts[2]}-{parts[1]}-{parts[0]}"
+    return dob
 
 
 # --- ФССП ---
 async def check_fssp(last: str, first: str, middle: str, dob: str, region: int):
     try:
-        # В API newdb: firstname = фамилия, lastname = имя (их специфика)
         params = {
             "method": "fssp_person",
             "firstname": last,
@@ -74,17 +84,12 @@ async def check_fssp(last: str, first: str, middle: str, dob: str, region: int):
         if region and region != 0:
             params["regioncode"] = region
         if dob:
-            parts = dob.replace("-", ".").split(".")
-            if len(parts) == 3:
-                params["dob"] = f"{parts[2]}-{parts[1]}-{parts[0]}" if len(parts[0]) != 4 else dob
+            params["dob"] = convert_dob(dob)
 
-        print(f"[FSSP] Запрос: {params}")
         data = await newdb_post(params)
-        print(f"[FSSP] Финальный state={data.get('state')}, balance={data.get('balance')}")
-
         raw = data.get("results", {}).get("fssp_person", {}).get("result", {})
-        print(f"[FSSP] Статус={raw.get('status')}, записей={len(raw.get('data', []))}")
         items = raw.get("data", [])
+        print(f"  [FSSP] Финал: state={data.get('state')}, записей={len(items)}")
 
         total = len(items)
         amount = 0.0
@@ -118,13 +123,13 @@ async def check_fssp(last: str, first: str, middle: str, dob: str, region: int):
             "source_url": "https://fssp.gov.ru/iss/ip",
         }
     except Exception as e:
-        print(f"[FSSP] Ошибка: {e}")
+        print(f"  [FSSP] Ошибка: {e}")
         return {"found": False, "count": 0, "amount": "—", "details": [], "risk": "low",
                 "source_url": "https://fssp.gov.ru/iss/ip", "error": str(e)}
 
 
 # --- Банкротство ---
-async def check_bankrupt(inn: str, last: str, first: str):
+async def check_bankrupt(inn: str):
     if not inn:
         return {
             "found": False, "count": 0, "details": [], "risk": "low",
@@ -143,19 +148,19 @@ async def check_bankrupt(inn: str, last: str, first: str):
             common = item.get("commmon", {})
             for bk in item.get("bankruptcy", []):
                 details.append({
-                    "name":       common.get("name_or_fio", ""),
-                    "inn":        common.get("inn", inn),
-                    "case":       bk.get("case_number", ""),
-                    "case_url":   bk.get("case_url", ""),
-                    "status":     bk.get("status", ""),
+                    "name":        common.get("name_or_fio", ""),
+                    "inn":         common.get("inn", inn),
+                    "case":        bk.get("case_number", ""),
+                    "case_url":    bk.get("case_url", ""),
+                    "status":      bk.get("status", ""),
                     "details_url": common.get("details_url", ""),
-                    "messages":   [m.get("type", "") + " — " + m.get("message_info", "") for m in bk.get("messages", [])[:5]],
+                    "messages":    [m.get("type", "") + " — " + m.get("message_info", "") for m in bk.get("messages", [])[:5]],
                 })
             if not item.get("bankruptcy") and common.get("name_or_fio"):
                 details.append({
-                    "name":   common.get("name_or_fio", ""),
-                    "inn":    common.get("inn", inn),
-                    "status": "Процедуры банкротства не найдены",
+                    "name":        common.get("name_or_fio", ""),
+                    "inn":         common.get("inn", inn),
+                    "status":      "Процедуры банкротства не найдены",
                     "details_url": common.get("details_url", ""),
                 })
 
@@ -168,48 +173,128 @@ async def check_bankrupt(inn: str, last: str, first: str):
             "source_url": "https://fedresurs.ru/",
         }
     except Exception as e:
-        print(f"[BANKRUPT] Ошибка: {e}")
+        print(f"  [BANKRUPT] Ошибка: {e}")
         return {"found": False, "count": 0, "details": [], "risk": "low",
                 "source_url": "https://fedresurs.ru/", "error": str(e)}
 
 
-# --- Суды ---
+# --- Суды (улучшенный поиск) ---
 async def check_courts(last: str, first: str, middle: str):
     try:
         fio = f"{last} {first} {middle}".strip()
-        params = {"method": "pravo_search", "query": fio, "limit": 20}
+
+        # Ищем дела где человек — участник (истец или ответчик)
+        params = {
+            "method": "pravo_search",
+            "party_name": fio,   # фильтр именно по участнику, не по тексту
+            "limit": 50,
+        }
         data = await newdb_post(params)
         raw = data.get("results", {}).get("pravo_search", {}).get("result", {})
         items = raw.get("data", [])
         meta = raw.get("meta", {})
+        print(f"  [COURTS] Финал: state={data.get('state')}, найдено={meta.get('count', len(items))}")
 
         details = []
         for item in items:
             parties = item.get("parties", [])
-            roles = [f"{p.get('party_name', '')} ({p.get('role_text', '')})" for p in parties]
+
+            # Определяем роль проверяемого человека в этом деле
+            person_roles = []
+            for p in parties:
+                name = p.get("party_name", "").lower()
+                if last.lower() in name and first.lower() in name:
+                    person_roles.append(p.get("role_text", ""))
+
+            all_parties = [f"{p.get('party_name', '')} ({p.get('role_text', '')})" for p in parties]
+
             details.append({
-                "case_number": item.get("case_number", item.get("delo_case_number", "")),
-                "category":    item.get("category_text", ""),
-                "judge":       item.get("judge_name", ""),
-                "result":      item.get("result_text", ""),
-                "date":        item.get("review_date", item.get("hearing_date", "")),
-                "region":      item.get("region_name", ""),
-                "parties":     roles,
-                "case_url":    item.get("case_url", ""),
+                "case_number":   item.get("case_number", item.get("delo_case_number", "")),
+                "category":      item.get("category_text", ""),
+                "judge":         item.get("judge_name", ""),
+                "result":        item.get("result_text", ""),
+                "date":          item.get("review_date", item.get("hearing_date", "")),
+                "region":        item.get("region_name", ""),
+                "person_roles":  person_roles,   # роль проверяемого
+                "all_parties":   all_parties,
+                "case_url":      item.get("case_url", ""),
             })
 
         total = meta.get("count", len(items))
+
+        # Считаем роли для сводки
+        as_defendant = sum(1 for d in details if any("ОТВЕТЧИК" in r for r in d.get("person_roles", [])))
+        as_plaintiff  = sum(1 for d in details if any("ИСТЕЦ" in r for r in d.get("person_roles", [])))
+
         return {
             "found": total > 0,
             "count": total,
-            "details": details[:10],
-            "risk": "medium" if total > 0 else "low",
+            "as_defendant": as_defendant,
+            "as_plaintiff": as_plaintiff,
+            "details": details[:15],
+            "risk": "high" if as_defendant >= 3 else "medium" if total > 0 else "low",
             "source_url": "https://sudrf.ru/",
         }
     except Exception as e:
-        print(f"[COURTS] Ошибка: {e}")
-        return {"found": False, "count": 0, "details": [], "risk": "low",
-                "source_url": "https://sudrf.ru/", "error": str(e)}
+        print(f"  [COURTS] Ошибка: {e}")
+        return {"found": False, "count": 0, "as_defendant": 0, "as_plaintiff": 0,
+                "details": [], "risk": "low", "source_url": "https://sudrf.ru/", "error": str(e)}
+
+
+# --- Проверка паспорта (МВД) ---
+async def check_passport(series: str, number: str):
+    if not series or not number:
+        return {
+            "checked": False,
+            "note": "Для проверки паспорта введите серию и номер",
+            "risk": "low",
+            "source_url": "https://мвд.рф/",
+        }
+    try:
+        params = {
+            "method": "passport_mvd",
+            "series": series.replace(" ", ""),
+            "number": number.replace(" ", ""),
+        }
+        data = await newdb_post(params)
+        raw = data.get("results", {}).get("passport_mvd", {}).get("result", {})
+        result_data = raw.get("data", {})
+        status = raw.get("status")
+        print(f"  [PASSPORT] Финал: state={data.get('state')}, status={status}")
+
+        # Интерпретируем результат
+        valid = result_data.get("valid", result_data.get("is_valid"))
+        note = result_data.get("message", result_data.get("description", ""))
+
+        if valid is True or valid == 1 or "действителен" in str(note).lower():
+            verdict = "Действителен"
+            risk = "low"
+        elif valid is False or valid == 0 or "недействителен" in str(note).lower():
+            verdict = "Недействителен"
+            risk = "high"
+        else:
+            verdict = "Статус неизвестен"
+            risk = "low"
+
+        return {
+            "checked": True,
+            "series": series,
+            "number": number,
+            "verdict": verdict,
+            "note": note,
+            "risk": risk,
+            "raw": result_data,
+            "source_url": "https://мвд.рф/",
+        }
+    except Exception as e:
+        print(f"  [PASSPORT] Ошибка: {e}")
+        return {
+            "checked": False,
+            "note": "Ошибка при проверке паспорта",
+            "risk": "low",
+            "source_url": "https://мвд.рф/",
+            "error": str(e),
+        }
 
 
 # --- Нотариат ---
@@ -229,23 +314,31 @@ async def check_notary(last: str, first: str, middle: str):
                 "manual_url": f"https://notariat.ru/ru-ru/help/probate-cases/search/?search={fio}",
             }
     except Exception as e:
-        return {"found": False, "note": "Недоступно", "risk": "low",
-                "source_url": "https://notariat.ru/",
-                "manual_url": f"https://notariat.ru/ru-ru/help/probate-cases/search/?search={last}+{first}",
-                "error": str(e)}
+        return {
+            "found": False, "note": "Недоступно", "risk": "low",
+            "source_url": "https://notariat.ru/",
+            "manual_url": f"https://notariat.ru/ru-ru/help/probate-cases/search/?search={last}+{first}",
+            "error": str(e),
+        }
 
 
 @app.post("/check")
 async def check(req: CheckRequest):
-    fssp, bankrupt, courts, notary = await asyncio.gather(
+    fssp, bankrupt, courts, notary, passport = await asyncio.gather(
         check_fssp(req.last, req.first, req.middle, req.dob, req.region),
-        check_bankrupt(req.inn, req.last, req.first),
+        check_bankrupt(req.inn),
         check_courts(req.last, req.first, req.middle),
         check_notary(req.last, req.first, req.middle),
+        check_passport(req.passport_series, req.passport_number),
     )
 
-    risks = [fssp.get("risk", "low"), bankrupt.get("risk", "low"),
-             courts.get("risk", "low"), notary.get("risk", "low")]
+    risks = [
+        fssp.get("risk", "low"),
+        bankrupt.get("risk", "low"),
+        courts.get("risk", "low"),
+        notary.get("risk", "low"),
+        passport.get("risk", "low"),
+    ]
     score = min(sum({"high": 35, "medium": 15, "low": 0}[r] for r in risks), 100)
 
     return {
@@ -256,9 +349,10 @@ async def check(req: CheckRequest):
         "bankrupt": bankrupt,
         "courts": courts,
         "notary": notary,
+        "passport": passport,
     }
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Person Check API v6"}
+    return {"status": "ok", "service": "Person Check API v7"}
