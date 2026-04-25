@@ -907,3 +907,19 @@ async def debug_bankrupt(inn: str):
         data["balance"] = "***"
 
     return data
+
+@app.get("/debug/passport")
+async def debug_passport(series: str, number: str):
+    params = {
+        "method": "passport_mvd",
+        "series": series.strip(),
+        "seria": series.strip(),
+        "number": number.strip(),
+    }
+
+    data = await newdb_post(params)
+
+    if "balance" in data:
+        data["balance"] = "***"
+
+    return data
