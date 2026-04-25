@@ -34,11 +34,9 @@ class CheckRequest(BaseModel):
 
 def safe_error(e: Exception) -> str:
     text = str(e)
-
     if NEWDB_TOKEN:
         text = text.replace(NEWDB_TOKEN, "***")
-
-    return text[:300]
+    return text[:500]
 
 
 async def newdb_post(params: dict) -> dict:
@@ -188,7 +186,7 @@ async def check_fssp(last: str, first: str, middle: str, dob: str, region: int):
         }
 
 
-async def check_bankrupt(inn: str):
+async def check_bankrupt(inn: str, last: str, first: str, middle: str, dob: str):
     if not inn:
         return {
             "checked": False,
@@ -197,7 +195,7 @@ async def check_bankrupt(inn: str):
             "details": [],
             "risk": "unknown",
             "source": "Федресурс",
-            "note": "Для проверки банкротства нужен ИНН",
+            "note": "Для проверки банкротства нужен ИНН физлица",
         }
 
     try:
@@ -211,36 +209,53 @@ async def check_bankrupt(inn: str):
         raw = data.get("results", {}).get("bankrot_person", {}).get("result", {})
         items = raw.get("data", [])
 
-        if not isinstance(items, list):
-            items = []
-
         details = []
 
-        for item in items:
-            common = item.get("common", item.get("commmon", {})) or {}
-            bankruptcies = item.get("bankruptcy", []) or []
+        if isinstance(items, list):
+            for item in items:
+                common = item.get("common", item.get("commmon", {})) or {}
+                bankruptcies = item.get("bankruptcy", []) or []
 
-            for bk in bankruptcies:
-                details.append({
-                    "name": common.get("name_or_fio", ""),
-                    "inn": common.get("inn", inn),
-                    "case": bk.get("case_number", ""),
-                    "status": bk.get("status", ""),
-                    "messages": [
-                        f"{m.get('type', '')} — {m.get('message_info', '')}"
-                        for m in bk.get("messages", [])[:5]
-                    ],
-                })
+                if isinstance(bankruptcies, dict):
+                    bankruptcies = [bankruptcies]
 
-        found = any(d.get("case") for d in details)
+                for bk in bankruptcies:
+                    messages = bk.get("messages", []) or []
+
+                    details.append({
+                        "name": common.get("name_or_fio", ""),
+                        "inn": common.get("inn", inn),
+                        "case": bk.get("case_number", ""),
+                        "status": bk.get("status", ""),
+                        "messages": [
+                            f"{m.get('type', '')} — {m.get('message_info', '')}"
+                            for m in messages[:5]
+                        ],
+                    })
+
+        found = any(
+            d.get("case") or d.get("status") or d.get("messages")
+            for d in details
+        )
+
+        if found:
+            return {
+                "checked": True,
+                "found": True,
+                "count": len(details),
+                "details": details[:20],
+                "risk": "high",
+                "source": "Федресурс",
+            }
 
         return {
             "checked": True,
-            "found": found,
-            "count": len(details),
-            "details": details[:20],
-            "risk": "high" if found else "low",
+            "found": False,
+            "count": 0,
+            "details": [],
+            "risk": "low",
             "source": "Федресурс",
+            "note": "По текущему парсеру банкротство не найдено. Диагностика NewDB: " + str(data)[:1800],
         }
 
     except Exception as e:
@@ -397,6 +412,7 @@ async def check_passport(series: str, number: str):
         else:
             verdict = "Статус неизвестен"
             risk = "medium"
+            note = "Источник не вернул однозначный статус паспорта. Требуется ручная проверка."
 
         return {
             "checked": True,
@@ -417,49 +433,14 @@ async def check_passport(series: str, number: str):
 
 
 async def check_notary(last: str, first: str, middle: str):
-    fio = f"{last} {first} {middle}".strip()
-
-    try:
-        url = "https://notariat.ru/ru-ru/help/probate-cases/search/"
-
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-        }
-
-        async with httpx.AsyncClient(
-            timeout=20,
-            headers=headers,
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(url, params={"search": fio})
-            response.raise_for_status()
-
-            page_text = response.text.lower()
-
-            found = (
-                "наследственное дело" in page_text
-                and "ничего не найдено" not in page_text
-                and "не найдено" not in page_text
-            )
-
-            return {
-                "checked": True,
-                "found": found,
-                "note": "Возможны наследственные дела — требуется ручная проверка" if found else "По автоматической проверке записей не найдено",
-                "requires_manual_check": True,
-                "risk": "medium" if found else "low",
-                "source": "Нотариат",
-            }
-
-    except Exception as e:
-        return {
-            "checked": False,
-            "found": False,
-            "note": f"Ошибка нотариат: {safe_error(e)}",
-            "requires_manual_check": True,
-            "risk": "unknown",
-            "source": "Нотариат",
-        }
+    return {
+        "checked": False,
+        "found": False,
+        "note": "Автоматическая проверка наследственных дел отключена. Требуется ручная проверка через официальный сервис Федеральной нотариальной палаты.",
+        "requires_manual_check": True,
+        "risk": "unknown",
+        "source": "Нотариат",
+    }
 
 
 def calculate_score(checks: list):
@@ -492,7 +473,7 @@ def calculate_score(checks: list):
 async def check(req: CheckRequest):
     fssp, bankrupt, courts, notary, passport = await asyncio.gather(
         check_fssp(req.last, req.first, req.middle, req.dob, req.region),
-        check_bankrupt(req.inn),
+        check_bankrupt(req.inn, req.last, req.first, req.middle, req.dob),
         check_courts(req.last, req.first, req.middle),
         check_notary(req.last, req.first, req.middle),
         check_passport(req.passport_series, req.passport_number),
