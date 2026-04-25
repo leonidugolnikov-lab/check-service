@@ -956,3 +956,17 @@ async def debug_passport(
         data["balance"] = "***"
 
     return data
+
+@app.get("/debug/rosreestr")
+async def debug_rosreestr(address: str):
+    params = {
+        "method": "rosreestr",
+        "address": address.strip(),
+    }
+
+    data = await newdb_post(params)
+
+    if "balance" in data:
+        data["balance"] = "***"
+
+    return data
