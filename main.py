@@ -358,3 +358,11 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok", "token_set": bool(NEWDB_TOKEN)}
+
+
+# Временный debug-эндпоинт — показывает сырой ответ newdb для банкротства
+@app.get("/debug/bankrupt/{inn}")
+async def debug_bankrupt(inn: str):
+    params = {"method": "bankrot_person", "innfiz": inn.strip()}
+    data = await newdb_post(params)
+    return data
