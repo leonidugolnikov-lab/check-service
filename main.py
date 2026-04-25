@@ -7,16 +7,17 @@ import uuid
 import re
 import os
 
+
 app = FastAPI(title="Person Check API")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST", "GET"],
+    allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "ВСТАВЬ_СЮДА_НОВЫЙ_ТОКЕН")
+NEWDB_TOKEN = os.getenv("NEWDB_TOKEN")
 NEWDB_URL = "https://api.newdb.net/v2"
 
 
@@ -31,7 +32,19 @@ class CheckRequest(BaseModel):
     passport_number: str = ""
 
 
+def safe_error(e: Exception) -> str:
+    text = str(e)
+
+    if NEWDB_TOKEN:
+        text = text.replace(NEWDB_TOKEN, "***")
+
+    return text[:300]
+
+
 async def newdb_post(params: dict) -> dict:
+    if not NEWDB_TOKEN:
+        raise Exception("NEWDB_TOKEN не задан в Render Environment Variables")
+
     headers = {
         "Content-Type": "application/json",
         "X-API-KEY": NEWDB_TOKEN,
@@ -40,25 +53,33 @@ async def newdb_post(params: dict) -> dict:
     request_id = str(uuid.uuid4())
 
     body = {
-        "params": {**params, "country": "ru"},
+        "params": {
+            **params,
+            "country": "ru",
+        },
         "requestId": request_id,
     }
 
-    poll_body = {"requestId": request_id}
+    poll_body = {
+        "requestId": request_id,
+    }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(NEWDB_URL, json=body, headers=headers)
-        r.raise_for_status()
-        data = r.json()
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(NEWDB_URL, json=body, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()
 
         attempts = 0
-        while data.get("state") in ("queued", "processing", "in progress") and attempts < 15:
+
+        while data.get("state") in ("queued", "processing", "in progress") and attempts < 20:
             await asyncio.sleep(3)
             attempts += 1
 
-            r2 = await client.post(NEWDB_URL, json=poll_body, headers=headers)
-            r2.raise_for_status()
-            data = r2.json()
+            poll_response = await client.post(NEWDB_URL, json=poll_body, headers=headers)
+            poll_response.raise_for_status()
+
+            data = poll_response.json()
 
         return data
 
@@ -67,6 +88,7 @@ def convert_dob(dob: str) -> str:
     if not dob:
         return ""
 
+    dob = dob.strip()
     parts = dob.replace("-", ".").split(".")
 
     if len(parts) == 3:
@@ -102,16 +124,25 @@ async def check_fssp(last: str, first: str, middle: str, dob: str, region: int):
             params["dob"] = convert_dob(dob)
 
         data = await newdb_post(params)
+
         raw = data.get("results", {}).get("fssp_person", {}).get("result", {})
         items = raw.get("data", [])
+
+        if not isinstance(items, list):
+            items = []
 
         total = len(items)
         amount = 0.0
         details = []
 
         for item in items:
-            subject_raw = item.get("SubjectAndDebtAmount", "")
-            sums = re.findall(r"Сумма долга:\s*([\d\s.,]+)\s*руб", subject_raw)
+            subject_raw = item.get("SubjectAndDebtAmount", "") or ""
+
+            sums = re.findall(
+                r"Сумма долга:\s*([\d\s.,]+)\s*руб",
+                subject_raw,
+                flags=re.IGNORECASE,
+            )
 
             for s in sums:
                 amount += normalize_money(s)
@@ -139,12 +170,12 @@ async def check_fssp(last: str, first: str, middle: str, dob: str, region: int):
             "found": total > 0,
             "count": total,
             "amount": f"{amount:,.0f} ₽".replace(",", " "),
-            "details": details,
+            "details": details[:20],
             "risk": risk,
             "source": "ФССП",
         }
 
-    except Exception:
+    except Exception as e:
         return {
             "checked": False,
             "found": False,
@@ -153,7 +184,7 @@ async def check_fssp(last: str, first: str, middle: str, dob: str, region: int):
             "details": [],
             "risk": "unknown",
             "source": "ФССП",
-            "note": "Проверка временно недоступна",
+            "note": f"Ошибка ФССП: {safe_error(e)}",
         }
 
 
@@ -176,14 +207,18 @@ async def check_bankrupt(inn: str):
         }
 
         data = await newdb_post(params)
+
         raw = data.get("results", {}).get("bankrot_person", {}).get("result", {})
         items = raw.get("data", [])
+
+        if not isinstance(items, list):
+            items = []
 
         details = []
 
         for item in items:
-            common = item.get("common", item.get("commmon", {}))
-            bankruptcies = item.get("bankruptcy", [])
+            common = item.get("common", item.get("commmon", {})) or {}
+            bankruptcies = item.get("bankruptcy", []) or []
 
             for bk in bankruptcies:
                 details.append({
@@ -203,12 +238,12 @@ async def check_bankrupt(inn: str):
             "checked": True,
             "found": found,
             "count": len(details),
-            "details": details,
+            "details": details[:20],
             "risk": "high" if found else "low",
             "source": "Федресурс",
         }
 
-    except Exception:
+    except Exception as e:
         return {
             "checked": False,
             "found": False,
@@ -216,7 +251,7 @@ async def check_bankrupt(inn: str):
             "details": [],
             "risk": "unknown",
             "source": "Федресурс",
-            "note": "Проверка временно недоступна",
+            "note": f"Ошибка Федресурс: {safe_error(e)}",
         }
 
 
@@ -231,9 +266,13 @@ async def check_courts(last: str, first: str, middle: str):
         }
 
         data = await newdb_post(params)
+
         raw = data.get("results", {}).get("pravo_search", {}).get("result", {})
         items = raw.get("data", [])
-        meta = raw.get("meta", {})
+        meta = raw.get("meta", {}) or {}
+
+        if not isinstance(items, list):
+            items = []
 
         details = []
 
@@ -242,12 +281,12 @@ async def check_courts(last: str, first: str, middle: str):
         middle_l = middle.lower().strip()
 
         for item in items:
-            parties = item.get("parties", [])
+            parties = item.get("parties", []) or []
             person_roles = []
 
             for p in parties:
-                name = p.get("party_name", "").lower()
-                role = p.get("role_text", "")
+                name = (p.get("party_name", "") or "").lower()
+                role = p.get("role_text", "") or ""
 
                 fio_match = (
                     last_l in name
@@ -270,7 +309,7 @@ async def check_courts(last: str, first: str, middle: str):
                 "date": item.get("review_date", item.get("hearing_date", "")),
                 "region": item.get("region_name", ""),
                 "person_roles": person_roles,
-                "all_parties": all_parties,
+                "all_parties": all_parties[:10],
             })
 
         total = meta.get("count", len(items))
@@ -303,7 +342,7 @@ async def check_courts(last: str, first: str, middle: str):
             "source": "Суды",
         }
 
-    except Exception:
+    except Exception as e:
         return {
             "checked": False,
             "found": False,
@@ -313,7 +352,7 @@ async def check_courts(last: str, first: str, middle: str):
             "details": [],
             "risk": "unknown",
             "source": "Суды",
-            "note": "Проверка временно недоступна",
+            "note": f"Ошибка суды: {safe_error(e)}",
         }
 
 
@@ -335,8 +374,15 @@ async def check_passport(series: str, number: str):
         }
 
         data = await newdb_post(params)
+
         raw = data.get("results", {}).get("passport_mvd", {}).get("result", {})
         result_data = raw.get("data", {})
+
+        if isinstance(result_data, list) and result_data:
+            result_data = result_data[0]
+
+        if not isinstance(result_data, dict):
+            result_data = {}
 
         valid = result_data.get("valid", result_data.get("is_valid"))
         note = result_data.get("message", result_data.get("description", ""))
@@ -360,13 +406,13 @@ async def check_passport(series: str, number: str):
             "source": "МВД",
         }
 
-    except Exception:
+    except Exception as e:
         return {
             "checked": False,
             "verdict": "Не удалось проверить",
             "risk": "unknown",
             "source": "МВД",
-            "note": "Проверка временно недоступна",
+            "note": f"Ошибка МВД: {safe_error(e)}",
         }
 
 
@@ -380,10 +426,15 @@ async def check_notary(last: str, first: str, middle: str):
             "User-Agent": "Mozilla/5.0",
         }
 
-        async with httpx.AsyncClient(timeout=15, headers=headers, follow_redirects=True) as client:
-            r = await client.get(url, params={"search": fio})
+        async with httpx.AsyncClient(
+            timeout=20,
+            headers=headers,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(url, params={"search": fio})
+            response.raise_for_status()
 
-            page_text = r.text.lower()
+            page_text = response.text.lower()
 
             found = (
                 "наследственное дело" in page_text
@@ -400,11 +451,11 @@ async def check_notary(last: str, first: str, middle: str):
                 "source": "Нотариат",
             }
 
-    except Exception:
+    except Exception as e:
         return {
             "checked": False,
             "found": False,
-            "note": "Проверка нотариата временно недоступна",
+            "note": f"Ошибка нотариат: {safe_error(e)}",
             "requires_manual_check": True,
             "risk": "unknown",
             "source": "Нотариат",
@@ -419,7 +470,10 @@ def calculate_score(checks: list):
         "unknown": 10,
     }
 
-    score = min(sum(weights.get(c.get("risk", "unknown"), 10) for c in checks), 100)
+    score = min(
+        sum(weights.get(c.get("risk", "unknown"), 10) for c in checks),
+        100,
+    )
 
     critical = any(c.get("risk") == "high" for c in checks)
     unknown_count = sum(1 for c in checks if c.get("risk") == "unknown")
@@ -472,4 +526,12 @@ def root():
     return {
         "status": "ok",
         "service": "Person Check API",
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "newdb_token_set": bool(NEWDB_TOKEN),
     }
