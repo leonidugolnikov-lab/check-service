@@ -37,10 +37,6 @@ class PropertyRequest(BaseModel):
 
 
 def fix_mojibake(text: str) -> str:
-    """
-    Исправляет частую проблему кодировки вида:
-    Р”РµР№СЃС‚РІРёС‚РµР»СЊРЅС‹Р№ -> Действительный
-    """
     if not isinstance(text, str):
         return ""
 
@@ -58,6 +54,12 @@ def safe_error(e: Exception) -> str:
     if NEWDB_TOKEN:
         text = text.replace(NEWDB_TOKEN, "***")
     return fix_mojibake(text)[:300]
+
+
+def clean_newdb_response(data: dict) -> dict:
+    if isinstance(data, dict) and "balance" in data:
+        data["balance"] = "***"
+    return data
 
 
 def convert_dob(dob: str) -> str:
@@ -81,22 +83,67 @@ def normalize_money(value: str) -> float:
         return 0.0
 
 
+def is_pending_state(data: dict) -> bool:
+    state = str(data.get("state", "")).lower().strip()
+    return state in ("queued", "processing", "in progress", "restart", "pending")
+
+
+def is_final_bad_state(data: dict) -> bool:
+    state = str(data.get("state", "")).lower().strip()
+    return state in ("timeout", "error", "failed", "cancelled", "canceled")
+
+
 def is_service_unavailable(raw: dict) -> bool:
+    if not isinstance(raw, dict):
+        return True
+
     status = raw.get("status")
     data = raw.get("data", [])
 
     if status and status != 200:
         return True
 
-    if isinstance(data, list) and data:
-        text = str(data[0]).lower()
-        if "unavailable" in text or "error" in text or "service is unavailable" in text:
-            return True
+    text = str(raw).lower()
+    bad_markers = [
+        "unavailable",
+        "service is unavailable",
+        "error",
+        "timeout",
+        "temporarily",
+        "недоступ",
+        "ошибка",
+        "таймаут",
+        "превышено время",
+    ]
+
+    return any(marker in text for marker in bad_markers)
+
+
+def looks_like_real_empty_result(raw: dict) -> bool:
+    """
+    True только когда источник реально ответил корректно,
+    но данных нет. Это важно для Росреестра:
+    пустота после timeout/in progress не должна быть 'объект не найден'.
+    """
+    if not isinstance(raw, dict):
+        return False
+
+    status = raw.get("status")
+    data = raw.get("data", None)
+
+    if status == 200 and isinstance(data, list) and len(data) == 0:
+        return True
 
     return False
 
 
-async def newdb_post(params: dict) -> dict:
+async def newdb_post(
+    params: dict,
+    *,
+    max_attempts: int = 25,
+    sleep_seconds: int = 3,
+    client_timeout: int = 120,
+) -> dict:
     if not NEWDB_TOKEN:
         raise Exception("NEWDB_TOKEN не задан в Render Environment Variables")
 
@@ -119,23 +166,30 @@ async def newdb_post(params: dict) -> dict:
         "requestId": request_id,
     }
 
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=client_timeout) as client:
         response = await client.post(NEWDB_URL, json=body, headers=headers)
         response.raise_for_status()
 
         data = response.json()
         attempts = 0
 
-        while data.get("state") in ("queued", "processing", "in progress", "restart") and attempts < 25:
-            await asyncio.sleep(3)
+        while is_pending_state(data) and attempts < max_attempts:
+            await asyncio.sleep(sleep_seconds)
             attempts += 1
 
             poll_response = await client.post(NEWDB_URL, json=poll_body, headers=headers)
             poll_response.raise_for_status()
-
             data = poll_response.json()
 
-        return data
+        if is_pending_state(data):
+            data["manual_check_required"] = True
+            data["manual_reason"] = "Источник не успел ответить за отведённое время"
+
+        if is_final_bad_state(data):
+            data["manual_check_required"] = True
+            data["manual_reason"] = f"Источник вернул состояние: {data.get('state')}"
+
+        return clean_newdb_response(data)
 
 
 async def check_fssp(last, first, middle, dob, region):
@@ -158,7 +212,7 @@ async def check_fssp(last, first, middle, dob, region):
         data = await newdb_post(params)
         raw = data.get("results", {}).get("fssp_person", {}).get("result", {})
 
-        if is_service_unavailable(raw):
+        if data.get("manual_check_required") or is_service_unavailable(raw):
             return {
                 "checked": False,
                 "found": False,
@@ -170,7 +224,7 @@ async def check_fssp(last, first, middle, dob, region):
                 "closed": [],
                 "risk": "unknown",
                 "source": "ФССП",
-                "note": "ФССП через API временно недоступен. Отсутствие результата не означает отсутствие исполнительных производств.",
+                "note": "ФССП не дал надежный автоматический ответ. Требуется ручная проверка.",
             }
 
         items = raw.get("data", []) or []
@@ -182,11 +236,8 @@ async def check_fssp(last, first, middle, dob, region):
         closed = []
 
         for item in items:
-            subject = item.get("SubjectAndDebtAmount", "") or ""
-            subject = fix_mojibake(subject)
-
-            completed = item.get("CompletionDateOrReason", "") or ""
-            completed = fix_mojibake(completed)
+            subject = fix_mojibake(item.get("SubjectAndDebtAmount", "") or "")
+            completed = fix_mojibake(item.get("CompletionDateOrReason", "") or "")
 
             sums = re.findall(
                 r"Сумма долга:\s*([\d\s.,]+)\s*руб",
@@ -274,7 +325,7 @@ async def check_bankrupt(inn):
         data = await newdb_post(params)
         raw = data.get("results", {}).get("bankrot_person", {}).get("result", {})
 
-        if is_service_unavailable(raw):
+        if data.get("manual_check_required") or is_service_unavailable(raw):
             return {
                 "checked": False,
                 "found": False,
@@ -282,7 +333,7 @@ async def check_bankrupt(inn):
                 "details": [],
                 "risk": "unknown",
                 "source": "Банкротство (ЕФРСБ)",
-                "note": "ЕФРСБ через API временно недоступен. Отсутствие результата не означает отсутствие банкротства.",
+                "note": "ЕФРСБ не дал надежный автоматический ответ. Требуется ручная проверка.",
                 "manual_url": f"https://fedresurs.ru/persons?q={inn.strip()}",
             }
 
@@ -368,7 +419,7 @@ async def check_courts(last, first, middle):
         data = await newdb_post(params)
         raw = data.get("results", {}).get("pravo_search", {}).get("result", {})
 
-        if is_service_unavailable(raw):
+        if data.get("manual_check_required") or is_service_unavailable(raw):
             return {
                 "checked": False,
                 "found": False,
@@ -378,7 +429,7 @@ async def check_courts(last, first, middle):
                 "details": [],
                 "risk": "unknown",
                 "source": "Судебные дела",
-                "note": "Судебный реестр через API временно недоступен.",
+                "note": "Судебный реестр не дал надежный автоматический ответ. Требуется ручная проверка.",
             }
 
         items = raw.get("data", []) or []
@@ -490,13 +541,13 @@ async def check_passport(series, number, last, first, middle, dob):
         data = await newdb_post(params)
         raw = data.get("results", {}).get("passport_mvd", {}).get("result", {})
 
-        if is_service_unavailable(raw):
+        if data.get("manual_check_required") or is_service_unavailable(raw):
             return {
                 "checked": False,
-                "verdict": "Не проверялся",
+                "verdict": "Требуется ручная проверка",
                 "risk": "unknown",
                 "source": "Паспорт МВД",
-                "note": "МВД через API временно недоступен. Требуется ручная проверка.",
+                "note": "МВД не дало надежный автоматический ответ.",
             }
 
         result_data = raw.get("data", {})
@@ -526,12 +577,15 @@ async def check_passport(series, number, last, first, middle, dob):
         elif valid is False or valid == 0 or "недейств" in status_l:
             verdict = "Недействителен"
             risk = "high"
+        elif "не найден" in status_l or "данные не найдены" in status_l:
+            verdict = "Данные не найдены. Требуется ручная проверка"
+            risk = "unknown"
         elif status_raw:
             verdict = status_raw
             risk = "medium"
         else:
-            verdict = "Статус неизвестен"
-            risk = "medium"
+            verdict = "Статус неизвестен. Требуется ручная проверка"
+            risk = "unknown"
 
         return {
             "checked": True,
@@ -568,7 +622,7 @@ async def check_pledge_person(last, first, middle, dob):
         data = await newdb_post(params)
         raw = data.get("results", {}).get("pledge_person", {}).get("result", {})
 
-        if is_service_unavailable(raw):
+        if data.get("manual_check_required") or is_service_unavailable(raw):
             return {
                 "checked": False,
                 "found": False,
@@ -576,7 +630,7 @@ async def check_pledge_person(last, first, middle, dob):
                 "fedresurs": [],
                 "risk": "unknown",
                 "source": "Залоги (ФНП + Федресурс)",
-                "note": "Реестр залогов через API временно недоступен.",
+                "note": "Реестр залогов не дал надежный автоматический ответ. Требуется ручная проверка.",
             }
 
         items = raw.get("data", []) or []
@@ -650,14 +704,14 @@ async def check_terrorist(last, first, middle, dob):
         data = await newdb_post(params)
         raw = data.get("results", {}).get("terrorist", {}).get("result", {})
 
-        if is_service_unavailable(raw):
+        if data.get("manual_check_required") or is_service_unavailable(raw):
             return {
                 "checked": False,
                 "found": False,
                 "suggestions": [],
                 "risk": "unknown",
                 "source": "Терроризм / ОМУ",
-                "note": "Реестр через API временно недоступен.",
+                "note": "Реестр не дал надежный автоматический ответ. Требуется ручная проверка.",
             }
 
         items = raw.get("data", []) or []
@@ -700,8 +754,35 @@ async def check_rosreestr(address: str):
             "address": address.strip(),
         }
 
-        data = await newdb_post(params)
+        data = await newdb_post(
+            params,
+            max_attempts=60,
+            sleep_seconds=5,
+            client_timeout=180,
+        )
+
         raw = data.get("results", {}).get("rosreestr", {}).get("result", {})
+
+        if data.get("manual_check_required"):
+            return {
+                "checked": False,
+                "found": False,
+                "objects": [],
+                "risk": "unknown",
+                "source": "Росреестр (ЕГРН)",
+                "note": "Росреестр не успел ответить. Требуется ручная проверка, а не вывод «объект не найден».",
+                "state": data.get("state", ""),
+            }
+
+        if not raw:
+            return {
+                "checked": False,
+                "found": False,
+                "objects": [],
+                "risk": "unknown",
+                "source": "Росреестр (ЕГРН)",
+                "note": "Росреестр вернул пустой технический ответ. Требуется ручная проверка.",
+            }
 
         if is_service_unavailable(raw):
             return {
@@ -710,18 +791,65 @@ async def check_rosreestr(address: str):
                 "objects": [],
                 "risk": "unknown",
                 "source": "Росреестр (ЕГРН)",
-                "note": "Росреестр через API временно недоступен.",
+                "note": "Росреестр через API временно недоступен. Требуется ручная проверка.",
             }
 
-        items = raw.get("data", []) or []
+        items = raw.get("data", None)
+
+        if items is None:
+            return {
+                "checked": False,
+                "found": False,
+                "objects": [],
+                "risk": "unknown",
+                "source": "Росреестр (ЕГРН)",
+                "note": "Росреестр не вернул поле data. Требуется ручная проверка.",
+            }
+
         if not isinstance(items, list):
-            items = []
+            return {
+                "checked": False,
+                "found": False,
+                "objects": [],
+                "risk": "unknown",
+                "source": "Росреестр (ЕГРН)",
+                "note": "Росреестр вернул неожиданный формат данных. Требуется ручная проверка.",
+            }
+
+        if len(items) == 0:
+            if looks_like_real_empty_result(raw):
+                return {
+                    "checked": True,
+                    "found": False,
+                    "objects": [],
+                    "risk": "unknown",
+                    "source": "Росреестр (ЕГРН)",
+                    "note": "По автоматическому ответу объект не найден. Перед юридическим выводом нужна ручная проверка по ЕГРН.",
+                }
+
+            return {
+                "checked": False,
+                "found": False,
+                "objects": [],
+                "risk": "unknown",
+                "source": "Росреестр (ЕГРН)",
+                "note": "Росреестр вернул пустой неоднозначный ответ. Требуется ручная проверка.",
+            }
 
         objects = []
 
         for obj in items:
+            if not isinstance(obj, dict):
+                continue
+
             encumbrances = obj.get("encumbrances", []) or []
             rights = obj.get("rights", []) or []
+
+            if not isinstance(encumbrances, list):
+                encumbrances = []
+
+            if not isinstance(rights, list):
+                rights = []
 
             address_obj = obj.get("address", {}) or {}
             readable_address = address_obj.get("readableAddress", "") if isinstance(address_obj, dict) else ""
@@ -744,6 +872,7 @@ async def check_rosreestr(address: str):
                         "shared": r.get("sharedOwnershipType", False),
                     }
                     for r in rights
+                    if isinstance(r, dict)
                 ],
                 "encumbrances": [
                     {
@@ -752,15 +881,26 @@ async def check_rosreestr(address: str):
                         "number": fix_mojibake(e.get("encumbranceNumber", "")),
                     }
                     for e in encumbrances
+                    if isinstance(e, dict)
                 ],
                 "has_encumbrances": len(encumbrances) > 0,
             })
+
+        if not objects:
+            return {
+                "checked": False,
+                "found": False,
+                "objects": [],
+                "risk": "unknown",
+                "source": "Росреестр (ЕГРН)",
+                "note": "Росреестр вернул данные, но объект не удалось разобрать. Требуется ручная проверка.",
+            }
 
         enc_total = sum(len(o.get("encumbrances", [])) for o in objects)
 
         return {
             "checked": True,
-            "found": bool(objects),
+            "found": True,
             "objects": objects,
             "encumbrances_total": enc_total,
             "risk": "high" if enc_total > 0 else "low",
@@ -849,18 +989,21 @@ async def check_property(req: PropertyRequest):
             "level": "unknown",
             "score": 10,
             "source": rosreestr.get("source", "Росреестр"),
-            "note": rosreestr.get("note", "Росреестр временно недоступен"),
+            "note": rosreestr.get("note", "Росреестр не дал надежный ответ. Требуется ручная проверка."),
         }
 
     if not objects:
         return {
             "checked": True,
             "found": False,
-            "risk": "low",
-            "level": "low",
-            "score": 0,
+            "risk": "unknown",
+            "level": "unknown",
+            "score": 10,
             "source": "Росреестр (ЕГРН)",
-            "note": "Объект не найден по указанному адресу или кадастровому номеру",
+            "note": rosreestr.get(
+                "note",
+                "Объект не найден автоматически. Перед выводом требуется ручная проверка по ЕГРН.",
+            ),
         }
 
     obj = objects[0]
@@ -919,11 +1062,7 @@ async def debug_bankrupt(inn: str):
     }
 
     data = await newdb_post(params)
-
-    if "balance" in data:
-        data["balance"] = "***"
-
-    return data
+    return clean_newdb_response(data)
 
 
 @app.get("/debug/passport")
@@ -951,11 +1090,8 @@ async def debug_passport(
         params["dob"] = convert_dob(dob)
 
     data = await newdb_post(params)
+    return clean_newdb_response(data)
 
-    if "balance" in data:
-        data["balance"] = "***"
-
-    return data
 
 @app.get("/debug/rosreestr")
 async def debug_rosreestr(address: str):
@@ -964,9 +1100,11 @@ async def debug_rosreestr(address: str):
         "address": address.strip(),
     }
 
-    data = await newdb_post(params)
+    data = await newdb_post(
+        params,
+        max_attempts=60,
+        sleep_seconds=5,
+        client_timeout=180,
+    )
 
-    if "balance" in data:
-        data["balance"] = "***"
-
-    return data
+    return clean_newdb_response(data)
