@@ -1,5 +1,6 @@
 
 from fastapi import FastAPI, Request
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import httpx, asyncio, uuid, os, re, json, base64, html
@@ -53,6 +54,33 @@ DISCLAIMER = (
     "Отчет носит информационно-аналитический характер, не является гарантией полной юридической "
     "безопасности сделки и не заменяет ручную юридическую проверку документов специалистом."
 )
+
+# --------------------------
+# Request model for Swagger
+# --------------------------
+
+class CheckRequest(BaseModel):
+    last: str = ""
+    first: str = ""
+    middle: str = ""
+    dob: str = ""
+    inn: str = ""
+    seller_inn: str = ""
+    inn_fiz: str = ""
+    innfiz: str = ""
+    innfl: str = ""
+    passport_series: str = ""
+    passport_number: str = ""
+    passport_seria: str = ""
+    passport_num: str = ""
+    seria: str = ""
+    number: str = ""
+    region: int = 78
+    regioncode: int = 78
+    cadastral_number: str = ""
+    cadastre_number: str = ""
+    cadnum: str = ""
+    address: str = ""
 
 # --------------------------
 # Basic helpers
@@ -1050,8 +1078,8 @@ async def health():
     }
 
 @app.post("/debug-newdb")
-async def debug_newdb(request: Request):
-    raw = await request.json()
+async def debug_newdb(request: CheckRequest):
+    raw = request.model_dump()
     inp = normalize_input(raw)
     payloads, responses = await run_checks(inp)
     checklist = classify_all(inp, responses)
@@ -1074,9 +1102,9 @@ async def debug_newdb(request: Request):
     }
 
 @app.post("/check-report")
-async def check_report(request: Request):
+async def check_report(request: CheckRequest):
     try:
-        raw = await request.json()
+        raw = request.model_dump()
         inp = normalize_input(raw)
         payloads, responses = await run_checks(inp)
         checklist = classify_all(inp, responses)
