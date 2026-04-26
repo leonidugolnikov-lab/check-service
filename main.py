@@ -384,8 +384,18 @@ def normalize_property(req: CheckRequest) -> Dict[str, str]:
 # NEWDB CLIENT
 # -----------------------------
 async def newdb_post(params: Dict[str, Any], max_wait: int = 90, poll_interval: int = 5) -> Dict[str, Any]:
+    """
+    Отправляет задачу в NewDB и дожидается финального результата.
+
+    requestId/newdb_qid нельзя чистить до polling. Наружу они не попадут:
+    чистка выполняется только при формировании публичного ответа/PDF.
+    """
     if not NEWDB_TOKEN:
-        return {"state": "not_configured", "error": "Источник не настроен. Требуется ручная проверка.", "sent_params": strip_sensitive(params)}
+        return {
+            "state": "not_configured",
+            "error": "Источник не настроен. Требуется ручная проверка.",
+            "sent_params": strip_sensitive(params),
+        }
 
     headers = {
         "Accept": "application/json",
@@ -399,11 +409,14 @@ async def newdb_post(params: Dict[str, Any], max_wait: int = 90, poll_interval: 
         try:
             first = await client.post(NEWDB_URL, headers=headers, json=payload)
             data = _safe_response_json(first)
-            data = strip_sensitive(data)
             data["http_status"] = first.status_code
             data["sent_params"] = strip_sensitive(params)
         except Exception as e:
-            return {"state": "error", "error": f"Ошибка связи с источником: {e}", "sent_params": strip_sensitive(params)}
+            return {
+                "state": "error",
+                "error": f"Ошибка связи с источником: {e}",
+                "sent_params": strip_sensitive(params),
+            }
 
         if first.status_code >= 400 or is_bad_response(data):
             data["state"] = data.get("state") or "error"
@@ -434,6 +447,8 @@ async def newdb_post(params: Dict[str, Any], max_wait: int = 90, poll_interval: 
                 ("GET", NEWDB_URL, {"newdb_qid": request_id}, None),
                 ("POST", NEWDB_URL, None, {"params": {"newdb_qid": request_id}}),
                 ("POST", NEWDB_URL, None, {"params": {"requestId": request_id}}),
+                ("POST", NEWDB_URL, None, {"params": {**params, "newdb_qid": request_id}}),
+                ("POST", NEWDB_URL, None, {"params": {**params, "requestId": request_id}}),
             ]
 
             for method, url, query, body in poll_attempts:
@@ -445,8 +460,8 @@ async def newdb_post(params: Dict[str, Any], max_wait: int = 90, poll_interval: 
 
                     if resp.status_code >= 500:
                         continue
+
                     polled = _safe_response_json(resp)
-                    polled = strip_sensitive(polled)
                     polled["http_status"] = resp.status_code
                     polled["sent_params"] = strip_sensitive(params)
                     last_data = polled
@@ -455,9 +470,14 @@ async def newdb_post(params: Dict[str, Any], max_wait: int = 90, poll_interval: 
                         continue
                     if is_bad_response(polled):
                         return polled
+
                     pst = state_of(polled)
                     if pst in IN_PROGRESS_STATES:
+                        new_id = find_request_id(polled)
+                        if new_id:
+                            request_id = new_id
                         continue
+
                     if pst in GOOD_STATES or has_meaningful_data(polled) or has_negative_empty_marker(polled):
                         return polled
                 except Exception:
