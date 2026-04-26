@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, Any
 import httpx
 import uuid
@@ -10,6 +10,7 @@ import io
 import re
 import json
 import html
+import asyncio
 
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -54,27 +55,30 @@ def only_digits(value: str) -> str:
 
 def dob_to_iso(value: str) -> str:
     value = (value or "").strip()
+
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         return value
+
     m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", value)
     if m:
         return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+
     return value
 
 
-def clean_none(value: Any) -> Any:
-    if value is None:
-        return ""
-    return value
+def strip_sensitive_newdb(data: Any) -> Any:
+    if isinstance(data, dict):
+        cleaned = {}
+        for key, value in data.items():
+            if key.lower() in {"balance", "token", "api_key", "x-api-key"}:
+                continue
+            cleaned[key] = strip_sensitive_newdb(value)
+        return cleaned
 
+    if isinstance(data, list):
+        return [strip_sensitive_newdb(item) for item in data]
 
-def strip_sensitive_newdb(data: dict) -> dict:
-    if not isinstance(data, dict):
-        return {}
-    cleaned = dict(data)
-    cleaned.pop("balance", None)
-    cleaned.pop("token", None)
-    return cleaned
+    return data
 
 
 async def newdb_request(params: dict, timeout_seconds: int = 90) -> dict:
@@ -114,12 +118,10 @@ async def newdb_request(params: dict, timeout_seconds: int = 90) -> dict:
         if state in ["complete", "completed", "done", "success"]:
             return first_data
 
-        # Получаем результат по requestId
         for _ in range(18):
-            try:
-                await_sleep = __import__("asyncio").sleep
-                await await_sleep(5)
+            await asyncio.sleep(5)
 
+            try:
                 r = await client.get(
                     NEWDB_DATA_URL,
                     params={
@@ -155,17 +157,33 @@ async def newdb_request(params: dict, timeout_seconds: int = 90) -> dict:
 
 
 def result_data(newdb_response: dict, method: str) -> list:
-    try:
-        data = (
-            newdb_response
-            .get("results", {})
-            .get(method, {})
-            .get("result", {})
-            .get("data", [])
-        )
-        return data if isinstance(data, list) else []
-    except Exception:
+    if not isinstance(newdb_response, dict):
         return []
+
+    possible_paths = [
+        ["results", method, "result", "data"],
+        ["results", method, "data"],
+        ["result", "data"],
+        ["data"],
+    ]
+
+    for path in possible_paths:
+        current = newdb_response
+        ok = True
+        for part in path:
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                ok = False
+                break
+
+        if ok:
+            if isinstance(current, list):
+                return current
+            if isinstance(current, dict):
+                return [current]
+
+    return []
 
 
 def any_data_found(items: list) -> bool:
@@ -177,9 +195,11 @@ def any_data_found(items: list) -> bool:
     negative_markers = [
         "данные не найдены",
         "не найдено",
+        "не найдена",
         "not found",
         "no data",
         "ничего не найдено",
+        "отсутствуют",
     ]
 
     if any(marker in text for marker in negative_markers):
@@ -207,15 +227,16 @@ def passport_summary(items: list) -> str:
         return "данные не найдены или требуется ручная проверка"
 
     text = json.dumps(items, ensure_ascii=False)
+    low = text.lower()
 
-    if "Действител" in text or "действител" in text:
+    if "недействител" in low:
+        return "паспорт недействителен"
+
+    if "действител" in low:
         return "паспорт действителен"
 
-    if "Данные не найдены" in text or "данные не найдены" in text:
+    if "данные не найдены" in low or "не найдено" in low:
         return "данные не найдены, требуется ручная проверка"
-
-    if "Недействител" in text or "недействител" in text:
-        return "паспорт недействителен"
 
     return "получен ответ, требуется ручная интерпретация"
 
@@ -231,11 +252,8 @@ async def run_all_newdb_checks(req: CheckRequest) -> dict:
     cadastre = (req.cadastre_number or "").strip()
     address = (req.address or "").strip()
 
-    checks = {}
-
     tasks = []
 
-    # 1. Паспорт МВД
     if passport_series and passport_number:
         tasks.append((
             "passport",
@@ -253,7 +271,6 @@ async def run_all_newdb_checks(req: CheckRequest) -> dict:
             }
         ))
 
-    # 2. ФССП
     if last and first and dob_iso:
         fssp_params = {
             "method": "fssp_person",
@@ -267,7 +284,6 @@ async def run_all_newdb_checks(req: CheckRequest) -> dict:
             fssp_params["regioncode"] = req.region
         tasks.append(("fssp", "fssp_person", fssp_params))
 
-    # 3. Залоги физлица
     if last and first and dob_iso:
         tasks.append((
             "pledges_person",
@@ -282,7 +298,6 @@ async def run_all_newdb_checks(req: CheckRequest) -> dict:
             }
         ))
 
-    # 4. Арбитражные дела ИП по ИНН
     if inn:
         tasks.append((
             "arbitration",
@@ -294,7 +309,6 @@ async def run_all_newdb_checks(req: CheckRequest) -> dict:
             }
         ))
 
-    # 5. Комплексная проверка по паспорту — часто полезна для банкротства/доп. источников
     if passport_series and passport_number and last and first and dob_iso:
         tasks.append((
             "complex",
@@ -302,6 +316,7 @@ async def run_all_newdb_checks(req: CheckRequest) -> dict:
             {
                 "method": "complex_by_passport",
                 "seria": passport_series,
+                "series": passport_series,
                 "number": passport_number,
                 "lastname": last,
                 "firstname": first,
@@ -311,12 +326,12 @@ async def run_all_newdb_checks(req: CheckRequest) -> dict:
             }
         ))
 
-    # 6. Росреестр
     if cadastre or address:
         rosreestr_params = {
             "method": "rosreestr",
             "country": "ru",
         }
+
         if cadastre:
             rosreestr_params["address"] = cadastre
             rosreestr_params["cadnum"] = cadastre
@@ -325,8 +340,6 @@ async def run_all_newdb_checks(req: CheckRequest) -> dict:
             rosreestr_params["address"] = address
 
         tasks.append(("rosreestr", "rosreestr", rosreestr_params))
-
-    import asyncio
 
     async def run_one(name: str, method: str, params: dict):
         response = await newdb_request(params)
@@ -337,9 +350,12 @@ async def run_all_newdb_checks(req: CheckRequest) -> dict:
         return_exceptions=True
     )
 
+    checks = {}
+
     for item in results:
         if isinstance(item, Exception):
             continue
+
         name, method, response = item
         checks[name] = {
             "method": method,
@@ -358,6 +374,7 @@ def build_risk_score(checks: dict) -> dict:
 
     passport_items = checks.get("passport", {}).get("data", [])
     passport_text = passport_summary(passport_items)
+
     if "недействителен" in passport_text:
         high += 1
         notes.append("Паспорт имеет признак недействительности.")
@@ -406,7 +423,8 @@ def build_risk_score(checks: dict) -> dict:
         medium += 1
         notes.append("Объект Росреестра не найден или требуется ручная проверка.")
     else:
-        if any(word in rosreestr_text for word in ["арест", "запрет", "ипотека", "обремен", "огранич"]):
+        risk_words = ["арест", "запрет", "ипотека", "обремен", "огранич", "залог"]
+        if any(word in rosreestr_text for word in risk_words):
             high += 1
             notes.append("В данных Росреестра есть признаки обременений/ограничений.")
 
@@ -615,7 +633,6 @@ def fallback_report(summary: dict) -> str:
 
 async def generate_ai_report(summary: dict, checks: dict) -> str:
     token = await get_gigachat_token()
-
     raw_checks = compact_raw_for_prompt(checks)
 
     if not token:
@@ -771,7 +788,6 @@ async def check_report_pdf(req: CheckRequest):
     )
 
 
-# Совместимость со старыми названиями endpoints
 @app.post("/generate-ai-report")
 async def generate_ai_report_alias(req: CheckRequest):
     return await check_report(req)
