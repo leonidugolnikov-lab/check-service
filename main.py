@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -63,6 +63,7 @@ class CheckRequest(BaseModel):
     passport_number: str = ""
     property_type: str = ""
     cadastral_number: str = ""
+    cadastre_number: str = ""  # поддержка старого имени поля из HTML
     address: str = ""
 
 
@@ -126,6 +127,10 @@ def source_failed(data) -> bool:
         "access@newdb.net",
         "недостаточно средств",
         "баланс",
+        "обязательного параметра",
+        "не заполнено значение",
+        "400",
+        "bad request",
     ]
     return any(marker in text for marker in failed_markers)
 
@@ -139,6 +144,8 @@ def safe_error_details(data) -> list:
         return ["Источник проверки не вернул данные: нужно проверить баланс/доступ NewDB и повторить запрос."]
     if "токен" in text or "x-api-key" in text or "unauthorized" in text or "forbidden" in text:
         return ["Источник проверки не вернул данные: нужно проверить токен доступа NewDB."]
+    if "обязательного параметра" in text or "не заполнено значение" in text or "400" in text:
+        return ["Источник проверки не принял запрос: не передан адрес или кадастровый номер. Проверьте поле объекта и повторите запрос."]
     if data.get("error"):
         return [clean_text(data.get("error"))]
     if clean_text(data.get("state")).lower() == "timeout":
@@ -761,8 +768,9 @@ async def root():
 
 
 @app.post("/check-report")
-async def check_report(req: CheckRequest):
-    prop = normalize_property(req.address, req.cadastral_number)
+async def check_report(req: CheckRequest, request: Request):
+    cad_value = req.cadastral_number or req.cadastre_number
+    prop = normalize_property(req.address, cad_value)
 
     # Методы NewDB могут отличаться по тарифу/аккаунту.
     # Если конкретное имя метода у тебя в Swagger другое — замени только method.
@@ -819,14 +827,23 @@ async def check_report(req: CheckRequest):
         "country": "ru",
     }
 
-    passport_raw, fssp_raw, bankruptcy_raw, pledges_raw, courts_raw, egrn_raw = await asyncio.gather(
+    base_tasks = [
         newdb_post(passport_params, max_wait=45, poll_interval=3),
         newdb_post(fssp_params, max_wait=60, poll_interval=3),
         newdb_post(bankruptcy_params, max_wait=60, poll_interval=3),
         newdb_post(pledges_params, max_wait=60, poll_interval=3),
         newdb_post(courts_params, max_wait=60, poll_interval=3),
-        newdb_post(egrn_params, max_wait=180, poll_interval=5),  # Росреестр ждем дольше
-    )
+    ]
+
+    if prop["query"]:
+        base_tasks.append(newdb_post(egrn_params, max_wait=180, poll_interval=5))  # Росреестр ждем дольше
+    else:
+        base_tasks.append({
+            "state": "manual",
+            "error": "Не указан адрес или кадастровый номер объекта",
+        })
+
+    passport_raw, fssp_raw, bankruptcy_raw, pledges_raw, courts_raw, egrn_raw = await asyncio.gather(*base_tasks)
 
     checklist = [
         classify_passport(passport_raw),
@@ -866,7 +883,8 @@ async def check_report(req: CheckRequest):
         "registry_results": registry_results,
         "checklist": checklist,
         "legal_report": legal_report,
-        "pdf_url": f"/download-pdf/{report_id}",
+        "pdf_url": str(request.base_url).rstrip("/") + f"/download-pdf/{report_id}",
+        "pdf_relative_url": f"/download-pdf/{report_id}",
     }
 
 
@@ -883,4 +901,5 @@ async def download_pdf(report_id: str):
         path=str(path),
         media_type="application/pdf",
         filename=f"legal-real-estate-report-{report_id}.pdf",
+        headers={"Cache-Control": "no-store"},
     )
