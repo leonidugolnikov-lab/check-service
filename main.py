@@ -54,10 +54,10 @@ GIGACHAT_VERIFY_SSL_CERTS = os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "true").lower
 # Имена методов NewDB могут отличаться по тарифу/кабинету.
 # Если поддержка NewDB даст точное имя метода — задай его в Environment без изменения кода.
 NEWDB_METHOD_PASSPORT = os.getenv("NEWDB_METHOD_PASSPORT", "passport_mvd").strip()
-NEWDB_METHOD_FSSP = os.getenv("NEWDB_METHOD_FSSP", "fssp").strip()
-NEWDB_METHOD_BANKRUPTCY = os.getenv("NEWDB_METHOD_BANKRUPTCY", "bankruptcy").strip()
-NEWDB_METHOD_PLEDGES = os.getenv("NEWDB_METHOD_PLEDGES", "pledges").strip()
-NEWDB_METHOD_COURTS = os.getenv("NEWDB_METHOD_COURTS", "courts").strip()
+NEWDB_METHOD_FSSP = os.getenv("NEWDB_METHOD_FSSP", "fssp_person").strip()
+NEWDB_METHOD_BANKRUPTCY = os.getenv("NEWDB_METHOD_BANKRUPTCY", "bankrot_person").strip()
+NEWDB_METHOD_PLEDGES = os.getenv("NEWDB_METHOD_PLEDGES", "pledge_person").strip()
+NEWDB_METHOD_COURTS = os.getenv("NEWDB_METHOD_COURTS", "arbitr_person").strip()
 NEWDB_METHOD_EGRN = os.getenv("NEWDB_METHOD_EGRN", "rosreestr").strip()
 NEWDB_ENABLE_METHOD_FALLBACKS = os.getenv("NEWDB_ENABLE_METHOD_FALLBACKS", "true").lower() not in {"0", "false", "no"}
 
@@ -242,7 +242,7 @@ def flatten_strings(obj: Any, limit: int = 80) -> List[str]:
     out: List[str] = []
     skip_keys = {
         "requestid", "request_id", "newdb_qid", "qid", "balance", "token", "method", "country",
-        "datecreated", "state", "status", "sent_params", "http_status", "params",
+        "datecreated", "state", "status", "sent_params", "http_status", "params", "api docs", "docs_url",
     }
     skip_values = {"ru", "queued", "pending", "processing", "in progress", "done", "ok", "success"}
 
@@ -308,6 +308,16 @@ def extract_items(data: Any) -> List[Any]:
             nested = extract_items(value)
             if nested:
                 return nested
+
+            # NewDB часто кладет результат под results.<method>.result.data.
+            # Если здесь словарь-обертка с одним/несколькими методами, сначала углубляемся,
+            # а не считаем всю обертку полезной записью.
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    nested_child = extract_items(child) if isinstance(child, dict) else child
+                    if nested_child:
+                        return nested_child
+
             meaningful = {
                 k: v for k, v in value.items()
                 if str(k).lower() not in {"state", "status", "requestid", "request_id", "balance", "datecreated", "params"}
@@ -332,7 +342,7 @@ def has_meaningful_data(data: Any) -> bool:
         return False
     useful = {
         k: v for k, v in data.items()
-        if str(k).lower() not in {"state", "status", "requestid", "request_id", "balance", "datecreated", "params", "sent_params", "http_status"}
+        if str(k).lower() not in {"state", "status", "requestid", "request_id", "balance", "datecreated", "params", "sent_params", "http_status", "api docs", "docs_url"}
     }
     return bool(flatten_strings(useful, 10))
 
@@ -556,10 +566,10 @@ def public_registry_data(obj: Any) -> Any:
 def method_variants(service: str, current: str) -> List[str]:
     variants = {
         "passport": [current, "passport_mvd", "passport"],
-        "fssp": [current, "fssp", "fssp_ip", "fssp_fl", "fssp_physical", "fssp_person"],
-        "bankruptcy": [current, "bankruptcy", "fedresurs", "bankrot", "efrsb"],
-        "pledges": [current, "pledges", "zalog", "reestr_zalogov"],
-        "courts": [current, "courts", "court", "kad_arbitr", "arbitr"],
+        "fssp": [current, "fssp_person", "fssp", "fssp_ip", "fssp_fl", "fssp_physical"],
+        "bankruptcy": [current, "bankrot_person", "bankruptcy", "fedresurs", "bankrot", "efrsb"],
+        "pledges": [current, "pledge_person", "pledges", "zalog", "reestr_zalogov"],
+        "courts": [current, "arbitr_person", "courts", "court", "kad_arbitr", "arbitr"],
         "egrn": [current, "rosreestr", "egrn"],
     }.get(service, [current])
     seen: List[str] = []
@@ -613,51 +623,56 @@ def build_newdb_params(req: CheckRequest) -> Tuple[Dict[str, Dict[str, Any]], Di
         "number": passport_number,
     }
 
+    # NewDB fssp_person по документации требует secondname, dob в ISO и regioncode.
     fssp_params = {
         "method": NEWDB_METHOD_FSSP,
         "lastname": last,
         "firstname": first,
-        "middlename": middle,
-        "birthdate": dob_ru,
+        "secondname": middle,
+        "dob": dob_to_iso(dob_ru),
         "country": "ru",
-        "region": int(req.region or 0),
+        "regioncode": int(req.region or 0),
     }
 
-    person_params = {
+    # Для физлица NewDB использует разные схемы:
+    # bankrot_person/arbitr_person — через innfiz; pledge_person — ФИО + dob.
+    person_fio_params = {
         "lastname": last,
         "firstname": first,
-        "middlename": middle,
-        "birthdate": dob_ru,
+        "secondname": middle,
+        "dob": dob_to_iso(dob_ru),
         "country": "ru",
     }
 
-    bankruptcy_params = {"method": NEWDB_METHOD_BANKRUPTCY, **person_params}
-    pledges_params = {"method": NEWDB_METHOD_PLEDGES, **person_params}
-    courts_params = {"method": NEWDB_METHOD_COURTS, **person_params}
+    bankruptcy_params = {"method": NEWDB_METHOD_BANKRUPTCY, "country": "ru"}
+    courts_params = {"method": NEWDB_METHOD_COURTS, "country": "ru"}
+    pledges_params = {"method": NEWDB_METHOD_PLEDGES, **person_fio_params}
 
-    # Не отправляем 12-значный ИНН физлица как innyur/inn для юрлица.
-    if inn_info["type"] == "ul":
-        for block in (bankruptcy_params, pledges_params, courts_params):
-            block["inn"] = inn_info["value"]
-            block["innyur"] = inn_info["value"]
-    elif inn_info["type"] == "fl":
-        bankruptcy_params["innfl"] = inn_info["value"]
-        courts_params["innfl"] = inn_info["value"]
-        pledges_params["__skip__"] = True
-        pledges_params["__skip_reason__"] = "Автоматическая проверка залогов по 12-значному ИНН физлица не выполнена. Требуется ручная проверка."
+    if inn_info["type"] == "fl":
+        bankruptcy_params["innfiz"] = inn_info["value"]
+        courts_params["innfiz"] = inn_info["value"]
+        pledges_params["innfiz"] = inn_info["value"]
+    elif inn_info["type"] == "ul":
+        bankruptcy_params["__skip__"] = True
+        bankruptcy_params["__skip_reason__"] = "Передан 10-значный ИНН юрлица, а для банкротства физлица нужен ИНН физлица. Требуется ручная проверка."
+        courts_params["__skip__"] = True
+        courts_params["__skip_reason__"] = "Передан 10-значный ИНН юрлица, а для арбитража физлица нужен ИНН физлица. Требуется ручная проверка."
     elif inn_info["type"] == "invalid":
         bankruptcy_params["__skip__"] = True
         bankruptcy_params["__skip_reason__"] = "Передан некорректный ИНН. Требуется ручная проверка банкротства."
-        pledges_params["__skip__"] = True
-        pledges_params["__skip_reason__"] = "Передан некорректный ИНН. Требуется ручная проверка залогов."
         courts_params["__skip__"] = True
         courts_params["__skip_reason__"] = "Передан некорректный ИНН. Требуется ручная проверка судебных производств."
 
+    if inn_info["type"] == "empty":
+        bankruptcy_params["__skip__"] = True
+        bankruptcy_params["__skip_reason__"] = "Для автоматической проверки банкротства физлица нужен ИНН физлица. Требуется ручная проверка."
+        courts_params["__skip__"] = True
+        courts_params["__skip_reason__"] = "Для автоматической проверки арбитражных дел физлица нужен ИНН физлица. Требуется ручная проверка."
+
+    # Росреестр принимает кадастровый номер или адрес в поле address.
     egrn_params = {
         "method": NEWDB_METHOD_EGRN,
-        "address": prop.get("address") or prop.get("query"),
-        "cadnum": prop.get("cadastral_number"),
-        "cadastral_number": prop.get("cadastral_number"),
+        "address": prop.get("query") or prop.get("address"),
         "country": "ru",
     }
 
@@ -848,11 +863,13 @@ def classify_egrn(data: Any, prop: Dict[str, str]) -> Tuple[Dict[str, Any], Dict
         return manual_item(source, ["Не передан кадастровый номер или адрес объекта."], MANUAL_URLS["egrn"]), {}
     if is_bad_response(data) or is_in_progress(data):
         return manual_item(source, extract_error_details(data), MANUAL_URLS["egrn"]), {}
-    if has_negative_empty_marker(data) or not has_meaningful_data(data):
-        return manual_item(source, [f"Запрос: {prop.get('query')}", "Объект не найден автоматически или ответ нельзя интерпретировать."], MANUAL_URLS["egrn"]), {}
+    items = extract_items(data)
+    # Нельзя считать успешной проверкой служебный ответ вида {"API docs": "..."} или пустой complete без data.
+    if has_negative_empty_marker(data) or not items:
+        return manual_item(source, [f"Запрос: {prop.get('query')}", "Источник не вернул структурированные данные объекта: cadNumber/rights/encumbrances. Требуется ручная проверка."], MANUAL_URLS["egrn"]), {}
 
-    txt = text_blob(data)
-    risk_words = ["арест", "запрет", "ограничение", "ипотека", "залог", "обременение", "рента", "запрещение"]
+    txt = text_blob(items)
+    risk_words = ["арест", "запрет", "ограничение", "ипотека", "залог", "обременение", "рента", "запрещение", "запрещение регистрации"]
     found_risks = [w for w in risk_words if w in txt]
     details = []
     if prop.get("cadastral_number"):
@@ -869,14 +886,14 @@ def classify_egrn(data: Any, prop: Dict[str, str]) -> Tuple[Dict[str, Any], Dict
             "Данные по объекту получены. В ответе есть признаки ограничений, обременений или иных рисков.",
             details,
             MANUAL_URLS["egrn"],
-        ), strip_sensitive(data)
+        ), public_registry_data(items)
     return make_item(
         source,
         "ok",
         "Данные по объекту получены. По полученным данным явные признаки ограничений или обременений не выявлены.",
         details,
         MANUAL_URLS["egrn"],
-    ), strip_sensitive(data)
+    ), public_registry_data(items)
 
 
 # -----------------------------
