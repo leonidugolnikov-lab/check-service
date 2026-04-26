@@ -1,77 +1,67 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-import httpx
+from __future__ import annotations
+
 import asyncio
-import uuid
+import base64
+import html
+import json
 import os
 import re
-import json
-from pathlib import Path
+import time
+import uuid
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-except Exception:
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+except Exception:  # pragma: no cover
     SimpleDocTemplate = None
 
 
-app = FastAPI(title="Real Estate Legal Check API")
+app = FastAPI(title="Real Estate Seller & Property Check API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
+# -----------------------------
+# ENV
+# -----------------------------
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
-NEWDB_URL = os.getenv("NEWDB_URL", "https://api.newdb.net/v2").strip()
+NEWDB_URL = os.getenv("NEWDB_URL", "https://api.newdb.net/v2").strip().rstrip("/")
 
-REPORT_DIR = Path("reports")
-REPORT_DIR.mkdir(exist_ok=True)
+GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "").strip()
+GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET", "").strip()
+GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
+GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat").strip()
+GIGACHAT_VERIFY_SSL_CERTS = os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "true").lower() not in {"0", "false", "no"}
 
-HTTP_TIMEOUT = httpx.Timeout(connect=25.0, read=240.0, write=60.0, pool=30.0)
+REPORT_DIR = Path(os.getenv("REPORT_DIR", "reports"))
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_TTL_SECONDS = int(os.getenv("REPORT_TTL_SECONDS", str(60 * 60 * 24)))
 
-IN_PROGRESS_STATES = {
-    "queued",
-    "queue",
-    "in progress",
-    "progress",
-    "pending",
-    "processing",
-    "wait",
-    "waiting",
-}
+HTTP_TIMEOUT = httpx.Timeout(connect=25.0, read=300.0, write=60.0, pool=30.0)
 
-BAD_STATES = {
-    "failed",
-    "fail",
-    "error",
-    "rejected",
-    "denied",
-    "timeout",
-    "manual",
-    "not_configured",
-}
+IN_PROGRESS_STATES = {"queued", "queue", "in progress", "progress", "pending", "processing", "wait", "waiting", "created", "new"}
+GOOD_STATES = {"complete", "completed", "done", "success", "finished", "ready", "ok"}
+BAD_STATES = {"failed", "fail", "error", "rejected", "denied", "timeout", "not_configured", "manual", "canceled", "cancelled"}
 
-GOOD_STATES = {
-    "complete",
-    "completed",
-    "done",
-    "success",
-    "finished",
-    "ready",
-    "ok",
-}
-
-DEFAULT_MANUAL_LINKS = {
+MANUAL_URLS = {
     "passport": "https://мвд.рф/сервисы-гувм",
     "fssp": "https://fssp.gov.ru/iss/ip",
     "bankruptcy": "https://bankrot.fedresurs.ru",
@@ -80,14 +70,22 @@ DEFAULT_MANUAL_LINKS = {
     "egrn": "https://rosreestr.gov.ru",
 }
 
+DISCLAIMER = (
+    "Отчет носит информационно-аналитический характер, не является гарантией полной юридической "
+    "безопасности сделки и не заменяет ручную юридическую проверку документов специалистом."
+)
 
+
+# -----------------------------
+# MODELS
+# -----------------------------
 class CheckRequest(BaseModel):
     last: str = ""
     first: str = ""
     middle: str = ""
     dob: str = ""
     inn: str = ""
-    region: int = 0
+    region: int = 78
     passport_series: str = ""
     passport_number: str = ""
     property_type: str = ""
@@ -96,10 +94,28 @@ class CheckRequest(BaseModel):
     address: str = ""
 
 
-def clean_text(value) -> str:
+class ChecklistItem(BaseModel):
+    source: str
+    title: str
+    status: str = Field(pattern="^(ok|risk|manual_check)$")
+    summary: str
+    details: List[str] = []
+    manual_url: str = ""
+    manual_check_url: str = ""
+
+
+# -----------------------------
+# BASIC HELPERS
+# -----------------------------
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def clean_text(value: Any) -> str:
     if value is None:
         return ""
     text = str(value)
+    # Часто встречается mojibake вида Р”РµР№...
     try:
         if "Р" in text or "С" in text:
             fixed = text.encode("latin1").decode("utf-8")
@@ -134,14 +150,15 @@ def dob_to_iso(value: str) -> str:
     return value
 
 
-def rub(value) -> str:
+def rub(value: Any) -> str:
     try:
-        return f"{float(value):,.2f}".replace(",", " ").replace(".00", "") + " ₽"
+        amount = float(str(value).replace(" ", "").replace(",", "."))
     except Exception:
-        return "0 ₽"
+        amount = 0.0
+    return f"{amount:,.2f}".replace(",", " ").replace(".00", "") + " ₽"
 
 
-def safe_json(value, limit: int = 6000) -> str:
+def safe_json(value: Any, limit: int = 12000) -> str:
     try:
         text = json.dumps(value, ensure_ascii=False, indent=2)
     except Exception:
@@ -149,99 +166,79 @@ def safe_json(value, limit: int = 6000) -> str:
     return text[:limit]
 
 
-def text_blob(obj) -> str:
+def text_blob(obj: Any) -> str:
     try:
         return json.dumps(obj, ensure_ascii=False).lower()
     except Exception:
         return str(obj).lower()
 
 
-def state_of(data: dict) -> str:
+def state_of(data: Any) -> str:
     if not isinstance(data, dict):
         return ""
-    return clean_text(data.get("state") or data.get("status") or "").lower()
+    return clean_text(data.get("state") or data.get("status") or data.get("stage") or "").lower()
 
 
-def is_bad_response(data: dict) -> bool:
-    if not isinstance(data, dict):
-        return True
-
-    st = state_of(data)
-    txt = text_blob(data)
-
-    if data.get("http_status") and int(data.get("http_status")) >= 400:
-        return True
-
-    if st in BAD_STATES:
-        return True
-
-    bad_markers = [
-        "не заполнено значение обязательного параметра",
-        "не передан",
-        "missing required",
-        "required parameter",
-        "проверьте баланс",
-        "токен доступа",
-        "access@newdb.net",
-        "x-api-key",
-        '"code":400',
-        '"status":400',
-        "bad request",
-        "unauthorized",
-        "forbidden",
-        "доступ запрещ",
-        "not enough balance",
-        "insufficient balance",
-    ]
-
-    return any(marker in txt for marker in bad_markers)
-
-
-def is_in_progress_response(data: dict) -> bool:
-    if not isinstance(data, dict):
-        return False
-    st = state_of(data)
-    return st in IN_PROGRESS_STATES
-
-
-def strip_sensitive(data):
-    if isinstance(data, dict):
+def strip_sensitive(obj: Any) -> Any:
+    if isinstance(obj, dict):
         cleaned = {}
-        for k, v in data.items():
-            kl = str(k).lower()
-            if kl in {"balance", "token", "api_key", "x-api-key", "authorization"}:
+        for k, v in obj.items():
+            key = str(k).lower()
+            if key in {
+                "balance", "token", "api_key", "x-api-key", "authorization", "access_token",
+                "client_secret", "secret", "password", "bearer", "headers",
+            }:
                 continue
             cleaned[k] = strip_sensitive(v)
         return cleaned
-    if isinstance(data, list):
-        return [strip_sensitive(x) for x in data]
-    return data
+    if isinstance(obj, list):
+        return [strip_sensitive(x) for x in obj]
+    return obj
 
 
-def flatten_strings(obj, limit=80):
-    out = []
+def public_error(message: str = "Источник не вернул данные. Требуется ручная проверка.") -> str:
+    return message
 
-    skip_values = {
-        "ru",
-        "queued",
-        "pending",
-        "processing",
-        "in progress",
-        "progress",
-        "complete",
-        "completed",
-        "done",
-        "success",
-        "ok",
+
+def is_in_progress(data: Any) -> bool:
+    return isinstance(data, dict) and state_of(data) in IN_PROGRESS_STATES
+
+
+def is_bad_response(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return True
+    st = state_of(data)
+    txt = text_blob(data)
+    try:
+        if int(data.get("http_status", 0)) >= 400:
+            return True
+    except Exception:
+        pass
+    if st in BAD_STATES:
+        return True
+    bad_markers = [
+        "не заполнено значение обязательного параметра", "не передан", "missing required",
+        "required parameter", "bad request", "unauthorized", "forbidden", "доступ запрещ",
+        "not enough balance", "insufficient balance", "проверьте баланс", "x-api-key",
+        "токен доступа", "access@newdb.net", '"code":400', '"status":400', "traceback",
+    ]
+    return any(x in txt for x in bad_markers)
+
+
+def flatten_strings(obj: Any, limit: int = 80) -> List[str]:
+    out: List[str] = []
+    skip_keys = {
+        "requestid", "request_id", "newdb_qid", "qid", "balance", "token", "method", "country",
+        "datecreated", "state", "status", "sent_params", "http_status", "params",
     }
+    skip_values = {"ru", "queued", "pending", "processing", "in progress", "done", "ok", "success"}
 
-    def walk(x):
+    def walk(x: Any) -> None:
         if len(out) >= limit:
             return
         if isinstance(x, dict):
             for k, v in x.items():
-                key = str(k).lower()
-                if key in {"requestid", "request_id", "newdb_qid", "qid", "balance", "token", "method", "country", "datecreated", "state", "status"}:
+                if str(k).lower() in skip_keys:
                     continue
                 walk(v)
         elif isinstance(x, list):
@@ -249,64 +246,41 @@ def flatten_strings(obj, limit=80):
                 walk(v)
         elif x is not None:
             s = clean_text(x)
-            if not s:
-                return
-            if s.lower() in skip_values:
+            if not s or s.lower() in skip_values:
                 return
             if re.fullmatch(r"[a-f0-9-]{20,}", s.lower()):
                 return
-            if s.startswith("https://newdb.net/docs"):
-                return
-            if len(s) <= 300:
+            if len(s) <= 350 and s not in out:
                 out.append(s)
 
     walk(obj)
     return out
 
 
-def extract_error_details(data: dict) -> list:
+def extract_error_details(data: Any) -> List[str]:
     if not isinstance(data, dict):
-        return ["Источник проверки вернул непонятный ответ."]
-
-    details = []
-
-    for key in ["error", "message", "detail", "description"]:
+        return [public_error()]
+    details: List[str] = []
+    for key in ["error", "message", "detail", "description", "raw_text"]:
         val = clean_text(data.get(key))
-        if val:
+        if val and "traceback" not in val.lower() and len(val) < 250:
             details.append(val)
-
-    txt = text_blob(data)
-    if "не заполнено значение обязательного параметра" in txt:
-        details.append("Источник проверки не принял запрос: не заполнен обязательный параметр.")
-    if "address" in txt and ("обязательного параметра" in txt or "required" in txt):
-        details.append("NewDB требует параметр address для этого метода.")
     if data.get("http_status"):
-        details.append(f"HTTP статус: {data.get('http_status')}")
-    if "проверьте баланс" in txt or "access@newdb.net" in txt:
-        details.append("NewDB просит проверить баланс, тариф или токен доступа.")
-    if "x-api-key" in txt:
-        details.append("NewDB ожидает токен в HTTP-заголовке X-API-KEY.")
-
-    clean = []
-    seen = set()
-    for d in details:
-        d = clean_text(d)
-        if d and d not in seen:
-            seen.add(d)
-            clean.append(d)
-
-    return clean or ["Источник проверки вернул ошибку."]
+        details.append(f"Источник вернул HTTP {data.get('http_status')}.")
+    if not details:
+        details.append(public_error())
+    # наружу не отдаем requestId, токены и служебный мусор
+    return list(dict.fromkeys(details))[:5]
 
 
-def extract_items(data) -> list:
-    if not isinstance(data, dict):
+def extract_items(data: Any) -> List[Any]:
+    if not isinstance(data, dict) or is_bad_response(data) or is_in_progress(data):
         return []
 
-    if is_bad_response(data) or is_in_progress_response(data):
-        return []
-
-    keys = ["items", "data", "result", "results", "records", "list", "rows", "objects", "response"]
-
+    keys = [
+        "items", "data", "result", "results", "records", "list", "rows", "objects", "response",
+        "executions", "proceedings", "cases", "documents", "content", "payload",
+    ]
     for key in keys:
         value = data.get(key)
         if isinstance(value, list):
@@ -315,857 +289,855 @@ def extract_items(data) -> list:
             nested = extract_items(value)
             if nested:
                 return nested
-            # Иногда полезный результат приходит словарем, а не массивом.
-            if not is_bad_response(value) and not is_in_progress_response(value):
-                meaningful = {k: v for k, v in value.items() if k not in {"state", "status", "requestId", "request_id", "balance", "datecreated"}}
-                if meaningful:
-                    return [meaningful]
-
+            meaningful = {
+                k: v for k, v in value.items()
+                if str(k).lower() not in {"state", "status", "requestid", "request_id", "balance", "datecreated", "params"}
+            }
+            if meaningful and flatten_strings(meaningful, 3):
+                return [meaningful]
     return []
 
 
-def has_meaningful_data(data) -> bool:
-    if not isinstance(data, dict):
-        return False
-    if is_bad_response(data) or is_in_progress_response(data):
-        return False
-
-    items = extract_items(data)
-    if items:
-        return True
-
+def has_negative_empty_marker(data: Any) -> bool:
     txt = text_blob(data)
-    empty_markers = [
-        "не найден",
-        "не найдено",
-        "нет свед",
-        "nothing found",
-        "not found",
-        "no data",
-        "empty",
-        "отсутств",
-    ]
-    if any(m in txt for m in empty_markers):
+    markers = ["не найден", "не найдено", "нет свед", "ничего не найдено", "nothing found", "not found", "no data", "empty", "отсутств"]
+    return any(x in txt for x in markers)
+
+
+def has_meaningful_data(data: Any) -> bool:
+    if not isinstance(data, dict) or is_bad_response(data) or is_in_progress(data):
         return False
+    if extract_items(data):
+        return True
+    if has_negative_empty_marker(data):
+        return False
+    useful = {
+        k: v for k, v in data.items()
+        if str(k).lower() not in {"state", "status", "requestid", "request_id", "balance", "datecreated", "params", "sent_params", "http_status"}
+    }
+    return bool(flatten_strings(useful, 10))
 
-    useful = {k: v for k, v in data.items() if k not in {"state", "status", "requestId", "request_id", "balance", "datecreated", "params"}}
-    useful_text = flatten_strings(useful, 20)
-    return bool(useful_text)
+
+def make_item(source: str, status: str, summary: str, details: Optional[List[str]] = None, manual_url: str = "") -> Dict[str, Any]:
+    # Даем обе пары ключей: source/title и manual_url/manual_check_url — чтобы фронт не ломался.
+    return {
+        "source": source,
+        "title": source,
+        "status": status,
+        "summary": summary,
+        "details": details or [],
+        "manual_url": manual_url,
+        "manual_check_url": manual_url,
+    }
 
 
-def normalize_property(req: CheckRequest) -> dict:
+def manual_item(source: str, details: Optional[List[str]] = None, manual_url: str = "") -> Dict[str, Any]:
+    return make_item(source, "manual_check", public_error(), details or [public_error()], manual_url)
+
+
+# -----------------------------
+# PROPERTY NORMALIZATION
+# -----------------------------
+def normalize_property(req: CheckRequest) -> Dict[str, str]:
     cadastral = clean_text(req.cadastral_number or req.cadastre_number)
     address = clean_text(req.address)
+    cad_pattern = r"^\d{1,2}:\d{1,2}:\d{5,10}:\d+$"
 
-    cad_pattern = r"^\d{2}:\d{2}:\d{6,7}:\d+$"
+    if cadastral and re.fullmatch(cad_pattern, cadastral):
+        return {"type": "cadastral", "query": cadastral, "cadastral_number": cadastral, "address": cadastral}
+    if address and re.fullmatch(cad_pattern, address):
+        return {"type": "cadastral", "query": address, "cadastral_number": address, "address": address}
 
-    if cadastral and re.match(cad_pattern, cadastral):
-        return {
-            "type": "cadastral",
-            "query": cadastral,
-            "cadastral_number": cadastral,
-            "address": cadastral,  # NewDB rosreestr часто требует именно address, даже если это кадастровый номер.
-        }
-
-    if address and re.match(cad_pattern, address):
-        return {
-            "type": "cadastral",
-            "query": address,
-            "cadastral_number": address,
-            "address": address,
-        }
-
-    address = re.sub(r"\s+", " ", address)
+    # Адрес чуть нормализуем, но кадастровый номер не трогаем.
+    address = re.sub(r"\s+", " ", address).strip()
     address = re.sub(r"(?i)\bспб\b|санкт[- ]петербург", "Санкт-Петербург", address)
     address = re.sub(r"(?i)\bгород\s+", "г. ", address)
     address = re.sub(r"(?i)\bулица\s+", "ул. ", address)
     address = re.sub(r"(?i)\bпроспект\s+", "пр. ", address)
     address = re.sub(r"(?i)\bдом\s+", "д. ", address)
-    address = re.sub(r"(?i)\bкорпус\s+", "к. ", address)
     address = re.sub(r"(?i)\bквартира\s+", "кв. ", address)
-
     if address and not re.search(r"(?i)санкт-петербург|ленинградская область", address):
         address = "Санкт-Петербург, " + address
-
-    return {
-        "type": "address",
-        "query": address,
-        "cadastral_number": "",
-        "address": address,
-    }
+    return {"type": "address", "query": address, "cadastral_number": "", "address": address}
 
 
-async def newdb_post(params: dict, max_wait: int = 90, poll_interval: int = 5) -> dict:
+# -----------------------------
+# NEWDB CLIENT
+# -----------------------------
+async def newdb_post(params: Dict[str, Any], max_wait: int = 90, poll_interval: int = 5) -> Dict[str, Any]:
     if not NEWDB_TOKEN:
-        return {
-            "state": "not_configured",
-            "error": "NEWDB_TOKEN не задан в Environment на Render.",
-            "params": strip_sensitive(params),
-        }
+        return {"state": "not_configured", "error": "Источник не настроен. Требуется ручная проверка.", "sent_params": strip_sensitive(params)}
 
     headers = {
-        "Content-Type": "application/json",
         "Accept": "application/json",
+        "Content-Type": "application/json",
         "X-API-KEY": NEWDB_TOKEN,
-        # Оставляем Bearer как дополнительный вариант совместимости.
         "Authorization": f"Bearer {NEWDB_TOKEN}",
     }
-
     payload = {"params": params}
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         try:
             first = await client.post(NEWDB_URL, headers=headers, json=payload)
-            try:
-                data = first.json()
-            except Exception:
-                data = {"raw_text": first.text}
-
+            data = _safe_response_json(first)
             data = strip_sensitive(data)
             data["http_status"] = first.status_code
             data["sent_params"] = strip_sensitive(params)
-
-            if first.status_code >= 400:
-                data["state"] = data.get("state") or "error"
-                return data
-
         except Exception as e:
-            return {
-                "state": "error",
-                "error": f"Ошибка запроса NewDB: {e}",
-                "sent_params": strip_sensitive(params),
-            }
+            return {"state": "error", "error": f"Ошибка связи с источником: {e}", "sent_params": strip_sensitive(params)}
 
-        if is_bad_response(data):
+        if first.status_code >= 400 or is_bad_response(data):
+            data["state"] = data.get("state") or "error"
             return data
 
-        # Если ответ сразу готовый — возвращаем.
         st = state_of(data)
         if st and st not in IN_PROGRESS_STATES:
             return data
-
-        # Если state отсутствует, но есть содержательные данные — возвращаем.
         if not st and has_meaningful_data(data):
             return data
 
-        request_id = (
-            data.get("requestId")
-            or data.get("request_id")
-            or data.get("id")
-            or data.get("qid")
-            or data.get("newdb_qid")
-        )
-
-        # Часто qid лежит внутри params.
-        if not request_id and isinstance(data.get("params"), dict):
-            request_id = data["params"].get("newdb_qid") or data["params"].get("requestId")
-
+        request_id = find_request_id(data)
         if not request_id:
             data["state"] = "manual"
-            data["error"] = "NewDB поставил задачу в очередь, но не вернул идентификатор для получения результата."
+            data["error"] = "Источник принял задачу, но не вернул идентификатор результата. Требуется ручная проверка."
             return data
 
         elapsed = 0
         last_data = data
-
         while elapsed < max_wait:
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
 
-            candidates = [
-                ("GET", f"{NEWDB_URL}/{request_id}", None),
-                ("GET", f"{NEWDB_URL}/result/{request_id}", None),
-                ("GET", f"{NEWDB_URL}", {"requestId": request_id}),
-                ("GET", f"{NEWDB_URL}", {"newdb_qid": request_id}),
-                ("POST", NEWDB_URL, {"params": {"newdb_qid": request_id}}),
-                ("POST", NEWDB_URL, {"params": {"requestId": request_id}}),
+            poll_attempts = [
+                ("GET", f"{NEWDB_URL}/{request_id}", None, None),
+                ("GET", f"{NEWDB_URL}/result/{request_id}", None, None),
+                ("GET", NEWDB_URL, {"requestId": request_id}, None),
+                ("GET", NEWDB_URL, {"newdb_qid": request_id}, None),
+                ("POST", NEWDB_URL, None, {"params": {"newdb_qid": request_id}}),
+                ("POST", NEWDB_URL, None, {"params": {"requestId": request_id}}),
             ]
 
-            for method, url, extra in candidates:
+            for method, url, query, body in poll_attempts:
                 try:
                     if method == "GET":
-                        r = await client.get(url, headers=headers, params=extra)
+                        resp = await client.get(url, headers=headers, params=query)
                     else:
-                        r = await client.post(url, headers=headers, json=extra)
+                        resp = await client.post(url, headers=headers, json=body)
 
-                    if r.status_code >= 500:
+                    if resp.status_code >= 500:
                         continue
-
-                    try:
-                        polled = r.json()
-                    except Exception:
-                        polled = {"raw_text": r.text}
-
+                    polled = _safe_response_json(resp)
                     polled = strip_sensitive(polled)
-                    polled["http_status"] = r.status_code
+                    polled["http_status"] = resp.status_code
                     polled["sent_params"] = strip_sensitive(params)
                     last_data = polled
 
-                    if r.status_code >= 400:
+                    if resp.status_code >= 400:
                         continue
-
                     if is_bad_response(polled):
                         return polled
-
                     pst = state_of(polled)
                     if pst in IN_PROGRESS_STATES:
                         continue
-
-                    if pst in GOOD_STATES or has_meaningful_data(polled):
+                    if pst in GOOD_STATES or has_meaningful_data(polled) or has_negative_empty_marker(polled):
                         return polled
-
                 except Exception:
                     continue
 
         last_data["state"] = "timeout"
-        last_data["error"] = f"Источник не вернул итоговый результат за {max_wait} секунд. Это не означает, что проверка чистая."
+        last_data["error"] = f"Источник не вернул итоговый результат за {max_wait} секунд. Требуется ручная проверка."
         return last_data
 
 
-def base_manual(title: str, summary: str, details: list, url: str) -> dict:
-    return {
-        "title": title,
-        "status": "manual",
-        "summary": summary,
-        "details": details,
-        "manual_check_url": url,
+def _safe_response_json(resp: httpx.Response) -> Dict[str, Any]:
+    try:
+        value = resp.json()
+        if isinstance(value, dict):
+            return value
+        return {"result": value}
+    except Exception:
+        return {"raw_text": resp.text[:1000]}
+
+
+def find_request_id(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in ["requestId", "request_id", "id", "qid", "newdb_qid", "task_id"]:
+        val = data.get(key)
+        if val:
+            return clean_text(val)
+    for key in ["params", "result", "data", "response"]:
+        val = data.get(key)
+        if isinstance(val, dict):
+            nested = find_request_id(val)
+            if nested:
+                return nested
+    return ""
+
+
+# -----------------------------
+# SOURCE PARAMS
+# -----------------------------
+def build_newdb_params(req: CheckRequest) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+    prop = normalize_property(req)
+    dob_ru = normalize_dob(req.dob)
+    dob_iso = dob_to_iso(req.dob)
+    passport_series = only_digits(req.passport_series)
+    passport_number = only_digits(req.passport_number)
+
+    person_base = {
+        "lastname": clean_text(req.last),
+        "firstname": clean_text(req.first),
+        "middlename": clean_text(req.middle),
+        "secondname": clean_text(req.middle),
+        "birthdate": dob_ru,
+        "dob": dob_iso,
+        "country": "ru",
     }
 
+    return {
+        "passport": {
+            "method": "passport_mvd",
+            **person_base,
+            "series": passport_series,
+            "seria": passport_series,
+            "number": passport_number,
+        },
+        "fssp": {
+            "method": "fssp",
+            **person_base,
+            "region": int(req.region or 0),
+        },
+        "bankruptcy": {
+            "method": "bankruptcy",
+            **person_base,
+            "inn": only_digits(req.inn),
+        },
+        "pledges": {
+            "method": "pledges",
+            **person_base,
+            "inn": only_digits(req.inn),
+        },
+        "courts": {
+            "method": "courts",
+            **person_base,
+            "inn": only_digits(req.inn),
+        },
+        "egrn": {
+            "method": "rosreestr",
+            # По практике NewDB часто принимает кадастровый номер именно через address.
+            "address": prop.get("address") or prop.get("query"),
+            "cadnum": prop.get("cadastral_number"),
+            "cadastral_number": prop.get("cadastral_number"),
+            "country": "ru",
+        },
+    }, prop
 
-def classify_passport(data) -> dict:
-    title = "Паспорт МВД"
-    url = DEFAULT_MANUAL_LINKS["passport"]
 
-    if is_in_progress_response(data):
-        return base_manual(title, "Источник еще не завершил проверку паспорта. Требуется повторить запрос или проверить вручную.", extract_error_details(data), url)
-
-    if is_bad_response(data):
-        return base_manual(title, "Источник проверки паспорта вернул ошибку. Требуется ручная проверка.", extract_error_details(data), url)
-
-    text = text_blob(data)
-
-    if any(x in text for x in ["недейств", "разыскивается", "invalid"]):
-        return {
-            "title": title,
-            "status": "risk",
-            "summary": "Выявлены признаки проблемы с паспортом.",
-            "details": flatten_strings(data, 8),
-            "manual_check_url": url,
-        }
-
-    if any(x in text for x in ["действителен", "действительный", "valid"]):
-        return {
-            "title": title,
-            "status": "ok",
-            "summary": "Паспорт по полученным данным действителен.",
-            "details": [],
-            "manual_check_url": url,
-        }
-
-    return base_manual(title, "Результат проверки паспорта неоднозначный. Требуется ручная проверка.", ["Источник вернул ответ, который нельзя уверенно трактовать автоматически."], url)
+# -----------------------------
+# CLASSIFIERS
+# -----------------------------
+def classify_passport(data: Any) -> Dict[str, Any]:
+    source = "Паспорт МВД"
+    if is_bad_response(data) or is_in_progress(data):
+        return manual_item(source, extract_error_details(data), MANUAL_URLS["passport"])
+    txt = text_blob(data)
+    if any(x in txt for x in ["недейств", "разыскивается", "invalid", "expired"]):
+        return make_item(source, "risk", "Выявлены признаки проблемы с паспортом.", flatten_strings(data, 8), MANUAL_URLS["passport"])
+    if any(x in txt for x in ["действителен", "действительный", "valid"]):
+        return make_item(source, "ok", "Паспорт по полученным данным действителен.", [], MANUAL_URLS["passport"])
+    return manual_item(source, ["Источник вернул ответ, который нельзя уверенно трактовать автоматически."], MANUAL_URLS["passport"])
 
 
-def item_status_text(item) -> str:
-    return text_blob(item)
-
-
-def extract_amount(item) -> float:
-    text = json.dumps(item, ensure_ascii=False)
-    matches = re.findall(r"(\d[\d\s]{0,12}(?:[.,]\d{1,2})?)\s*(?:руб|₽)", text, flags=re.I)
+def extract_amount(item: Any) -> float:
+    if isinstance(item, dict):
+        for key in [
+            "amount", "sum", "debt", "debt_sum", "total", "balance", "debtSum", "ip_end_sum",
+            "actual_debt", "outstanding", "remainder", "remain", "sum_debt",
+        ]:
+            if key in item and item[key] not in [None, ""]:
+                try:
+                    return float(str(item[key]).replace(" ", "").replace(",", "."))
+                except Exception:
+                    pass
+    txt = text_blob(item)
+    matches = re.findall(r"(\d[\d\s]{0,12}(?:[.,]\d{1,2})?)\s*(?:руб|₽)", txt, flags=re.I)
     amounts = []
     for m in matches:
         try:
             amounts.append(float(m.replace(" ", "").replace(",", ".")))
         except Exception:
             pass
-
-    if amounts:
-        return max(amounts)
-
-    if isinstance(item, dict):
-        for key in ["amount", "sum", "debt", "debt_sum", "total", "balance", "debtSum"]:
-            if key in item:
-                try:
-                    return float(str(item[key]).replace(" ", "").replace(",", "."))
-                except Exception:
-                    pass
-    return 0.0
+    return max(amounts) if amounts else 0.0
 
 
-def classify_fssp(data) -> dict:
-    title = "ФССП"
-    url = DEFAULT_MANUAL_LINKS["fssp"]
+def is_closed_fssp(item: Any) -> bool:
+    txt = text_blob(item)
+    closed_words = [
+        "оконч", "прекращ", "закрыт", "заверш", "исполнено", "ст. 46", "статья 46",
+        "ст.46", "returned", "terminated", "closed", "completed", "end_date", "date_end",
+    ]
+    return any(w in txt for w in closed_words)
 
-    if is_in_progress_response(data):
-        return base_manual(title, "Источник еще не завершил проверку ФССП. Требуется повторить запрос или проверить вручную.", extract_error_details(data), url)
 
-    if is_bad_response(data):
-        return base_manual(title, "Источник проверки ФССП вернул ошибку. Требуется ручная проверка.", extract_error_details(data), url)
+def is_active_fssp(item: Any) -> bool:
+    txt = text_blob(item)
+    active_words = [
+        "возбужден", "актив", "в процессе", "исполнительное производство", "задолженность", "остаток",
+        "взыскание", "active", "in_process", "actual", "current", "department",
+    ]
+    return any(w in txt for w in active_words) and not is_closed_fssp(item)
+
+
+def describe_fssp_record(item: Any) -> str:
+    if not isinstance(item, dict):
+        return clean_text(item)[:300]
+    parts = []
+    for key in ["number", "ip_number", "case_number", "exec_number", "date", "date_start", "subject", "article", "department", "bailiff"]:
+        if item.get(key):
+            parts.append(f"{key}: {clean_text(item.get(key))}")
+    amount = extract_amount(item)
+    if amount:
+        parts.append(f"сумма: {rub(amount)}")
+    return "; ".join(parts) or "; ".join(flatten_strings(item, 4))
+
+
+def classify_fssp(data: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    source = "ФССП"
+    empty_stats = {
+        "all_count": 0, "active_count": 0, "closed_count": 0, "unknown_count": 0,
+        "total_sum_all": 0.0, "active_sum": 0.0, "closed_sum": 0.0, "actual_debt": 0.0,
+        "active_items": [], "closed_items": [], "unknown_items": [],
+    }
+
+    if is_bad_response(data) or is_in_progress(data):
+        return manual_item(source, extract_error_details(data), MANUAL_URLS["fssp"]), empty_stats
 
     items = extract_items(data)
-    text = text_blob(data)
-
-    if not items and any(x in text for x in ["не найден", "нет свед", "nothing found", "not found", "отсутств"]):
-        return {
-            "title": title,
-            "status": "ok",
-            "summary": "По полученным данным активные исполнительные производства не найдены.",
-            "details": [],
-            "manual_check_url": url,
-        }
-
+    if not items and has_negative_empty_marker(data):
+        return make_item(source, "ok", "По полученным данным исполнительные производства не выявлены.", [], MANUAL_URLS["fssp"]), empty_stats
     if not items and not has_meaningful_data(data):
-        return {
-            "title": title,
-            "status": "ok",
-            "summary": "По полученным данным исполнительные производства не найдены.",
-            "details": [],
-            "manual_check_url": url,
-        }
+        return manual_item(source, ["Источник вернул пустой или непонятный ответ."], MANUAL_URLS["fssp"]), empty_stats
+    if not items:
+        items = [data]
 
-    active_items = []
-    closed_items = []
-    unknown_items = []
-
-    closed_words = ["оконч", "прекращ", "закрыт", "заверш", "ст. 46", "статья 46", "terminated", "closed"]
-    active_words = ["возбужден", "актив", "исполнительное производство", "задолженность", "остаток", "взыскание", "active"]
-
-    for item in items or [data]:
-        t = item_status_text(item)
-        if any(w in t for w in closed_words):
-            closed_items.append(item)
-        elif any(w in t for w in active_words):
-            active_items.append(item)
+    active, closed, unknown = [], [], []
+    for item in items:
+        if is_closed_fssp(item):
+            closed.append(item)
+        elif is_active_fssp(item):
+            active.append(item)
         else:
-            unknown_items.append(item)
+            unknown.append(item)
 
-    active_total = sum(extract_amount(x) for x in active_items)
-    closed_total = sum(extract_amount(x) for x in closed_items)
+    active_sum = sum(extract_amount(x) for x in active)
+    closed_sum = sum(extract_amount(x) for x in closed)
+    unknown_sum = sum(extract_amount(x) for x in unknown)
+    total_sum = active_sum + closed_sum + unknown_sum
+
+    stats = {
+        "all_count": len(items),
+        "active_count": len(active),
+        "closed_count": len(closed),
+        "unknown_count": len(unknown),
+        "total_sum_all": total_sum,
+        "active_sum": active_sum,
+        "closed_sum": closed_sum,
+        "unknown_sum": unknown_sum,
+        "actual_debt": active_sum,
+        "active_items": strip_sensitive(active),
+        "closed_items": strip_sensitive(closed),
+        "unknown_items": strip_sensitive(unknown),
+    }
 
     details = [
-        f"Активные ИП: {len(active_items)}",
-        f"Оконченные/закрытые ИП: {len(closed_items)}",
-        f"Неоднозначные записи: {len(unknown_items)}",
-        f"Сумма по активным ИП: {rub(active_total)}",
-        f"Сумма по закрытым/оконченным ИП: {rub(closed_total)}",
+        f"Всего найдено ИП: {len(items)}",
+        f"Активные ИП: {len(active)}",
+        f"Закрытые/оконченные ИП: {len(closed)}",
+        f"Неоднозначные записи: {len(unknown)}",
+        f"Общая сумма всех найденных ИП: {rub(total_sum)}",
+        f"Сумма по активным ИП: {rub(active_sum)}",
+        f"Сумма по закрытым ИП: {rub(closed_sum)}",
+        f"Актуальный долг по активным ИП: {rub(active_sum)}",
     ]
+    for rec in active[:5]:
+        details.append("Активное ИП: " + describe_fssp_record(rec))
+    for rec in closed[:5]:
+        details.append("Закрытое/оконченное ИП: " + describe_fssp_record(rec))
 
-    if active_items or active_total > 0:
-        return {
-            "title": title,
-            "status": "risk",
-            "summary": "Выявлены активные исполнительные производства или признаки актуальной задолженности.",
-            "details": details,
-            "manual_check_url": url,
-        }
-
-    if closed_items and not active_items:
-        return {
-            "title": title,
-            "status": "ok",
-            "summary": "Найдены закрытые/оконченные ИП. По полученным данным активный долг не подтвержден.",
-            "details": details,
-            "manual_check_url": url,
-        }
-
-    if unknown_items:
-        return base_manual(title, "Найдены неоднозначные записи ФССП. Нужно проверить статус вручную.", details, url)
-
-    return {
-        "title": title,
-        "status": "ok",
-        "summary": "По полученным данным исполнительные производства не найдены.",
-        "details": [],
-        "manual_check_url": url,
-    }
+    if active:
+        return make_item(
+            source,
+            "risk",
+            f"Найдены активные исполнительные производства. Актуальная сумма долга: {rub(active_sum)}.",
+            details,
+            MANUAL_URLS["fssp"],
+        ), stats
+    if closed and not active and not unknown:
+        return make_item(
+            source,
+            "ok",
+            f"Найдены исполнительные производства. Активных: 0, закрытых: {len(closed)}. Актуальный долг по активным производствам: 0 ₽.",
+            details,
+            MANUAL_URLS["fssp"],
+        ), stats
+    if unknown:
+        return make_item(
+            source,
+            "manual_check",
+            "Найдены исполнительные производства с неоднозначным статусом. Требуется ручная проверка.",
+            details,
+            MANUAL_URLS["fssp"],
+        ), stats
+    return make_item(source, "ok", "По полученным данным исполнительные производства не выявлены.", details, MANUAL_URLS["fssp"]), stats
 
 
-def classify_empty_or_risk(data, title: str, risk_summary: str, ok_summary: str, manual_url: str) -> dict:
-    if is_in_progress_response(data):
-        return base_manual(title, f"Источник еще не завершил проверку: {title}. Требуется повторить запрос или проверить вручную.", extract_error_details(data), manual_url)
-
-    if is_bad_response(data):
-        return base_manual(title, f"Источник проверки «{title}» вернул ошибку. Требуется ручная проверка.", extract_error_details(data), manual_url)
-
+def classify_empty_or_risk(data: Any, source: str, ok_summary: str, risk_summary: str, manual_url: str) -> Tuple[Dict[str, Any], List[Any]]:
+    if is_bad_response(data) or is_in_progress(data):
+        return manual_item(source, extract_error_details(data), manual_url), []
     items = extract_items(data)
-    text = text_blob(data)
-
-    negative_markers = ["не найден", "нет свед", "ничего не найдено", "not found", "empty", "отсутств", "no data"]
-
-    if not items and (not has_meaningful_data(data) or any(x in text for x in negative_markers)):
-        return {
-            "title": title,
-            "status": "ok",
-            "summary": ok_summary,
-            "details": [],
-            "manual_check_url": manual_url,
-        }
-
-    if items:
-        return {
-            "title": title,
-            "status": "risk",
-            "summary": risk_summary,
-            "details": flatten_strings(items, 10),
-            "manual_check_url": manual_url,
-        }
-
-    suspicious = [x for x in ["банкрот", "залог", "арбитраж", "дело", "иск", "огранич", "обремен"] if x in text]
-    if suspicious:
-        return base_manual(title, "Источник вернул неоднозначные сведения. Нужна ручная оценка релевантности записей.", flatten_strings(data, 8), manual_url)
-
-    return {
-        "title": title,
-        "status": "ok",
-        "summary": ok_summary,
-        "details": [],
-        "manual_check_url": manual_url,
-    }
+    if not items and has_negative_empty_marker(data):
+        return make_item(source, "ok", ok_summary, [], manual_url), []
+    if not items and not has_meaningful_data(data):
+        return manual_item(source, ["Источник вернул пустой или непонятный ответ."], manual_url), []
+    if not items:
+        # Не превращаем подозрительное слово из служебного текста в риск. Лучше manual_check.
+        return manual_item(source, flatten_strings(data, 8) or ["Источник вернул неоднозначный ответ."], manual_url), []
+    return make_item(source, "risk", risk_summary, flatten_strings(items, 12), manual_url), strip_sensitive(items)
 
 
-def classify_egrn(data, prop: dict) -> dict:
-    title = "ЕГРН / Росреестр"
-    url = DEFAULT_MANUAL_LINKS["egrn"]
-
+def classify_egrn(data: Any, prop: Dict[str, str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    source = "ЕГРН / Росреестр"
     if not prop.get("query"):
-        return base_manual(title, "Не передан адрес или кадастровый номер объекта. Проверка ЕГРН не выполнена.", ["Укажите кадастровый номер или адрес объекта."], url)
+        return manual_item(source, ["Не передан кадастровый номер или адрес объекта."], MANUAL_URLS["egrn"]), {}
+    if is_bad_response(data) or is_in_progress(data):
+        return manual_item(source, extract_error_details(data), MANUAL_URLS["egrn"]), {}
+    if has_negative_empty_marker(data) or not has_meaningful_data(data):
+        return manual_item(source, [f"Запрос: {prop.get('query')}", "Объект не найден автоматически или ответ нельзя интерпретировать."], MANUAL_URLS["egrn"]), {}
 
-    if is_in_progress_response(data):
-        return base_manual(title, "Росреестр еще не завершил обработку запроса. Это не является положительным результатом.", extract_error_details(data), url)
-
-    if is_bad_response(data):
-        return base_manual(title, "Источник проверки ЕГРН / Росреестра вернул ошибку. Требуется ручная проверка.", extract_error_details(data), url)
-
-    text_values = flatten_strings(data, 40)
-    text = text_blob(data)
-
-    if not has_meaningful_data(data) or any(x in text for x in ["не найден", "нет свед", "not found", "объект не найден"]):
-        return base_manual(title, "Объект не найден автоматически или источник не вернул понятный результат. Требуется ручная проверка.", [f"Запрос: {prop.get('query')}"], url)
-
-    risk_words = ["арест", "запрет", "ограничение", "ипотека", "залог", "обременение", "рента"]
-    risks = [w for w in risk_words if w in text]
-
+    txt = text_blob(data)
+    risk_words = ["арест", "запрет", "ограничение", "ипотека", "залог", "обременение", "рента", "запрещение"]
+    found_risks = [w for w in risk_words if w in txt]
     details = []
     if prop.get("cadastral_number"):
         details.append(f"Кадастровый номер: {prop.get('cadastral_number')}")
-    elif prop.get("address"):
+    if prop.get("address") and prop.get("address") != prop.get("cadastral_number"):
         details.append(f"Адрес/запрос: {prop.get('address')}")
+    details.extend(flatten_strings(data, 15))
+    details = list(dict.fromkeys(details))[:20]
 
-    useful_details = [x for x in text_values[:12] if x not in details]
-    details.extend(useful_details)
+    if found_risks:
+        return make_item(
+            source,
+            "risk",
+            "Данные по объекту получены. В ответе есть признаки ограничений, обременений или иных рисков.",
+            details,
+            MANUAL_URLS["egrn"],
+        ), strip_sensitive(data)
+    return make_item(
+        source,
+        "ok",
+        "Данные по объекту получены. По полученным данным явные признаки ограничений или обременений не выявлены.",
+        details,
+        MANUAL_URLS["egrn"],
+    ), strip_sensitive(data)
 
-    if risks:
-        return {
-            "title": title,
-            "status": "risk",
-            "summary": "В данных по объекту выявлены признаки ограничений, обременений или иных рисков.",
-            "details": details,
-            "manual_check_url": url,
-        }
 
+# -----------------------------
+# GIGACHAT
+# -----------------------------
+def gigachat_credentials() -> str:
+    if GIGACHAT_CREDENTIALS:
+        return GIGACHAT_CREDENTIALS
+    if GIGACHAT_CLIENT_ID and GIGACHAT_CLIENT_SECRET:
+        raw = f"{GIGACHAT_CLIENT_ID}:{GIGACHAT_CLIENT_SECRET}".encode("utf-8")
+        return base64.b64encode(raw).decode("ascii")
+    return ""
+
+
+def build_prompt_payload(req: CheckRequest, prop: Dict[str, str], checklist: List[Dict[str, Any]], registry_data: Dict[str, Any], warnings: List[str]) -> Dict[str, Any]:
     return {
-        "title": title,
-        "status": "ok",
-        "summary": "Данные по объекту получены. Явные признаки ограничений или обременений в полученном результате не выявлены.",
-        "details": details,
-        "manual_check_url": url,
+        "seller": {
+            "last": clean_text(req.last),
+            "first": clean_text(req.first),
+            "middle": clean_text(req.middle),
+            "dob": normalize_dob(req.dob),
+            "inn_provided": bool(only_digits(req.inn)),
+            "passport_provided": bool(only_digits(req.passport_series) and only_digits(req.passport_number)),
+            "fssp_region": req.region,
+        },
+        "property": prop,
+        "checklist": checklist,
+        "registry_data": registry_data,
+        "warnings": warnings,
+        "not_checked_or_manual": [x for x in checklist if x.get("status") == "manual_check"],
+        "disclaimer": DISCLAIMER,
     }
 
 
-def make_registry_results(checklist: list) -> dict:
-    mapping = {
-        "Паспорт МВД": "passport",
-        "ФССП": "fssp",
-        "Банкротство / Федресурс": "bankruptcy",
-        "Залоги движимого имущества": "pledges",
-        "Суды / арбитраж": "courts",
-        "ЕГРН / Росреестр": "egrn",
-    }
+async def generate_gigachat_report(payload: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    credentials = gigachat_credentials()
+    if not credentials:
+        return build_fallback_legal_report(payload), "GigaChat не настроен: отчет сформирован резервной backend-логикой."
 
-    result = {}
-    for item in checklist:
-        key = mapping.get(item["title"], item["title"])
-        result[key] = {
-            "title": item["title"],
-            "status": item["status"],
-            "summary": item["summary"],
-            "details": item.get("details", []),
-            "manual_check_url": item.get("manual_check_url", ""),
-        }
-    return result
+    prompt = """Ты юрист-эксперт по недвижимости в Санкт-Петербурге.
+
+На основе переданных структурированных данных сформируй подробный юридический отчет для покупателя недвижимости.
+
+Строго соблюдай структуру:
+1. Краткий вывод
+2. Что проверено
+3. Риски по продавцу
+4. Риски по объекту
+5. Что говорит в пользу сделки
+6. Что обязательно проверить до аванса
+7. Что прописать в авансовом соглашении / ПДКП
+8. Безопасная схема расчетов
+9. Итоговое заключение
+
+Не придумывай факты.
+Если данных нет — прямо пиши: “по предоставленным данным не проверялось”.
+Если источник не ответил — пиши: “требуется ручная проверка”.
+Не обещай 100% безопасность.
+Не называй объект юридически чистым.
+Пиши уверенно, как юрист по недвижимости, но понятным клиенту языком.
+
+СТРУКТУРИРОВАННЫЕ ДАННЫЕ:
+""" + safe_json(payload, 18000)
+
+    try:
+        # Используем официальный SDK, если он установлен из requirements.txt.
+        from gigachat import GigaChat
+
+        def call_sync() -> str:
+            with GigaChat(credentials=credentials, scope=GIGACHAT_SCOPE, verify_ssl_certs=GIGACHAT_VERIFY_SSL_CERTS) as giga:
+                resp = giga.chat({
+                    "model": GIGACHAT_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                })
+                return clean_text(resp.choices[0].message.content)
+
+        report = await asyncio.to_thread(call_sync)
+        if report:
+            return report, None
+        return build_fallback_legal_report(payload), "GigaChat вернул пустой ответ: отчет сформирован резервной backend-логикой."
+    except Exception as e:
+        return build_fallback_legal_report(payload), f"GigaChat недоступен: отчет сформирован резервной backend-логикой. Причина: {clean_text(e)[:180]}"
 
 
-def build_legal_report(req: CheckRequest, checklist: list) -> str:
-    risks = [x for x in checklist if x["status"] == "risk"]
-    manuals = [x for x in checklist if x["status"] == "manual"]
-    oks = [x for x in checklist if x["status"] == "ok"]
+def build_fallback_legal_report(payload: Dict[str, Any]) -> str:
+    seller = payload.get("seller", {})
+    prop = payload.get("property", {})
+    checklist = payload.get("checklist", [])
+    risks = [x for x in checklist if x.get("status") == "risk"]
+    manual = [x for x in checklist if x.get("status") == "manual_check"]
+    ok = [x for x in checklist if x.get("status") == "ok"]
 
-    seller = " ".join([req.last, req.first, req.middle]).strip()
-    obj = req.cadastral_number or req.cadastre_number or req.address or "по предоставленным данным не указан"
+    seller_name = " ".join([seller.get("last", ""), seller.get("first", ""), seller.get("middle", "")]).strip() or "по предоставленным данным не указан"
+    obj = prop.get("query") or "по предоставленным данным не проверялось"
 
-    risk_level = "низкий предварительный риск"
     if risks:
-        risk_level = "повышенный риск"
-    if len(risks) >= 2:
-        risk_level = "высокий риск"
-    if manuals and not risks:
-        risk_level = "неполные данные, требуется ручная проверка"
+        short = "по автоматическим данным есть признаки риска, сделку нельзя двигать без ручной проверки."
+    elif manual:
+        short = "часть источников не вернула данные, требуется ручная проверка до аванса."
+    else:
+        short = "по полученным автоматическим данным явные риски не выделены, но это не гарантия безопасности."
 
     lines = [
         "1. Краткий вывод",
-        f"По автоматическим проверкам сформирована предварительная оценка: {risk_level}.",
-        "Этот вывод не является гарантией безопасности сделки и требует сверки с оригиналами документов.",
+        f"Предварительный вывод: {short}",
         "",
         "2. Что проверено",
-        f"Продавец: {seller or 'по предоставленным данным не указан'}.",
-        f"Дата рождения: {req.dob or 'по предоставленным данным не указана'}.",
+        f"Продавец: {seller_name}.",
+        f"Дата рождения: {seller.get('dob') or 'по предоставленным данным не проверялось'}.",
         f"Объект: {obj}.",
+        f"Проверок без явных рисков: {len(ok)}. Проверок с рисками: {len(risks)}. Требуют ручной проверки: {len(manual)}.",
         "",
         "3. Риски по продавцу",
     ]
-
-    seller_items = [x for x in checklist if x["title"] in ["Паспорт МВД", "ФССП", "Банкротство / Федресурс", "Залоги движимого имущества", "Суды / арбитраж"]]
-    for item in seller_items:
-        lines.append(f"- {item['title']}: {item['summary']}")
-
-    lines.extend(["", "4. Риски по объекту"])
-    egrn = next((x for x in checklist if x["title"] == "ЕГРН / Росреестр"), None)
-    if egrn:
-        lines.append(f"- {egrn['title']}: {egrn['summary']}")
-    else:
-        lines.append("- ЕГРН / Росреестр: по предоставленным данным не проверялось.")
-
-    lines.extend([
+    for item in checklist:
+        if item.get("source") != "ЕГРН / Росреестр":
+            lines.append(f"- {item.get('source')}: {item.get('summary')}")
+    lines += ["", "4. Риски по объекту"]
+    egrn = next((x for x in checklist if x.get("source") == "ЕГРН / Росреестр"), None)
+    lines.append(f"- ЕГРН / Росреестр: {egrn.get('summary') if egrn else 'по предоставленным данным не проверялось'}")
+    lines += [
         "",
         "5. Что говорит в пользу сделки",
-        f"Проверок без выявленных рисков: {len(oks)}.",
-        "Положительным фактором можно считать только те пункты, где получен понятный результат и не выявлены актуальные риски.",
+        "В пользу сделки говорят только те пункты, где источник реально ответил и backend присвоил статус ok. Отсутствие ответа источника не считается отсутствием риска.",
         "",
         "6. Что обязательно проверить до аванса",
-    ])
-
-    if manuals:
-        for item in manuals:
-            lines.append(f"- {item['title']}: требуется ручная проверка. Ссылка: {item.get('manual_check_url','')}")
+    ]
+    if manual:
+        for item in manual:
+            lines.append(f"- {item.get('source')}: требуется ручная проверка. {item.get('manual_url') or ''}")
     else:
-        lines.append("- Перед авансом всё равно нужно сверить оригиналы документов, актуальную ЕГРН, основание права, семейное положение продавца и отсутствие ограничений.")
-
-    lines.extend([
+        lines.append("- Актуальная выписка ЕГРН, основание права, семейное положение продавца, полномочия, отсутствие свежих ограничений и долгов.")
+    lines += [
         "",
         "7. Что прописать в авансовом соглашении / ПДКП",
-        "Прописать обязанность продавца подтвердить отсутствие скрытых обременений, арестов, запретов, банкротства и активных исполнительных производств.",
-        "Если есть закрытые ИП, отдельно указать обязанность продавца предоставить документы об окончании/прекращении и отсутствии действующих ограничений.",
+        "Прописать обязанность продавца подтвердить отсутствие скрытых обременений, арестов, запретов, банкротства, активных исполнительных производств и судебных споров, влияющих на сделку.",
         "",
         "8. Безопасная схема расчетов",
-        "При долгах, ограничениях или неполных данных безопаснее использовать аккредитив, депозит нотариуса или иную контролируемую схему расчетов с условиями раскрытия после перехода права и снятия ограничений.",
+        "При долгах, ограничениях или неполных данных использовать аккредитив, депозит нотариуса или иную контролируемую схему с раскрытием денег только после выполнения условий.",
         "",
         "9. Итоговое заключение",
-        "Автоматическая проверка помогает выявить предварительные риски, но не заменяет ручной юридический анализ документов и актуальной выписки ЕГРН. 100% безопасность сделки не гарантируется.",
-    ])
-
+        "Отчет является предварительным. Не обещает 100% безопасность и не заменяет ручную юридическую проверку документов специалистом.",
+    ]
     return "\n".join(lines)
 
 
-def generate_pdf(report_id: str, registry_results: dict, legal_report: str) -> Path:
-    pdf_path = REPORT_DIR / f"{report_id}.pdf"
+# -----------------------------
+# PDF
+# -----------------------------
+def save_report_json(report_id: str, data: Dict[str, Any]) -> Path:
+    path = REPORT_DIR / f"{report_id}.json"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
+
+def load_report_json(report_id: str) -> Dict[str, Any]:
+    path = REPORT_DIR / f"{report_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Отчет не найден или уже удален.")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def cleanup_old_reports() -> None:
+    cutoff = time.time() - REPORT_TTL_SECONDS
+    for path in REPORT_DIR.glob("*"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def generate_pdf_file(report_id: str, report_data: Dict[str, Any]) -> Path:
+    pdf_path = REPORT_DIR / f"{report_id}.pdf"
     if SimpleDocTemplate is None:
-        pdf_path.write_text("PDF module reportlab is not installed. Add reportlab to requirements.txt", encoding="utf-8")
-        return pdf_path
+        raise RuntimeError("reportlab is not installed")
 
     doc = SimpleDocTemplate(str(pdf_path), pagesize=A4, rightMargin=42, leftMargin=42, topMargin=42, bottomMargin=42)
-
     font_name = "Helvetica"
-    try:
-        dejavu = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-        if Path(dejavu).exists():
-            pdfmetrics.registerFont(TTFont("DejaVuSans", dejavu))
-            font_name = "DejaVuSans"
-    except Exception:
-        pass
+    for font_path in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]:
+        try:
+            if Path(font_path).exists():
+                pdfmetrics.registerFont(TTFont("ReportFont", font_path))
+                font_name = "ReportFont"
+                break
+        except Exception:
+            pass
 
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("TitleRU", parent=styles["Title"], fontName=font_name, fontSize=18, leading=24, alignment=TA_LEFT, spaceAfter=16)
-    h_style = ParagraphStyle("HeadRU", parent=styles["Heading2"], fontName=font_name, fontSize=13, leading=18, spaceBefore=12, spaceAfter=8)
-    p_style = ParagraphStyle("BodyRU", parent=styles["BodyText"], fontName=font_name, fontSize=10, leading=15, spaceAfter=6)
+    title_style = ParagraphStyle("TitleRU", parent=styles["Title"], fontName=font_name, fontSize=18, leading=24, alignment=TA_LEFT, spaceAfter=14)
+    h_style = ParagraphStyle("HeadRU", parent=styles["Heading2"], fontName=font_name, fontSize=13, leading=18, spaceBefore=10, spaceAfter=6)
+    p_style = ParagraphStyle("BodyRU", parent=styles["BodyText"], fontName=font_name, fontSize=10, leading=15, spaceAfter=5)
+    small_style = ParagraphStyle("SmallRU", parent=p_style, fontSize=8, leading=12)
 
-    def esc(s):
-        return clean_text(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    def p(text: Any, style=p_style) -> Paragraph:
+        return Paragraph(html.escape(clean_text(text)).replace("\n", "<br/>"), style)
 
-    story = []
-    story.append(Paragraph("Юридический отчет по проверке недвижимости", title_style))
-    story.append(Paragraph(f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}", p_style))
-    story.append(Spacer(1, 8))
+    req = report_data.get("request", {})
+    prop = report_data.get("property", {})
+    checklist = report_data.get("checklist", [])
+    registry_data = report_data.get("registry_data", {})
+    legal_report = report_data.get("legal_report", "")
 
-    story.append(Paragraph("1. Данные, полученные из реестров", h_style))
-    for item in registry_results.values():
-        status_label = {"ok": "Проверено — риск не выявлен", "manual": "Требуется ручная проверка", "risk": "Выявлены риски"}.get(item.get("status"), "Статус не определен")
-        story.append(Paragraph(f"<b>{esc(item.get('title'))}</b>", p_style))
-        story.append(Paragraph(f"{esc(status_label)}. {esc(item.get('summary'))}", p_style))
-        for d in item.get("details", [])[:10]:
-            story.append(Paragraph(f"• {esc(d)}", p_style))
-        if item.get("status") == "manual" and item.get("manual_check_url"):
-            story.append(Paragraph(f"Ручная проверка: {esc(item.get('manual_check_url'))}", p_style))
-        story.append(Spacer(1, 4))
+    story = [
+        p("Юридический отчет по проверке продавца и объекта недвижимости", title_style),
+        p(f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}", small_style),
+        Spacer(1, 8),
+        p("1. Данные продавца", h_style),
+        p(f"ФИО: {' '.join([req.get('last',''), req.get('first',''), req.get('middle','')]).strip() or 'по предоставленным данным не указано'}"),
+        p(f"Дата рождения: {req.get('dob') or 'по предоставленным данным не указана'}"),
+        p(f"ИНН передан: {'да' if req.get('inn') else 'нет'}"),
+        p("2. Данные объекта", h_style),
+        p(f"Запрос: {prop.get('query') or 'по предоставленным данным не указан'}"),
+        p(f"Кадастровый номер: {prop.get('cadastral_number') or 'по предоставленным данным не указан'}"),
+        p("3. Чек-лист проверок", h_style),
+    ]
+    for item in checklist:
+        status_label = {"ok": "Проверено", "risk": "Выявлен риск", "manual_check": "Требуется ручная проверка"}.get(item.get("status"), "Не определено")
+        story.append(p(f"{item.get('source')}: {status_label}. {item.get('summary')}"))
+        for d in item.get("details", [])[:12]:
+            story.append(p(f"• {d}", small_style))
 
-    story.append(Paragraph("2. Юридический анализ", h_style))
+    story.append(p("4. Данные, полученные из реестров", h_style))
+    for key, block in registry_data.items():
+        story.append(p(f"{block.get('source') or key}: {block.get('summary','')}"))
+        raw = block.get("data") or block.get("stats") or block.get("items")
+        if raw:
+            for line in safe_json(strip_sensitive(raw), 1800).split("\n")[:35]:
+                story.append(p(line, small_style))
+
+    story.append(p("5. Юридический отчет", h_style))
     for paragraph in legal_report.split("\n"):
-        if paragraph.strip():
-            story.append(Paragraph(esc(paragraph), p_style))
-        else:
-            story.append(Spacer(1, 4))
+        story.append(p(paragraph if paragraph.strip() else " ", p_style))
+
+    story.append(p("Дисклеймер", h_style))
+    story.append(p(DISCLAIMER, small_style))
 
     doc.build(story)
     return pdf_path
 
 
 def absolute_pdf_url(request: Request, report_id: str) -> str:
-    base = str(request.base_url).rstrip("/")
-    return f"{base}/download-pdf/{report_id}"
+    return f"{str(request.base_url).rstrip('/')}/download-pdf/{report_id}"
 
 
+def pdf_base64(path: Path) -> str:
+    return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+# -----------------------------
+# ROUTES
+# -----------------------------
 @app.get("/")
-async def root():
+@app.get("/health")
+async def health() -> Dict[str, Any]:
     return {
-        "ok": True,
-        "service": "Real Estate Legal Check API",
+        "success": True,
+        "service": "Real Estate Seller & Property Check API",
+        "version": "2.0.0",
         "newdb_configured": bool(NEWDB_TOKEN),
-        "newdb_url": NEWDB_URL,
-        "endpoints": ["/check-report", "/download-pdf/{report_id}", "/debug-newdb"],
-    }
-
-
-@app.post("/debug-newdb")
-async def debug_newdb(req: CheckRequest):
-    """
-    Техническая диагностика.
-    Этот endpoint нужен, чтобы увидеть, какие именно ответы NewDB возвращает по каждому методу.
-    Клиентам его не показывать.
-    """
-    prop = normalize_property(req)
-    dob_ru = normalize_dob(req.dob)
-    dob_iso = dob_to_iso(req.dob)
-    passport_series = only_digits(req.passport_series)
-    passport_number = only_digits(req.passport_number)
-
-    methods = {
-        "passport": {
-            "method": "passport_mvd",
-            "series": passport_series,
-            "seria": passport_series,
-            "number": passport_number,
-            "lastname": req.last,
-            "firstname": req.first,
-            "middlename": req.middle,
-            "secondname": req.middle,
-            "birthdate": dob_ru,
-            "dob": dob_iso,
-            "country": "ru",
-        },
-        "fssp": {
-            "method": "fssp",
-            "lastname": req.last,
-            "firstname": req.first,
-            "middlename": req.middle,
-            "secondname": req.middle,
-            "birthdate": dob_ru,
-            "dob": dob_iso,
-            "region": req.region,
-            "country": "ru",
-        },
-        "bankruptcy": {
-            "method": "bankruptcy",
-            "lastname": req.last,
-            "firstname": req.first,
-            "middlename": req.middle,
-            "secondname": req.middle,
-            "birthdate": dob_ru,
-            "dob": dob_iso,
-            "inn": req.inn,
-            "country": "ru",
-        },
-        "pledges": {
-            "method": "pledges",
-            "lastname": req.last,
-            "firstname": req.first,
-            "middlename": req.middle,
-            "secondname": req.middle,
-            "birthdate": dob_ru,
-            "dob": dob_iso,
-            "inn": req.inn,
-            "country": "ru",
-        },
-        "courts": {
-            "method": "courts",
-            "lastname": req.last,
-            "firstname": req.first,
-            "middlename": req.middle,
-            "secondname": req.middle,
-            "birthdate": dob_ru,
-            "dob": dob_iso,
-            "inn": req.inn,
-            "country": "ru",
-        },
-        "egrn": {
-            "method": "rosreestr",
-            "address": prop.get("address") or prop.get("query"),
-            "cadnum": prop.get("cadastral_number"),
-            "cadastral_number": prop.get("cadastral_number"),
-            "country": "ru",
-        },
-    }
-
-    async def one(name, params):
-        res = await newdb_post(params, max_wait=20, poll_interval=5)
-        return name, res
-
-    results = await asyncio.gather(*[one(name, params) for name, params in methods.items()])
-    return {
-        "sent_property": prop,
-        "results": {name: result for name, result in results},
+        "gigachat_configured": bool(gigachat_credentials()),
+        "endpoints": ["/check-report", "/download-pdf/{report_id}", "/health"],
     }
 
 
 @app.post("/check-report")
-async def check_report(req: CheckRequest, request: Request):
-    prop = normalize_property(req)
-    dob_ru = normalize_dob(req.dob)
-    dob_iso = dob_to_iso(req.dob)
-    passport_series = only_digits(req.passport_series)
-    passport_number = only_digits(req.passport_number)
+async def check_report(req: CheckRequest, request: Request) -> JSONResponse:
+    cleanup_old_reports()
+    warnings: List[str] = []
 
-    passport_params = {
-        "method": "passport_mvd",
-        "series": passport_series,
-        "seria": passport_series,
-        "number": passport_number,
-        "lastname": req.last,
-        "firstname": req.first,
-        "middlename": req.middle,
-        "secondname": req.middle,
-        "birthdate": dob_ru,
-        "dob": dob_iso,
-        "country": "ru",
-    }
+    if not clean_text(req.last) or not clean_text(req.first):
+        raise HTTPException(status_code=422, detail="Укажите фамилию и имя продавца.")
 
-    fssp_params = {
-        "method": "fssp",
-        "lastname": req.last,
-        "firstname": req.first,
-        "middlename": req.middle,
-        "secondname": req.middle,
-        "birthdate": dob_ru,
-        "dob": dob_iso,
-        "region": req.region,
-        "country": "ru",
-    }
-
-    bankruptcy_params = {
-        "method": "bankruptcy",
-        "lastname": req.last,
-        "firstname": req.first,
-        "middlename": req.middle,
-        "secondname": req.middle,
-        "birthdate": dob_ru,
-        "dob": dob_iso,
-        "inn": req.inn,
-        "country": "ru",
-    }
-
-    pledges_params = {
-        "method": "pledges",
-        "lastname": req.last,
-        "firstname": req.first,
-        "middlename": req.middle,
-        "secondname": req.middle,
-        "birthdate": dob_ru,
-        "dob": dob_iso,
-        "inn": req.inn,
-        "country": "ru",
-    }
-
-    courts_params = {
-        "method": "courts",
-        "lastname": req.last,
-        "firstname": req.first,
-        "middlename": req.middle,
-        "secondname": req.middle,
-        "birthdate": dob_ru,
-        "dob": dob_iso,
-        "inn": req.inn,
-        "country": "ru",
-    }
-
-    egrn_params = {
-        "method": "rosreestr",
-        "address": prop.get("address") or prop.get("query"),  # обязательно address
-        "cadnum": prop.get("cadastral_number"),
-        "cadastral_number": prop.get("cadastral_number"),
-        "country": "ru",
-    }
+    params, prop = build_newdb_params(req)
 
     passport_raw, fssp_raw, bankruptcy_raw, pledges_raw, courts_raw, egrn_raw = await asyncio.gather(
-        newdb_post(passport_params, max_wait=70, poll_interval=5),
-        newdb_post(fssp_params, max_wait=90, poll_interval=5),
-        newdb_post(bankruptcy_params, max_wait=90, poll_interval=5),
-        newdb_post(pledges_params, max_wait=90, poll_interval=5),
-        newdb_post(courts_params, max_wait=90, poll_interval=5),
-        newdb_post(egrn_params, max_wait=240, poll_interval=8),
+        newdb_post(params["passport"], max_wait=75, poll_interval=5),
+        newdb_post(params["fssp"], max_wait=100, poll_interval=5),
+        newdb_post(params["bankruptcy"], max_wait=100, poll_interval=5),
+        newdb_post(params["pledges"], max_wait=90, poll_interval=5),
+        newdb_post(params["courts"], max_wait=100, poll_interval=5),
+        newdb_post(params["egrn"], max_wait=300, poll_interval=10),
     )
 
-    checklist = [
-        classify_passport(passport_raw),
-        classify_fssp(fssp_raw),
-        classify_empty_or_risk(
-            bankruptcy_raw,
-            "Банкротство / Федресурс",
-            "Выявлены сведения, похожие на банкротство или публикации Федресурса.",
-            "По полученным данным сведения о банкротстве не найдены.",
-            DEFAULT_MANUAL_LINKS["bankruptcy"],
-        ),
-        classify_empty_or_risk(
-            pledges_raw,
-            "Залоги движимого имущества",
-            "Выявлены сведения о залогах. Требуется оценить предмет залога и связь с продавцом.",
-            "По полученным данным сведения о залогах не найдены.",
-            DEFAULT_MANUAL_LINKS["pledges"],
-        ),
-        classify_empty_or_risk(
-            courts_raw,
-            "Суды / арбитраж",
-            "Выявлены судебные/арбитражные сведения. Требуется оценить связь с продавцом и сделкой.",
-            "По полученным данным релевантные судебные сведения не найдены.",
-            DEFAULT_MANUAL_LINKS["courts"],
-        ),
-        classify_egrn(egrn_raw, prop),
-    ]
+    passport_item = classify_passport(passport_raw)
+    fssp_item, fssp_stats = classify_fssp(fssp_raw)
+    bankruptcy_item, bankruptcy_items = classify_empty_or_risk(
+        bankruptcy_raw,
+        "Банкротство / Федресурс",
+        "По полученным данным сведения о банкротстве не выявлены.",
+        "Выявлены сведения, связанные с банкротством.",
+        MANUAL_URLS["bankruptcy"],
+    )
+    pledges_item, pledges_items = classify_empty_or_risk(
+        pledges_raw,
+        "Залоги движимого имущества",
+        "По полученным данным сведения о залогах движимого имущества не выявлены.",
+        "Выявлены сведения о залогах. Требуется оценить предмет залога и связь с продавцом.",
+        MANUAL_URLS["pledges"],
+    )
+    courts_item, courts_items = classify_empty_or_risk(
+        courts_raw,
+        "Суды / арбитраж",
+        "По полученным данным судебные дела не выявлены.",
+        "Найдены судебные производства. Требуется анализ предмета спора.",
+        MANUAL_URLS["courts"],
+    )
+    egrn_item, egrn_data = classify_egrn(egrn_raw, prop)
 
-    registry_results = make_registry_results(checklist)
-    legal_report = build_legal_report(req, checklist)
+    checklist = [passport_item, fssp_item, bankruptcy_item, pledges_item, courts_item, egrn_item]
+
+    registry_data = {
+        "passport": {"source": passport_item["source"], "status": passport_item["status"], "summary": passport_item["summary"], "details": passport_item["details"], "data": strip_sensitive(passport_raw) if passport_item["status"] != "manual_check" else {}},
+        "fssp": {"source": fssp_item["source"], "status": fssp_item["status"], "summary": fssp_item["summary"], "details": fssp_item["details"], "stats": fssp_stats, "data": strip_sensitive(fssp_raw) if fssp_item["status"] != "manual_check" else {}},
+        "bankruptcy": {"source": bankruptcy_item["source"], "status": bankruptcy_item["status"], "summary": bankruptcy_item["summary"], "details": bankruptcy_item["details"], "items": bankruptcy_items},
+        "pledges": {"source": pledges_item["source"], "status": pledges_item["status"], "summary": pledges_item["summary"], "details": pledges_item["details"], "items": pledges_items},
+        "courts": {"source": courts_item["source"], "status": courts_item["status"], "summary": courts_item["summary"], "details": courts_item["details"], "items": courts_items},
+        "egrn": {"source": egrn_item["source"], "status": egrn_item["status"], "summary": egrn_item["summary"], "details": egrn_item["details"], "data": egrn_data},
+    }
+
+    for item in checklist:
+        if item["status"] == "manual_check":
+            warnings.append(f"{item['source']}: требуется ручная проверка.")
+
+    prompt_payload = build_prompt_payload(req, prop, checklist, registry_data, warnings)
+    legal_report, giga_warning = await generate_gigachat_report(prompt_payload)
+    if giga_warning:
+        warnings.append(giga_warning)
 
     report_id = str(uuid.uuid4())
-    generate_pdf(report_id, registry_results, legal_report)
-
-    return {
+    response_data: Dict[str, Any] = {
+        "success": True,
         "report_id": report_id,
-        "registry_results": registry_results,
+        "created_at": now_iso(),
+        "request": strip_sensitive(req.model_dump()),
+        "property": prop,
         "checklist": checklist,
+        "registry_data": registry_data,
+        # Совместимость с ранней версией виджета:
+        "registry_results": registry_data,
         "legal_report": legal_report,
-        "pdf_url": absolute_pdf_url(request, report_id),
+        "disclaimer": DISCLAIMER,
+        "warnings": warnings,
+        "pdf_available": False,
+        "pdf_url": "",
+        "pdf_base64": "",
     }
+
+    save_report_json(report_id, response_data)
+    try:
+        pdf_path = generate_pdf_file(report_id, response_data)
+        response_data["pdf_available"] = True
+        response_data["pdf_url"] = absolute_pdf_url(request, report_id)
+        # Оставляю base64 для твоего текущего frontend-виджета, где кнопка скачивания завязана именно на pdf_base64.
+        response_data["pdf_base64"] = pdf_base64(pdf_path)
+        save_report_json(report_id, response_data)
+    except Exception as e:
+        warnings.append(f"PDF временно не сформирован: {clean_text(e)[:180]}")
+        response_data["warnings"] = warnings
+        save_report_json(report_id, response_data)
+
+    # Финальная защита: наружу не уходит token/balance/requestId.
+    return JSONResponse(content=strip_sensitive(response_data))
 
 
 @app.get("/download-pdf/{report_id}")
-async def download_pdf(report_id: str):
-    if not re.match(r"^[a-f0-9-]{36}$", report_id):
-        raise HTTPException(status_code=400, detail="Invalid report id")
+async def download_pdf(report_id: str) -> FileResponse:
+    if not re.fullmatch(r"[a-f0-9-]{36}", report_id):
+        raise HTTPException(status_code=400, detail="Некорректный идентификатор отчета.")
 
-    path = REPORT_DIR / f"{report_id}.pdf"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="PDF not found")
+    pdf_path = REPORT_DIR / f"{report_id}.pdf"
+    if not pdf_path.exists():
+        data = load_report_json(report_id)
+        try:
+            pdf_path = generate_pdf_file(report_id, data)
+        except Exception:
+            raise HTTPException(status_code=503, detail="PDF временно недоступен. Попробуйте сформировать отчет повторно.")
 
     return FileResponse(
-        path=str(path),
+        path=str(pdf_path),
         media_type="application/pdf",
         filename=f"legal-real-estate-report-{report_id}.pdf",
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Не отдаем traceback/Render/внутренние детали пользователю.
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "message": "Не удалось сформировать отчет. Проверьте данные и повторите запрос. Если ошибка повторяется — требуется ручная проверка.",
+            "warnings": ["Техническая ошибка скрыта от пользователя и не влияет на юридический вывод."],
+        },
     )
