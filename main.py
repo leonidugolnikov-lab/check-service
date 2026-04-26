@@ -22,7 +22,7 @@ try:
 except Exception:
     SimpleDocTemplate = None
 
-app = FastAPI(title="Real Estate Seller & Property Check API", version="1.0.0-polling-final")
+app = FastAPI(title="Real Estate Seller & Property Check API", version="1.0.1-polling-no-extra-tokens")
 
 app.add_middleware(
     CORSMiddleware,
@@ -340,29 +340,25 @@ async def newdb_call(client: httpx.AsyncClient, params: Optional[Dict[str, Any]]
     while elapsed < max_wait:
         await asyncio.sleep(NEWDB_POLL_INTERVAL)
         elapsed += NEWDB_POLL_INTERVAL
-        poll_payloads = [
-            {"requestId": request_id, "params": params},
-            {"requestId": request_id},
-            {"params": {**params, "requestId": request_id}},
-            {"params": {**params, "newdb_qid": data.get("params", {}).get("newdb_qid", "")}} if isinstance(data.get("params"), dict) and data.get("params", {}).get("newdb_qid") else None,
-        ]
-        for pp in [x for x in poll_payloads if x]:
+        # IMPORTANT: polling must NOT resend params.
+        # Resending params creates a NEW paid task in newDB. Poll only by top-level requestId.
+        pp = {"requestId": request_id}
+        try:
+            pr = await client.post(NEWDB_URL, headers=headers, json=pp)
             try:
-                pr = await client.post(NEWDB_URL, headers=headers, json=pp)
-                try:
-                    polled = pr.json()
-                except Exception:
-                    polled = {"raw_text": pr.text}
-                polled["_http_status"] = pr.status_code
-                last = polled
-                pst = state_of(polled)
-                if polled.get("results") or pst in GOOD_STATES:
-                    return polled
-                if is_bad_newdb_response(polled) and pst not in IN_PROGRESS_STATES:
-                    return polled
-            except Exception as e:
-                last = {"state": "error", "error": f"Ошибка polling newDB: {e}"}
-                continue
+                polled = pr.json()
+            except Exception:
+                polled = {"raw_text": pr.text}
+            polled["_http_status"] = pr.status_code
+            last = polled
+            pst = state_of(polled)
+            if polled.get("results") or pst in GOOD_STATES:
+                return polled
+            if is_bad_newdb_response(polled) and pst not in IN_PROGRESS_STATES:
+                return polled
+        except Exception as e:
+            last = {"state": "error", "error": f"Ошибка polling newDB: {e}"}
+            continue
     last["state"] = "timeout"
     last["error"] = f"Источник не вернул итоговый результат за {max_wait} секунд. Требуется ручная проверка."
     return last
@@ -826,7 +822,7 @@ def make_pdf(report_id: str, n: Dict[str, Any], checklist: List[Dict[str, Any]],
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.0.0-polling-final", "newdb_url": NEWDB_URL, "poll_interval": NEWDB_POLL_INTERVAL, "default_wait": NEWDB_DEFAULT_MAX_WAIT, "egrn_wait": NEWDB_EGRN_MAX_WAIT}
+    return {"status": "ok", "version": "1.0.1-polling-no-extra-tokens", "newdb_url": NEWDB_URL, "poll_interval": NEWDB_POLL_INTERVAL, "default_wait": NEWDB_DEFAULT_MAX_WAIT, "egrn_wait": NEWDB_EGRN_MAX_WAIT}
 
 @app.post("/debug-newdb")
 async def debug_newdb(req: CheckRequest):
@@ -836,7 +832,7 @@ async def debug_newdb(req: CheckRequest):
         registry_data = registry_data_from_checklist(checklist)
         scoring, recs = score_and_recommend(checklist)
         legal_report = build_legal_report(n, checklist, scoring, recs)
-        return {"success": True, "payloads": payloads, "responses": strip_sensitive(responses, debug=True), "checklist": checklist, "classified_checklist": checklist, "registry_data": registry_data, "risk_scoring": scoring, "recommendations": recs, "legal_report": legal_report, "normalized_input": n, "notes": ["Polling включен: queued/restart/in progress ожидаются до complete.", "ГАС пробует основной метод и fallback; если оба не приняты — manual_check.", "Клиентский /check-report очищает служебные поля newDB."]}
+        return {"success": True, "payloads": payloads, "responses": strip_sensitive(responses, debug=True), "checklist": checklist, "classified_checklist": checklist, "registry_data": registry_data, "risk_scoring": scoring, "recommendations": recs, "legal_report": legal_report, "normalized_input": n, "notes": ["Polling включен: queued/restart/in progress ожидаются до complete. Повторные опросы идут только по top-level requestId без повторной отправки params.", "ГАС пробует основной метод и fallback; если оба не приняты — manual_check.", "Клиентский /check-report очищает служебные поля newDB."]}
     except Exception as e:
         return {"success": False, "stage": "debug-newdb", "error": str(e)}
 
