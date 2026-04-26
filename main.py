@@ -98,6 +98,54 @@ def is_empty_data(data) -> bool:
     return False
 
 
+def source_failed(data) -> bool:
+    """Отделяет техническую ошибку источника от реального результата проверки."""
+    if not isinstance(data, dict):
+        return False
+
+    state = clean_text(data.get("state")).lower()
+    if state in {"manual", "timeout", "failed", "fail", "error", "not_configured", "unauthorized", "forbidden"}:
+        return True
+
+    if data.get("error") or data.get("errors"):
+        return True
+
+    text = " ".join(flatten_strings(data, 120)).lower()
+    failed_markers = [
+        "failed",
+        "fail",
+        "ошибка",
+        "error",
+        "unauthorized",
+        "forbidden",
+        "access denied",
+        "проверьте баланс",
+        "проверьте токен",
+        "токен доступа",
+        "x-api-key",
+        "access@newdb.net",
+        "недостаточно средств",
+        "баланс",
+    ]
+    return any(marker in text for marker in failed_markers)
+
+
+def safe_error_details(data) -> list:
+    """Короткое объяснение для клиента без requestId, паспортов и технического мусора."""
+    if not isinstance(data, dict):
+        return []
+    text = " ".join(flatten_strings(data, 120)).lower()
+    if "баланс" in text or "access@newdb.net" in text:
+        return ["Источник проверки не вернул данные: нужно проверить баланс/доступ NewDB и повторить запрос."]
+    if "токен" in text or "x-api-key" in text or "unauthorized" in text or "forbidden" in text:
+        return ["Источник проверки не вернул данные: нужно проверить токен доступа NewDB."]
+    if data.get("error"):
+        return [clean_text(data.get("error"))]
+    if clean_text(data.get("state")).lower() == "timeout":
+        return ["Источник не успел вернуть итоговый результат за время ожидания."]
+    return ["Источник вернул техническую ошибку или неоднозначный ответ. Требуется ручная проверка."]
+
+
 def flatten_strings(obj, limit=80):
     out = []
 
@@ -157,6 +205,9 @@ async def newdb_post(params: dict, max_wait: int = 60, poll_interval: int = 3) -
         return {"state": "manual", "error": "NEWDB_TOKEN не задан"}
 
     headers = {
+        # NewDB в разных кабинетах может принимать токен по-разному.
+        # Передаем оба варианта: X-API-KEY и Bearer.
+        "X-API-KEY": NEWDB_TOKEN,
         "Authorization": f"Bearer {NEWDB_TOKEN}",
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -236,12 +287,12 @@ def extract_items(data) -> list:
 def classify_passport(data) -> dict:
     text = " ".join(flatten_strings(data)).lower()
 
-    if data.get("state") in {"manual", "timeout"} or data.get("error"):
+    if source_failed(data):
         return {
             "title": "Паспорт МВД",
             "status": "manual",
             "summary": "Не удалось автоматически получить результат. Требуется ручная проверка.",
-            "details": [clean_text(data.get("error"))] if data.get("error") else [],
+            "details": safe_error_details(data),
             "manual_check_url": DEFAULT_MANUAL_LINKS["passport"],
         }
 
@@ -267,7 +318,7 @@ def classify_passport(data) -> dict:
         "title": "Паспорт МВД",
         "status": "manual",
         "summary": "Результат проверки паспорта неоднозначный. Требуется ручная проверка.",
-        "details": flatten_strings(data, 5),
+        "details": ["Источник вернул ответ, который нельзя уверенно трактовать автоматически."],
         "manual_check_url": DEFAULT_MANUAL_LINKS["passport"],
     }
 
@@ -301,12 +352,12 @@ def extract_amount(item) -> float:
 
 
 def classify_fssp(data) -> dict:
-    if data.get("state") in {"manual", "timeout"} or data.get("error"):
+    if source_failed(data):
         return {
             "title": "ФССП",
             "status": "manual",
             "summary": "Не удалось автоматически получить результат. Требуется ручная проверка.",
-            "details": [clean_text(data.get("error"))] if data.get("error") else [],
+            "details": safe_error_details(data),
             "manual_check_url": DEFAULT_MANUAL_LINKS["fssp"],
         }
 
@@ -395,12 +446,12 @@ def classify_fssp(data) -> dict:
 
 
 def classify_empty_or_risk(data, title: str, risk_summary: str, ok_summary: str, manual_url: str) -> dict:
-    if data.get("state") in {"manual", "timeout"} or data.get("error"):
+    if source_failed(data):
         return {
             "title": title,
             "status": "manual",
             "summary": "Не удалось автоматически получить результат. Требуется ручная проверка.",
-            "details": [clean_text(data.get("error"))] if data.get("error") else [],
+            "details": safe_error_details(data),
             "manual_check_url": manual_url,
         }
 
@@ -446,15 +497,12 @@ def classify_empty_or_risk(data, title: str, risk_summary: str, ok_summary: str,
 
 
 def classify_egrn(data, prop: dict) -> dict:
-    if data.get("state") in {"manual", "timeout"} or data.get("error"):
+    if source_failed(data):
         return {
             "title": "ЕГРН / Росреестр",
             "status": "manual",
             "summary": "Автоматически получить данные ЕГРН не удалось. Требуется ручная проверка.",
-            "details": [
-                f"Запрос: {prop.get('query')}",
-                clean_text(data.get("error")) or "Росреестр мог не вернуть результат за время ожидания.",
-            ],
+            "details": [f"Запрос: {prop.get('query')}"] + safe_error_details(data),
             "manual_check_url": DEFAULT_MANUAL_LINKS["egrn"],
         }
 
