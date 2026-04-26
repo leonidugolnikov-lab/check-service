@@ -2,3 +2,5 @@ fastapi
 uvicorn
 httpx
 pydantic
+gigachat
+weasyprint
