@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
     SimpleDocTemplate = None
 
 
-app = FastAPI(title="Real Estate Seller & Property Check API", version="2.0.0")
+app = FastAPI(title="Real Estate Seller & Property Check API", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,6 +51,16 @@ GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
 GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat").strip()
 GIGACHAT_VERIFY_SSL_CERTS = os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "true").lower() not in {"0", "false", "no"}
 
+# Имена методов NewDB могут отличаться по тарифу/кабинету.
+# Если поддержка NewDB даст точное имя метода — задай его в Environment без изменения кода.
+NEWDB_METHOD_PASSPORT = os.getenv("NEWDB_METHOD_PASSPORT", "passport_mvd").strip()
+NEWDB_METHOD_FSSP = os.getenv("NEWDB_METHOD_FSSP", "fssp").strip()
+NEWDB_METHOD_BANKRUPTCY = os.getenv("NEWDB_METHOD_BANKRUPTCY", "bankruptcy").strip()
+NEWDB_METHOD_PLEDGES = os.getenv("NEWDB_METHOD_PLEDGES", "pledges").strip()
+NEWDB_METHOD_COURTS = os.getenv("NEWDB_METHOD_COURTS", "courts").strip()
+NEWDB_METHOD_EGRN = os.getenv("NEWDB_METHOD_EGRN", "rosreestr").strip()
+NEWDB_ENABLE_METHOD_FALLBACKS = os.getenv("NEWDB_ENABLE_METHOD_FALLBACKS", "true").lower() not in {"0", "false", "no"}
+
 REPORT_DIR = Path(os.getenv("REPORT_DIR", "reports"))
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 REPORT_TTL_SECONDS = int(os.getenv("REPORT_TTL_SECONDS", str(60 * 60 * 24)))
@@ -59,7 +69,7 @@ HTTP_TIMEOUT = httpx.Timeout(connect=25.0, read=300.0, write=60.0, pool=30.0)
 
 IN_PROGRESS_STATES = {"queued", "queue", "in progress", "progress", "pending", "processing", "wait", "waiting", "created", "new"}
 GOOD_STATES = {"complete", "completed", "done", "success", "finished", "ready", "ok"}
-BAD_STATES = {"failed", "fail", "error", "rejected", "denied", "timeout", "not_configured", "manual", "canceled", "cancelled"}
+BAD_STATES = {"failed", "fail", "error", "rejected", "denied", "timeout", "not_configured", "manual", "canceled", "cancelled", "skipped"}
 
 MANUAL_URLS = {
     "passport": "https://мвд.рф/сервисы-гувм",
@@ -187,6 +197,8 @@ def strip_sensitive(obj: Any) -> Any:
             if key in {
                 "balance", "token", "api_key", "x-api-key", "authorization", "access_token",
                 "client_secret", "secret", "password", "bearer", "headers",
+                "requestid", "request_id", "newdb_qid", "qid", "task_id", "docs_url",
+                "api docs", "errors_info", "sent_params", "http_status",
             }:
                 continue
             cleaned[k] = strip_sensitive(v)
@@ -221,6 +233,7 @@ def is_bad_response(data: Any) -> bool:
         "required parameter", "bad request", "unauthorized", "forbidden", "доступ запрещ",
         "not enough balance", "insufficient balance", "проверьте баланс", "x-api-key",
         "токен доступа", "access@newdb.net", '"code":400', '"status":400', "traceback",
+        "method or country is not valid", "error_code", "errors_info", "not valid",
     ]
     return any(x in txt for x in bad_markers)
 
@@ -258,19 +271,25 @@ def flatten_strings(obj: Any, limit: int = 80) -> List[str]:
 
 
 def extract_error_details(data: Any) -> List[str]:
+    # Наружу не отдаем requestId, docs_url, error_code, HTTP 400 и прочую кухню API.
     if not isinstance(data, dict):
         return [public_error()]
+    txt = text_blob(data)
+    if "method or country is not valid" in txt:
+        return ["Источник не принял параметры запроса. Требуется ручная проверка и уточнение метода в newDB."]
+    if "inn is not valid" in txt or "innyur" in txt:
+        return ["Источник требует другой тип ИНН для этой проверки. Требуется ручная проверка."]
+    if "required" in txt or "обязатель" in txt or "missing" in txt:
+        return ["Источник не принял запрос: не хватает обязательного параметра. Требуется ручная проверка."]
+    if "not enough balance" in txt or "insufficient balance" in txt or "проверьте баланс" in txt:
+        return ["Источник не выполнил проверку из-за настроек доступа или баланса. Требуется ручная проверка."]
     details: List[str] = []
-    for key in ["error", "message", "detail", "description", "raw_text"]:
+    for key in ["error", "message", "detail", "description"]:
         val = clean_text(data.get(key))
-        if val and "traceback" not in val.lower() and len(val) < 250:
+        low = val.lower()
+        if val and len(val) < 180 and not any(x in low for x in ["traceback", "requestid", "newdb", "docs_url"]):
             details.append(val)
-    if data.get("http_status"):
-        details.append(f"Источник вернул HTTP {data.get('http_status')}.")
-    if not details:
-        details.append(public_error())
-    # наружу не отдаем requestId, токены и служебный мусор
-    return list(dict.fromkeys(details))[:5]
+    return list(dict.fromkeys(details))[:3] or [public_error()]
 
 
 def extract_items(data: Any) -> List[Any]:
@@ -475,64 +494,161 @@ def find_request_id(data: Any) -> str:
     return ""
 
 
+
+def normalize_inn(value: str) -> Dict[str, str]:
+    digits = only_digits(value)
+    if len(digits) == 12:
+        return {"type": "fl", "value": digits}
+    if len(digits) == 10:
+        return {"type": "ul", "value": digits}
+    if digits:
+        return {"type": "invalid", "value": digits}
+    return {"type": "empty", "value": ""}
+
+
+def api_method_invalid(data: Any) -> bool:
+    txt = text_blob(data)
+    return "method or country is not valid" in txt or "method is not valid" in txt
+
+
+def skipped_source(reason: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {"state": "skipped", "error": reason, "sent_params": strip_sensitive(params or {})}
+
+
+def public_registry_data(obj: Any) -> Any:
+    forbidden = {
+        "requestid", "request_id", "newdb_qid", "qid", "task_id", "balance", "token",
+        "api_key", "authorization", "x-api-key", "headers", "params", "sent_params",
+        "http_status", "docs_url", "api docs", "errors_info", "error_code", "datecreated",
+    }
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if str(k).lower() in forbidden:
+                continue
+            out[k] = public_registry_data(v)
+        return out
+    if isinstance(obj, list):
+        return [public_registry_data(x) for x in obj]
+    return obj
+
+
+def method_variants(service: str, current: str) -> List[str]:
+    variants = {
+        "passport": [current, "passport_mvd", "passport"],
+        "fssp": [current, "fssp", "fssp_ip", "fssp_fl", "fssp_physical", "fssp_person"],
+        "bankruptcy": [current, "bankruptcy", "fedresurs", "bankrot", "efrsb"],
+        "pledges": [current, "pledges", "zalog", "reestr_zalogov"],
+        "courts": [current, "courts", "court", "kad_arbitr", "arbitr"],
+        "egrn": [current, "rosreestr", "egrn"],
+    }.get(service, [current])
+    seen: List[str] = []
+    for item in variants:
+        if item and item not in seen:
+            seen.append(item)
+    return seen
+
+
+async def newdb_service_post(service: str, params: Dict[str, Any], max_wait: int, poll_interval: int = 5) -> Dict[str, Any]:
+    if params.get("__skip__"):
+        return skipped_source(params.get("__skip_reason__") or public_error(), params)
+
+    first_result: Optional[Dict[str, Any]] = None
+    methods = method_variants(service, clean_text(params.get("method"))) if NEWDB_ENABLE_METHOD_FALLBACKS else [clean_text(params.get("method"))]
+    for method in methods:
+        attempt = dict(params)
+        attempt["method"] = method
+        result = await newdb_post(attempt, max_wait=max_wait, poll_interval=poll_interval)
+        if first_result is None:
+            first_result = result
+        if not api_method_invalid(result):
+            return result
+    return first_result or skipped_source(public_error(), params)
+
 # -----------------------------
 # SOURCE PARAMS
 # -----------------------------
 def build_newdb_params(req: CheckRequest) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
     prop = normalize_property(req)
     dob_ru = normalize_dob(req.dob)
-    dob_iso = dob_to_iso(req.dob)
     passport_series = only_digits(req.passport_series)
     passport_number = only_digits(req.passport_number)
+    inn_info = normalize_inn(req.inn)
 
-    person_base = {
-        "lastname": clean_text(req.last),
-        "firstname": clean_text(req.first),
-        "middlename": clean_text(req.middle),
-        "secondname": clean_text(req.middle),
+    last = clean_text(req.last)
+    first = clean_text(req.first)
+    middle = clean_text(req.middle)
+
+    # ВАЖНО: не используем один общий person_base для всех методов.
+    # По фактическому PDF было видно, что лишние secondname/dob/inn ломают проверки.
+    passport_params = {
+        "method": NEWDB_METHOD_PASSPORT,
+        "lastname": last,
+        "firstname": first,
+        "middlename": middle,
         "birthdate": dob_ru,
-        "dob": dob_iso,
+        "country": "ru",
+        "series": passport_series,
+        "seria": passport_series,
+        "number": passport_number,
+    }
+
+    fssp_params = {
+        "method": NEWDB_METHOD_FSSP,
+        "lastname": last,
+        "firstname": first,
+        "middlename": middle,
+        "birthdate": dob_ru,
+        "country": "ru",
+        "region": int(req.region or 0),
+    }
+
+    person_params = {
+        "lastname": last,
+        "firstname": first,
+        "middlename": middle,
+        "birthdate": dob_ru,
+        "country": "ru",
+    }
+
+    bankruptcy_params = {"method": NEWDB_METHOD_BANKRUPTCY, **person_params}
+    pledges_params = {"method": NEWDB_METHOD_PLEDGES, **person_params}
+    courts_params = {"method": NEWDB_METHOD_COURTS, **person_params}
+
+    # Не отправляем 12-значный ИНН физлица как innyur/inn для юрлица.
+    if inn_info["type"] == "ul":
+        for block in (bankruptcy_params, pledges_params, courts_params):
+            block["inn"] = inn_info["value"]
+            block["innyur"] = inn_info["value"]
+    elif inn_info["type"] == "fl":
+        bankruptcy_params["innfl"] = inn_info["value"]
+        courts_params["innfl"] = inn_info["value"]
+        pledges_params["__skip__"] = True
+        pledges_params["__skip_reason__"] = "Автоматическая проверка залогов по 12-значному ИНН физлица не выполнена. Требуется ручная проверка."
+    elif inn_info["type"] == "invalid":
+        bankruptcy_params["__skip__"] = True
+        bankruptcy_params["__skip_reason__"] = "Передан некорректный ИНН. Требуется ручная проверка банкротства."
+        pledges_params["__skip__"] = True
+        pledges_params["__skip_reason__"] = "Передан некорректный ИНН. Требуется ручная проверка залогов."
+        courts_params["__skip__"] = True
+        courts_params["__skip_reason__"] = "Передан некорректный ИНН. Требуется ручная проверка судебных производств."
+
+    egrn_params = {
+        "method": NEWDB_METHOD_EGRN,
+        "address": prop.get("address") or prop.get("query"),
+        "cadnum": prop.get("cadastral_number"),
+        "cadastral_number": prop.get("cadastral_number"),
         "country": "ru",
     }
 
     return {
-        "passport": {
-            "method": "passport_mvd",
-            **person_base,
-            "series": passport_series,
-            "seria": passport_series,
-            "number": passport_number,
-        },
-        "fssp": {
-            "method": "fssp",
-            **person_base,
-            "region": int(req.region or 0),
-        },
-        "bankruptcy": {
-            "method": "bankruptcy",
-            **person_base,
-            "inn": only_digits(req.inn),
-        },
-        "pledges": {
-            "method": "pledges",
-            **person_base,
-            "inn": only_digits(req.inn),
-        },
-        "courts": {
-            "method": "courts",
-            **person_base,
-            "inn": only_digits(req.inn),
-        },
-        "egrn": {
-            "method": "rosreestr",
-            # По практике NewDB часто принимает кадастровый номер именно через address.
-            "address": prop.get("address") or prop.get("query"),
-            "cadnum": prop.get("cadastral_number"),
-            "cadastral_number": prop.get("cadastral_number"),
-            "country": "ru",
-        },
+        "passport": passport_params,
+        "fssp": fssp_params,
+        "bankruptcy": bankruptcy_params,
+        "pledges": pledges_params,
+        "courts": courts_params,
+        "egrn": egrn_params,
     }, prop
-
 
 # -----------------------------
 # CLASSIFIERS
@@ -645,9 +761,9 @@ def classify_fssp(data: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "closed_sum": closed_sum,
         "unknown_sum": unknown_sum,
         "actual_debt": active_sum,
-        "active_items": strip_sensitive(active),
-        "closed_items": strip_sensitive(closed),
-        "unknown_items": strip_sensitive(unknown),
+        "active_items": public_registry_data(active),
+        "closed_items": public_registry_data(closed),
+        "unknown_items": public_registry_data(unknown),
     }
 
     details = [
@@ -1003,9 +1119,10 @@ async def health() -> Dict[str, Any]:
     return {
         "success": True,
         "service": "Real Estate Seller & Property Check API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "newdb_configured": bool(NEWDB_TOKEN),
         "gigachat_configured": bool(gigachat_credentials()),
+        "newdb_methods": {"passport": NEWDB_METHOD_PASSPORT, "fssp": NEWDB_METHOD_FSSP, "bankruptcy": NEWDB_METHOD_BANKRUPTCY, "pledges": NEWDB_METHOD_PLEDGES, "courts": NEWDB_METHOD_COURTS, "egrn": NEWDB_METHOD_EGRN},
         "endpoints": ["/check-report", "/download-pdf/{report_id}", "/health"],
     }
 
@@ -1021,12 +1138,12 @@ async def check_report(req: CheckRequest, request: Request) -> JSONResponse:
     params, prop = build_newdb_params(req)
 
     passport_raw, fssp_raw, bankruptcy_raw, pledges_raw, courts_raw, egrn_raw = await asyncio.gather(
-        newdb_post(params["passport"], max_wait=75, poll_interval=5),
-        newdb_post(params["fssp"], max_wait=100, poll_interval=5),
-        newdb_post(params["bankruptcy"], max_wait=100, poll_interval=5),
-        newdb_post(params["pledges"], max_wait=90, poll_interval=5),
-        newdb_post(params["courts"], max_wait=100, poll_interval=5),
-        newdb_post(params["egrn"], max_wait=300, poll_interval=10),
+        newdb_service_post("passport", params["passport"], max_wait=75, poll_interval=5),
+        newdb_service_post("fssp", params["fssp"], max_wait=100, poll_interval=5),
+        newdb_service_post("bankruptcy", params["bankruptcy"], max_wait=100, poll_interval=5),
+        newdb_service_post("pledges", params["pledges"], max_wait=90, poll_interval=5),
+        newdb_service_post("courts", params["courts"], max_wait=100, poll_interval=5),
+        newdb_service_post("egrn", params["egrn"], max_wait=300, poll_interval=10),
     )
 
     passport_item = classify_passport(passport_raw)
@@ -1057,12 +1174,12 @@ async def check_report(req: CheckRequest, request: Request) -> JSONResponse:
     checklist = [passport_item, fssp_item, bankruptcy_item, pledges_item, courts_item, egrn_item]
 
     registry_data = {
-        "passport": {"source": passport_item["source"], "status": passport_item["status"], "summary": passport_item["summary"], "details": passport_item["details"], "data": strip_sensitive(passport_raw) if passport_item["status"] != "manual_check" else {}},
-        "fssp": {"source": fssp_item["source"], "status": fssp_item["status"], "summary": fssp_item["summary"], "details": fssp_item["details"], "stats": fssp_stats, "data": strip_sensitive(fssp_raw) if fssp_item["status"] != "manual_check" else {}},
-        "bankruptcy": {"source": bankruptcy_item["source"], "status": bankruptcy_item["status"], "summary": bankruptcy_item["summary"], "details": bankruptcy_item["details"], "items": bankruptcy_items},
-        "pledges": {"source": pledges_item["source"], "status": pledges_item["status"], "summary": pledges_item["summary"], "details": pledges_item["details"], "items": pledges_items},
-        "courts": {"source": courts_item["source"], "status": courts_item["status"], "summary": courts_item["summary"], "details": courts_item["details"], "items": courts_items},
-        "egrn": {"source": egrn_item["source"], "status": egrn_item["status"], "summary": egrn_item["summary"], "details": egrn_item["details"], "data": egrn_data},
+        "passport": {"source": passport_item["source"], "status": passport_item["status"], "summary": passport_item["summary"], "details": passport_item["details"], "data": public_registry_data(passport_raw) if passport_item["status"] != "manual_check" else {}},
+        "fssp": {"source": fssp_item["source"], "status": fssp_item["status"], "summary": fssp_item["summary"], "details": fssp_item["details"], "stats": fssp_stats, "data": public_registry_data(fssp_raw) if fssp_item["status"] != "manual_check" else {}},
+        "bankruptcy": {"source": bankruptcy_item["source"], "status": bankruptcy_item["status"], "summary": bankruptcy_item["summary"], "details": bankruptcy_item["details"], "items": public_registry_data(bankruptcy_items)},
+        "pledges": {"source": pledges_item["source"], "status": pledges_item["status"], "summary": pledges_item["summary"], "details": pledges_item["details"], "items": public_registry_data(pledges_items)},
+        "courts": {"source": courts_item["source"], "status": courts_item["status"], "summary": courts_item["summary"], "details": courts_item["details"], "items": public_registry_data(courts_items)},
+        "egrn": {"source": egrn_item["source"], "status": egrn_item["status"], "summary": egrn_item["summary"], "details": egrn_item["details"], "data": public_registry_data(egrn_data)},
     }
 
     for item in checklist:
