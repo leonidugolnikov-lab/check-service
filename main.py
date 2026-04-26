@@ -386,7 +386,7 @@ def build_newdb_payloads(req: CheckRequest) -> Dict[str, Optional[Dict[str, Any]
     # Суды общей юрисдикции / ГАС Правосудие. По документации сценарий pravosudfiz / pravo_search
     # ищет дела по ФИО, участнику, категории, тексту карточки и др. Оставляем метод настраиваемым.
     payloads["pravosud"] = ({
-        "method": os.getenv("NEWDB_METHOD_PRAVOSUD", "pravosudfiz"),
+        "method": os.getenv("NEWDB_METHOD_PRAVOSUD", "pravo_search"),
         "country": "ru",
         "query": fio,
         "q": fio,
@@ -416,18 +416,44 @@ async def run_newdb_checks(req: CheckRequest, debug: bool = False) -> Dict[str, 
         data = await newdb_request(params, max_wait=wait, poll_interval=5, debug=debug)
         return name, data
 
+    async def call_pravosud(params: Optional[Dict[str, Any]], wait: int):
+        if not params:
+            return "pravosud", {"state": "skipped", "error": "Недостаточно входных данных для автоматической проверки."}
+
+        tried: List[Dict[str, Any]] = []
+        first = await newdb_request(params, max_wait=wait, poll_interval=5, debug=debug)
+        tried.append({"method": params.get("method"), "response": first})
+
+        # Страница newDB называется /fiz/pravosudfiz, но технический API-метод на странице указан как pravo_search.
+        # Если API не принял метод, пробуем альтернативу автоматически.
+        if has_api_error(first) and "method or country is not valid" in text_blob(first):
+            for method in ["pravo_search", "pravosudfiz"]:
+                if method == params.get("method"):
+                    continue
+                alt = dict(params)
+                alt["method"] = method
+                second = await newdb_request(alt, max_wait=wait, poll_interval=5, debug=debug)
+                tried.append({"method": method, "response": second})
+                if not has_api_error(second):
+                    payloads["pravosud"] = alt
+                    if debug and isinstance(second, dict):
+                        second["_fallback_tried"] = tried
+                    return "pravosud", second
+
+        if debug and isinstance(first, dict):
+            first["_fallback_tried"] = tried
+        return "pravosud", first
+
     tasks = [
         call("passport", payloads["passport"], 90),
         call("fssp", payloads["fssp"], 180),
         call("bankruptcy", payloads["bankruptcy"], 150),
         call("arbitr", payloads["arbitr"], 150),
-        call("pravosud", payloads["pravosud"], 180),
+        call_pravosud(payloads["pravosud"], 180),
         call("egrn", payloads["egrn"], 420),
     ]
     pairs = await asyncio.gather(*tasks)
     return {"payloads": payloads, "responses": {k: v for k, v in pairs}}
-
-
 def checklist_item(source: str, status: str, summary: str, details: Optional[List[str]] = None, url: str = "", data: Any = None) -> Dict[str, Any]:
     ui = "manual" if status == "manual_check" else status
     item = {
@@ -602,7 +628,7 @@ def classify_arbitr(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]
 
 def classify_pravosud(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     source = "Суды общей юрисдикции / ГАС Правосудие"
-    method = os.getenv("NEWDB_METHOD_PRAVOSUD", "pravosudfiz")
+    method = os.getenv("NEWDB_METHOD_PRAVOSUD", "pravo_search")
     if has_api_error(raw) or get_state(raw) in {"error", "timeout", "skipped"}:
         return checklist_item(source, "manual_check", CLIENT_MANUAL_TEXT, [extract_error_reason(raw)], DEFAULT_MANUAL_LINKS["pravosud"]), {"summary": CLIENT_MANUAL_TEXT}
     status, data, result = get_result_data(raw, method)
