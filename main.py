@@ -208,6 +208,28 @@ def strip_sensitive(obj: Any) -> Any:
     return obj
 
 
+
+def debug_sanitize(obj: Any) -> Any:
+    """
+    Диагностическая чистка: сохраняет state/http_status/errors_info/методы,
+    но убирает токены, balance и requestId.
+    """
+    if isinstance(obj, dict):
+        cleaned = {}
+        for k, v in obj.items():
+            key = str(k).lower()
+            if key in {
+                "balance", "token", "api_key", "x-api-key", "authorization", "access_token",
+                "client_secret", "secret", "password", "bearer", "headers",
+                "requestid", "request_id", "newdb_qid", "qid", "task_id",
+            }:
+                continue
+            cleaned[k] = debug_sanitize(v)
+        return cleaned
+    if isinstance(obj, list):
+        return [debug_sanitize(x) for x in obj]
+    return obj
+
 def public_error(message: str = "Источник не вернул данные. Требуется ручная проверка.") -> str:
     return message
 
@@ -413,7 +435,8 @@ async def newdb_post(params: Dict[str, Any], max_wait: int = 90, poll_interval: 
         "X-API-KEY": NEWDB_TOKEN,
         "Authorization": f"Bearer {NEWDB_TOKEN}",
     }
-    payload = {"params": params}
+    request_id = str(uuid.uuid4())
+    payload = {"params": params, "requestId": request_id}
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         try:
@@ -438,7 +461,7 @@ async def newdb_post(params: Dict[str, Any], max_wait: int = 90, poll_interval: 
         if not st and has_meaningful_data(data):
             return data
 
-        request_id = find_request_id(data)
+        request_id = find_request_id(data) or request_id
         if not request_id:
             data["state"] = "manual"
             data["error"] = "Источник принял задачу, но не вернул идентификатор результата. Требуется ручная проверка."
@@ -455,10 +478,13 @@ async def newdb_post(params: Dict[str, Any], max_wait: int = 90, poll_interval: 
                 ("GET", f"{NEWDB_URL}/result/{request_id}", None, None),
                 ("GET", NEWDB_URL, {"requestId": request_id}, None),
                 ("GET", NEWDB_URL, {"newdb_qid": request_id}, None),
-                ("POST", NEWDB_URL, None, {"params": {"newdb_qid": request_id}}),
-                ("POST", NEWDB_URL, None, {"params": {"requestId": request_id}}),
-                ("POST", NEWDB_URL, None, {"params": {**params, "newdb_qid": request_id}}),
-                ("POST", NEWDB_URL, None, {"params": {**params, "requestId": request_id}}),
+                # По документации NewDB повторный POST с тем же top-level requestId возвращает старый/готовый результат.
+                ("POST", NEWDB_URL, None, {"params": params, "requestId": request_id}),
+                # Дополнительные варианты оставлены как fallback для старых/внутренних схем.
+                ("POST", NEWDB_URL, None, {"params": {"newdb_qid": request_id}, "requestId": request_id}),
+                ("POST", NEWDB_URL, None, {"params": {"requestId": request_id}, "requestId": request_id}),
+                ("POST", NEWDB_URL, None, {"params": {**params, "newdb_qid": request_id}, "requestId": request_id}),
+                ("POST", NEWDB_URL, None, {"params": {**params, "requestId": request_id}, "requestId": request_id}),
             ]
 
             for method, url, query, body in poll_attempts:
@@ -1282,6 +1308,78 @@ async def download_pdf(report_id: str) -> FileResponse:
         media_type="application/pdf",
         filename=f"legal-real-estate-report-{report_id}.pdf",
     )
+
+
+
+
+@app.post("/debug-newdb")
+async def debug_newdb(req: CheckRequest) -> JSONResponse:
+    """
+    Диагностический endpoint. Не используйте как публичный виджет.
+    Показывает, что реально возвращает NewDB по каждому источнику, без токена/balance.
+    Нужен для настройки методов и параметров на Render.
+    """
+    params, prop = build_newdb_params(req)
+    services = [
+        ("passport", params["passport"], PASSPORT_WAIT_SECONDS),
+        ("fssp", params["fssp"], FSSP_WAIT_SECONDS),
+        ("bankruptcy", params["bankruptcy"], DEFAULT_WAIT_SECONDS),
+        ("pledges", params["pledges"], DEFAULT_WAIT_SECONDS),
+        ("courts", params["courts"], DEFAULT_WAIT_SECONDS),
+        ("egrn", params["egrn"], EGRN_WAIT_SECONDS),
+    ]
+
+    result: Dict[str, Any] = {
+        "success": True,
+        "property": prop,
+        "sent_params_public": {name: debug_sanitize(par) for name, par, _ in services},
+        "newdb_raw_public": {},
+        "classification": {},
+        "note": "Этот endpoint нужен только для диагностики. В публичный отчет его выводить нельзя.",
+    }
+
+    for name, par, wait in services:
+        raw = await newdb_service_post(name, par, max_wait=wait, poll_interval=5)
+        result["newdb_raw_public"][name] = debug_sanitize(raw)
+
+        if name == "passport":
+            item = classify_passport(raw)
+            result["classification"][name] = item
+        elif name == "fssp":
+            item, stats = classify_fssp(raw)
+            result["classification"][name] = {"item": item, "stats": stats}
+        elif name == "bankruptcy":
+            item, items = classify_empty_or_risk(
+                raw,
+                "Банкротство / Федресурс",
+                "По полученным данным сведения о банкротстве не выявлены.",
+                "Выявлены сведения, связанные с банкротством.",
+                MANUAL_URLS["bankruptcy"],
+            )
+            result["classification"][name] = {"item": item, "items": public_registry_data(items)}
+        elif name == "pledges":
+            item, items = classify_empty_or_risk(
+                raw,
+                "Залоги движимого имущества",
+                "По полученным данным сведения о залогах не выявлены.",
+                "Выявлены сведения о залогах или обременениях.",
+                MANUAL_URLS["pledges"],
+            )
+            result["classification"][name] = {"item": item, "items": public_registry_data(items)}
+        elif name == "courts":
+            item, items = classify_empty_or_risk(
+                raw,
+                "Суды / арбитраж",
+                "По полученным данным судебные дела не выявлены.",
+                "Найдены судебные производства. Требуется анализ предмета спора.",
+                MANUAL_URLS["courts"],
+            )
+            result["classification"][name] = {"item": item, "items": public_registry_data(items)}
+        elif name == "egrn":
+            item, reg = classify_egrn(raw, prop)
+            result["classification"][name] = {"item": item, "registry": public_registry_data(reg)}
+
+    return JSONResponse(content=strip_sensitive(result))
 
 
 @app.exception_handler(Exception)
