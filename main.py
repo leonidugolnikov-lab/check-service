@@ -32,6 +32,7 @@ try:
         TableStyle,
         PageBreak,
     )
+    from reportlab.graphics.shapes import Drawing, Rect, String, Polygon, Line
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
@@ -1274,20 +1275,20 @@ def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> 
 
     score = max(0, min(100, int(score)))
     if score >= 85:
-        level = "опасная"
-        label = "Опасная при самостоятельной сделке"
+        level = "ОПАСНО"
+        label = "ОПАСНО при самостоятельной сделке"
         conclusion = "Аванс (задаток) и сделку нельзя проводить без ручной юридической проверки, устранения ключевых рисков и безопасной схемы расчетов."
     elif score >= 60:
-        level = "высокорискованная"
-        label = "Высокий риск при самостоятельной сделке"
+        level = "РИСКОВАННО"
+        label = "РИСКОВАННО без контроля условий сделки"
         conclusion = "Сделку можно рассматривать только после уточнения рисков, проверки документов и жестких защитных условий в авансе (задатке)/ПДКП."
     elif score >= 35:
-        level = "условно рискованная"
-        label = "Условно рискованная при самостоятельной сделке"
+        level = "РИСКОВАННО"
+        label = "РИСКОВАННО, требуется дополнительная проверка"
         conclusion = "Критический стоп-фактор по автоматическим данным не подтвержден, но до аванса (задатка) нужно закрыть ручные проверки и внести защитные условия в документы."
     else:
-        level = "допустимая"
-        label = "Допустимая к дальнейшему рассмотрению"
+        level = "ДОПУСТИМО"
+        label = "ДОПУСТИМО к дальнейшему рассмотрению"
         conclusion = "По автоматическим источникам критичных рисков не выявлено, но отчет не заменяет ручную юридическую проверку документов."
 
     return {"score": score, "max_score": 100, "level": level, "label": label, "conclusion": conclusion, "factors": factors}
@@ -1832,6 +1833,55 @@ def p(text: Any) -> str:
 
 
 
+def build_score_bar(score: int, level: str = "", font_name: str = "Helvetica") -> Any:
+    """Premium PDF scoring scale with pointer and score inside the scale."""
+    score = max(0, min(100, int(score or 0)))
+    width = 180 * mm
+    height = 25 * mm
+    left = 8 * mm
+    bar_y = 9 * mm
+    bar_w = 164 * mm
+    bar_h = 8 * mm
+    x = left + (score / 100) * bar_w
+
+    d = Drawing(width, height)
+
+    # Soft background / border
+    d.add(Rect(0, 0, width, height, fillColor=colors.HexColor("#FFFFFF"), strokeColor=colors.HexColor("#D8DEE5"), strokeWidth=0.4))
+
+    # Risk zones
+    d.add(Rect(left, bar_y, bar_w * 0.35, bar_h, fillColor=colors.HexColor("#2E7D59"), strokeWidth=0))
+    d.add(Rect(left + bar_w * 0.35, bar_y, bar_w * 0.25, bar_h, fillColor=colors.HexColor("#D4A373"), strokeWidth=0))
+    d.add(Rect(left + bar_w * 0.60, bar_y, bar_w * 0.40, bar_h, fillColor=colors.HexColor("#8B1E1E"), strokeWidth=0))
+
+    # Outer line
+    d.add(Rect(left, bar_y, bar_w, bar_h, fillColor=None, strokeColor=colors.HexColor("#0F3D56"), strokeWidth=0.45))
+
+    # Pointer inside the scale
+    d.add(Line(x, bar_y - 1.5 * mm, x, bar_y + bar_h + 2.5 * mm, strokeColor=colors.HexColor("#111827"), strokeWidth=1.15))
+    d.add(Polygon(
+        [x, bar_y + bar_h + 3.4 * mm, x - 2.4 * mm, bar_y + bar_h + 7.2 * mm, x + 2.4 * mm, bar_y + bar_h + 7.2 * mm],
+        fillColor=colors.HexColor("#111827"),
+        strokeColor=colors.HexColor("#111827"),
+        strokeWidth=0,
+    ))
+
+    # Score number inside the bar
+    marker_w = 14 * mm
+    marker_x = min(max(x - marker_w / 2, left), left + bar_w - marker_w)
+    d.add(Rect(marker_x, bar_y + 0.8 * mm, marker_w, bar_h - 1.6 * mm, fillColor=colors.HexColor("#FFFFFF"), strokeColor=colors.HexColor("#111827"), strokeWidth=0.45))
+    d.add(String(marker_x + 4.5 * mm, bar_y + 2.35 * mm, str(score), fontName=font_name, fontSize=8.5, fillColor=colors.HexColor("#111827")))
+
+    # Labels
+    d.add(String(left, 3 * mm, "0", fontName=font_name, fontSize=6.8, fillColor=colors.HexColor("#6E7F8D")))
+    d.add(String(left + bar_w - 6 * mm, 3 * mm, "100", fontName=font_name, fontSize=6.8, fillColor=colors.HexColor("#6E7F8D")))
+    if level:
+        d.add(String(left, 20.2 * mm, str(level).upper(), fontName=font_name, fontSize=9.2, fillColor=colors.HexColor("#0F3D56")))
+
+    return d
+
+
+
 def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     if not REPORTLAB_AVAILABLE:
         return ("PDF generation unavailable: reportlab is not installed.\n\n" + json.dumps(report, ensure_ascii=False, indent=2)).encode("utf-8")
@@ -1890,20 +1940,25 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         story.append(Spacer(1, 5))
 
     # Cover / header
-    story.append(Paragraph("Юридическое заключение", styles["TitleRu"]))
-    story.append(Paragraph("по проверке продавца и объекта недвижимости", styles["SubtitleRu"]))
+    story.append(Paragraph("Комплексный юридический отчет по продавцу и объекту недвижимости", styles["TitleRu"]))
+    story.append(Paragraph("проверка продавца, объекта, судебных и имущественных рисков", styles["SubtitleRu"]))
     story.append(Paragraph(f"Дата формирования: {p(report.get('created_at'))}", styles["SubtitleRu"]))
     story.append(Spacer(1, 8))
 
-    label = scoring.get("label") or scoring.get("level") or "Оценка риска"
     score = int(scoring.get("score") or 0)
+    level = (scoring.get("level") or "ОЦЕНКА РИСКА").upper()
+    label = scoring.get("label") or level
     badge_color = "#8B1E1E" if score >= 85 else ("#B7791F" if score >= 35 else "#1F7A4D")
-    badge = Table([[Paragraph(f"{p(label).upper()}<br/>{score}/100", styles["BadgeRu"])]], colWidths=[180*mm])
+
+    story.append(build_score_bar(score, level, font))
+    story.append(Spacer(1, 5))
+
+    badge = Table([[Paragraph(f"{p(level)}<br/>{score}/100", styles["BadgeRu"])]], colWidths=[180*mm])
     badge.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(badge_color)),
         ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor(badge_color)),
-        ("TOPPADDING", (0, 0), (-1, -1), 10),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
     ]))
     story.append(badge)
     story.append(Spacer(1, 7))
