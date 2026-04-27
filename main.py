@@ -49,6 +49,10 @@ APP_VERSION = "1.7.0-legal-risk-balanced-report"
 NEWDB_URL = "https://api.newdb.net/v2"
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
+# По умолчанию используем детерминированный локальный отчет, потому что LLM может
+# красиво, но опасно переиначить факты: написать, что ФССП/ЕГРН подтверждены,
+# хотя источник был в ручной проверке. Включать GigaChat только осознанно.
+USE_GIGACHAT_REPORT = os.getenv("USE_GIGACHAT_REPORT", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # In-memory storage. For Render free/simple MVP it is OK; after restart reports disappear.
 REPORTS: Dict[str, Dict[str, Any]] = {}
@@ -627,14 +631,25 @@ def bankruptcy_deep_flags(data: Any) -> Dict[str, Any]:
     text = flatten_text(data).lower()
 
     completed_words = [
+        # Явные признаки завершения/закрытия процедуры.
         "заверш", "завершение реализации имущества", "процедура завершена",
         "освобожд", "освободить гражданина", "освобождение гражданина",
         "прекратить производство", "производство по делу завершено",
+        "завершить процедуру", "завершена реализация имущества",
     ]
+    # Осторожно: слова «финансовый управляющий», «реализация имущества»,
+    # «признан банкротом» часто встречаются и в завершенных публикациях.
+    # Поэтому они НЕ являются самостоятельным признаком активной процедуры.
     active_words = [
-        "введена процедура", "ввести процедуру", "реализация имущества гражданина",
-        "реструктуризация долгов", "признан банкротом", "финансовый управляющий",
+        "введена процедура", "ввести процедуру", "реструктуризация долгов",
         "конкурсное производство", "наблюдение",
+    ]
+    explicit_active_words = [
+        "процедура не заверш", "дело не заверш", "процедура продолжа",
+        "реализация имущества продолжа", "действующая процедура",
+        "текущая процедура", "в стадии реализации", "в стадии реструктуризации",
+        "назначено судебное заседание", "следующее судебное заседание",
+        "судебное заседание отложено", "рассмотрение дела продолжа",
     ]
     property_words = [
         "оспаривание сделки", "недействительность сделки", "признать сделку недействительной",
@@ -666,14 +681,18 @@ def bankruptcy_deep_flags(data: Any) -> Dict[str, Any]:
 
     has_completed = any(word in text for word in completed_words)
     has_active = any(word in text for word in active_words)
+    has_explicit_active = any(word in text for word in explicit_active_words)
 
-    # Важно: активная/незавершенная процедура имеет приоритет над признаками завершения.
-    # В публикациях могут одновременно встречаться слова о введении процедуры и о завершении
-    # отдельных этапов, поэтому сначала отсекаем активный риск.
-    if has_active:
+    # Ключевая правка: завершенное банкротство НЕ должно превращаться в активное
+    # только из-за слов «финансовый управляющий», «реализация имущества», «торги» и т.п.
+    # Если есть явные слова завершения — считаем completed, кроме случаев, когда прямо
+    # написано, что процедура продолжается / не завершена / назначено заседание.
+    if has_explicit_active:
         status = "active"
     elif has_completed:
         status = "completed"
+    elif has_active:
+        status = "active"
     else:
         status = "unknown"
 
@@ -2047,7 +2066,7 @@ def enforce_ai_report_text(text: str, checklist: List[Dict[str, Any]], scoring: 
 
 async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], recs: List[Dict[str, str]]) -> str:
     fallback = build_local_legal_report(req, checklist, scoring, recs)
-    if not (GIGACHAT_AVAILABLE and GIGACHAT_CREDENTIALS):
+    if not (USE_GIGACHAT_REPORT and GIGACHAT_AVAILABLE and GIGACHAT_CREDENTIALS):
         return fallback
 
     payload = build_gigachat_safe_payload(req, checklist, scoring, recs)
@@ -2064,6 +2083,7 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
         "7.1) Если ЕГРН выявил ограничение/обременение — не называй это автоматической катастрофой. Пиши: риск требует проверки основания, суммы, держателя и схемы снятия/учета до регистрации.\n"
         "8) Судебные совпадения без точной идентификации называй совпадениями, а не установленными делами продавца. Вероятные и слабые совпадения — это ручная проверка, не доказанный риск.\n"
         "9) Завершенное банкротство не является автоматическим запретом сделки, но требует проверки дела и связи объекта с процедурой.\n"
+        "9.1) Если bankruptcy_status = completed — запрещено писать, что банкротство активное, действующее или незавершенное.\n"
         "10) ИНН, паспорт и дату рождения в тексте не раскрывай.\n\n"
         "СТРУКТУРА, строго в таком порядке, без цифр:\n"
         "Краткий вывод\n"
@@ -2093,9 +2113,21 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
         text = normalize_legal_report_format(text)
         if not text or is_gigachat_refusal(text):
             return fallback
-        # If model produced a suspiciously short or structurally broken answer, use deterministic fallback.
+        # If model produced a suspiciously short, structurally broken or fact-conflicting answer,
+        # use deterministic fallback.
         required = ["Краткий вывод", "Итоговое заключение", "Важно"]
         if not all(x in text for x in required):
+            return fallback
+
+        text_l = text.lower()
+        fssp_manual = any("ФССП" in x.get("title", "") and x.get("status") == "manual_check" for x in checklist)
+        egrn_manual = any("ЕГРН" in x.get("title", "") and x.get("status") == "manual_check" for x in checklist)
+        bankruptcy_completed = any("Банкрот" in x.get("title", "") and isinstance(x.get("data"), dict) and x.get("data", {}).get("bankruptcy_status") == "completed" for x in checklist)
+        if fssp_manual and re.search(r"исполнительн\w+ производств\w+.*отсутств", text_l):
+            return fallback
+        if egrn_manual and ("егрн" in text_l and ("признается актуальной" in text_l or "права собственности содержится" in text_l)):
+            return fallback
+        if bankruptcy_completed and re.search(r"банкротств\w+.*(активн|действующ|незаверш)", text_l):
             return fallback
         return text
     except Exception:
