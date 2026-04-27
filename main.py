@@ -694,7 +694,7 @@ def bankruptcy_deep_flags(data: Any) -> Dict[str, Any]:
         if months_after_latest < 12:
             details.append("После последней значимой публикации прошло менее 1 года — нужна повышенная осторожность.")
         elif months_after_latest < 36:
-            details.append("После последней значимой публикации прошло менее 3 лет — требуется проверка банкротного дела до аванса.")
+            details.append("После последней значимой публикации прошло менее 3 лет — требуется проверка банкротного дела до аванса (задатка).")
 
     if has_property_words:
         details.append("В публикациях есть слова/признаки, связанные с имуществом, торгами, конкурсной массой или оспариванием сделок.")
@@ -720,11 +720,16 @@ def classify_bankruptcy(resp: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(data, list):
         for row in data:
             if isinstance(row, dict):
+                labels = {
+                    "bankruptcy": "Банкротные дела",
+                    "publications": "Публикации Федресурса",
+                    "encumbrances": "Связанные ограничения/обременения",
+                }
                 for key in ["bankruptcy", "publications", "encumbrances"]:
                     val = row.get(key)
                     if isinstance(val, list) and len(val) > 0:
                         has_bankruptcy = True
-                        details.append(f"{key}: найдено записей {len(val)}")
+                        details.append(f"{labels.get(key, key)}: найдено записей {len(val)}")
 
     if not has_bankruptcy:
         return ok_item(title, "По полученным данным сведения о банкротстве физлица не выявлены.", url, [], data)
@@ -749,7 +754,7 @@ def classify_bankruptcy(resp: Dict[str, Any]) -> Dict[str, Any]:
             "Выявлены сведения о банкротстве продавца. По автоматическим данным есть признаки "
             "действующей или незавершенной процедуры. Это высокий риск для самостоятельной сделки."
         )
-        details.append("До аванса нужно проверить карточку банкротного дела, полномочия продавца и позицию финансового управляющего.")
+        details.append("До аванса (задатка) нужно проверить карточку банкротного дела, полномочия продавца и позицию финансового управляющего.")
         return risk_item(title, summary, url, details, risk_data)
 
     if status == "completed" and months is not None and months < 36:
@@ -774,7 +779,7 @@ def classify_bankruptcy(resp: Dict[str, Any]) -> Dict[str, Any]:
             "Выявлены сведения о банкротстве продавца и публикации, связанные с имуществом, торгами, "
             "конкурсной массой или оспариванием сделок. Нужна ручная проверка связи объекта с процедурой."
         )
-        details.append("До аванса нужно сверить объект с материалами банкротного дела и отчетом финансового управляющего.")
+        details.append("До аванса (задатка) нужно сверить объект с материалами банкротного дела и отчетом финансового управляющего.")
         return risk_item(title, summary, url, details, risk_data)
 
     summary = (
@@ -917,12 +922,10 @@ def build_hidden_risks(req: Optional[CheckRequest] = None) -> List[Dict[str, str
     """Risks that public registries/newDB may not fully confirm automatically."""
     age = calculate_age(normalize_dob(req.dob)[0]) if req else None
     age_comment = "Проверить дееспособность и свободное волеизъявление продавца."
-    if age is not None and age >= 80:
-        age_comment = "Возраст 80+: справки ПНД/НД и оценка понимания сделки критически необходимы до аванса/подписания."
-    elif age is not None and age >= 75:
-        age_comment = "Возраст 75+: справки ПНД/НД крайне желательно получить до аванса; нотариальная форма и видеофиксация могут снизить риск спора."
+    if age is not None and age >= 75:
+        age_comment = "Возраст 75+: справка из ПНД и медицинское освидетельствование до сделки обязательны; дополнительно рекомендована видеофиксация волеизъявления продавца."
     elif age is not None and age >= 70:
-        age_comment = "Возраст 70+: справки ПНД/НД желательно запросить, особенно при продаже единственного жилья, занижении цены или давлении родственников."
+        age_comment = "Возраст 70+: справка из ПНД и медицинское освидетельствование до сделки желательны, особенно при срочной продаже, занижении цены, единственном жилье или участии представителей/родственников."
 
     return [
         {"risk": "Супруг / согласие супруга", "why": "Если квартира приобреталась в браке, требуется проверить режим совместной собственности и согласие супруга.", "law": "ст. 34, 35 СК РФ; ст. 253 ГК РФ"},
@@ -943,11 +946,11 @@ def build_hidden_risks(req: Optional[CheckRequest] = None) -> List[Dict[str, str
 def build_advance_decision(scoring: Dict[str, Any]) -> Dict[str, str]:
     score = int(scoring.get("score") or 0)
     if score >= 85:
-        return {"decision": "Нельзя передавать аванс до устранения рисков", "level": "stop", "comment": "Есть критические признаки. Сначала ручная проверка, документы, условия снятия рисков и безопасная схема расчетов."}
+        return {"decision": "Нельзя передавать аванс (задаток) до устранения рисков", "level": "stop", "comment": "Есть критические признаки. Сначала ручная проверка, документы, условия снятия рисков и безопасная схема расчетов."}
     if score >= 60:
         return {"decision": "Только с жесткими защитными условиями", "level": "strict_conditions", "comment": "Аванс возможен только после ручной проверки и с условиями возврата/ответственности продавца."}
     if score >= 35:
-        return {"decision": "Осторожно, после проверки документов", "level": "caution", "comment": "Критический стоп-фактор не подтвержден, но до аванса нужно закрыть ручные проверки и прописать условия в ПДКП."}
+        return {"decision": "Осторожно, после проверки документов", "level": "caution", "comment": "Критический стоп-фактор не подтвержден, но до аванса (задатка) нужно закрыть ручные проверки и прописать условия в ПДКП."}
     return {"decision": "Можно рассматривать, но не без документов", "level": "allowed_with_standard_checks", "comment": "По автоматическим источникам критичных рисков не выявлено, но ручная проверка правоустанавливающих документов обязательна."}
 
 
@@ -1262,12 +1265,10 @@ def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRe
     recs: List[Dict[str, str]] = []
     if req is not None:
         age = calculate_age(normalize_dob(req.dob)[0])
-        if age is not None and age >= 80:
-            recs.append({"priority": "critical", "title": "Проверка дееспособности обязательна", "text": "Возраст 80+. До аванса и сделки критически необходимо получить справки ПНД и НД, убедиться в понимании продавцом условий сделки и исключить давление третьих лиц."})
-        elif age is not None and age >= 75:
-            recs.append({"priority": "high", "title": "Проверка дееспособности крайне желательна", "text": "Возраст 75+. Желательно получить справки ПНД и НД до аванса; при сомнениях использовать нотариальную форму и фиксировать волю продавца."})
+        if age is not None and age >= 75:
+            recs.append({"priority": "critical", "title": "Проверка дееспособности обязательна", "text": "Возраст 75+. До сделки обязательны справка из ПНД и медицинское освидетельствование; рекомендована видеофиксация волеизъявления продавца, чтобы снизить риск последующего спора по ст. 177 ГК РФ."})
         elif age is not None and age >= 70:
-            recs.append({"priority": "medium", "title": "Проверка дееспособности желательна", "text": "Возраст 70+. Рекомендуется запросить справки ПНД и НД, особенно если цена ниже рынка, сделка срочная или участвуют родственники/представители."})
+            recs.append({"priority": "high", "title": "Проверка дееспособности желательна", "text": "Возраст 70+. До сделки желательно получить справку из ПНД и провести медицинское освидетельствование, особенно если цена ниже рынка, сделка срочная или участвуют представители/родственники."})
 
     by_title = {x.get("title", ""): x for x in checklist}
     egrn = by_title.get("ЕГРН / Росреестр")
@@ -1277,7 +1278,7 @@ def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRe
     pravosud = by_title.get("Суды общей юрисдикции / ГАС Правосудие")
 
     if egrn and egrn.get("status") == "risk":
-        recs.append({"priority": "critical", "title": "Требовать снятие ограничения до основной сделки", "text": "По ЕГРН выявлены ограничения/обременения. До аванса нужно получить основание ограничения и прописать обязанность продавца снять его в конкретный срок."})
+        recs.append({"priority": "critical", "title": "Требовать снятие ограничения до основной сделки", "text": "По ЕГРН выявлены ограничения/обременения. До аванса (задатка) нужно получить основание ограничения и прописать обязанность продавца снять его в конкретный срок."})
         recs.append({"priority": "critical", "title": "Не передавать деньги напрямую продавцу", "text": "При запрете регистрации использовать нотариальный депозит или аккредитив с раскрытием денег только после снятия ограничения и регистрации перехода права."})
     if fssp and fssp.get("status") == "risk":
         actual = ((fssp.get("data") or {}).get("actual_debt") or 0) if isinstance(fssp.get("data"), dict) else 0
@@ -1289,7 +1290,7 @@ def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRe
         if bstatus == "active":
             recs.append({"priority": "critical", "title": "Не вносить аванс без анализа банкротного дела", "text": "По банкротству есть признаки действующей или незавершенной процедуры. Нужно проверить карточку дела, полномочия продавца и позицию финансового управляющего."})
         elif months is not None and months < 36:
-            recs.append({"priority": "high", "title": "Проверить завершенное банкротство до аванса", "text": "После значимой публикации по банкротству прошло менее 3 лет. Нужно проверить судебный акт о завершении процедуры, отчет финансового управляющего и связь квартиры с конкурсной массой."})
+            recs.append({"priority": "high", "title": "Проверить завершенное банкротство до аванса (задатка)", "text": "После значимой публикации по банкротству прошло менее 3 лет. Нужно проверить судебный акт о завершении процедуры, отчет финансового управляющего и связь квартиры с конкурсной массой."})
         else:
             recs.append({"priority": "high", "title": "Разобрать банкротный риск", "text": "Нужно проверить даты процедуры, статус завершения, освобождение от обязательств, публикации Федресурса и риск оспаривания сделки."})
     if arbitr and arbitr.get("status") == "risk":
@@ -1297,8 +1298,8 @@ def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRe
     if pravosud and pravosud.get("status") == "risk":
         recs.append({"priority": "medium", "title": "Разобрать дела судов общей юрисдикции", "text": "Нужно проверить роль продавца в делах, предмет спора и возможные имущественные последствия."})
     if any(x.get("status") == "manual_check" for x in checklist):
-        recs.append({"priority": "medium", "title": "Закрыть ручные проверки до аванса", "text": "Все источники со статусом «требуется ручная проверка» нужно проверить вручную до передачи денег."})
-    recs.append({"priority": "high", "title": "Авансовое соглашение делать с защитными условиями", "text": "Включить обязанность продавца раскрыть долги, запреты, банкротство, судебные споры; предусмотреть возврат аванса/задатка и ответственность при неподтверждении данных."})
+        recs.append({"priority": "medium", "title": "Закрыть ручные проверки до аванса (задатка)", "text": "Все источники со статусом «требуется ручная проверка» нужно проверить вручную до передачи денег."})
+    recs.append({"priority": "high", "title": "Авансовое соглашение / соглашение о задатке делать с защитными условиями", "text": "Включить обязанность продавца раскрыть долги, запреты, банкротство, судебные споры; предусмотреть возврат аванса (задатка) и ответственность при неподтверждении данных."})
     return recs
 
 
@@ -1378,7 +1379,7 @@ def build_local_legal_report(req: CheckRequest, checklist: List[Dict[str, Any]],
     else:
         lines.append("- Нет блоков, которые можно считать полностью подтвержденными без замечаний.")
     lines.append("")
-    lines.append("6. Что обязательно сделать до аванса")
+    lines.append("6. Что обязательно сделать до аванса (задатка)")
     for rec in recs:
         lines.append(f"- {rec.get('title')}: {rec.get('text')}")
     lines.append("")
@@ -1462,11 +1463,11 @@ def build_gigachat_safe_payload(req: CheckRequest, checklist: List[Dict[str, Any
             "data_summary": compact_data,
         })
 
-    age_factor = "не выявлен"
-    if age is not None and age >= 80:
-        age_factor = "высокая осторожность: проверить дееспособность, волю продавца и отсутствие давления"
+    age_factor = "возрастной риск по автоматическим данным не выявлен"
+    if age is not None and age >= 75:
+        age_factor = "75+: справка из ПНД и медицинское освидетельствование обязательны; рекомендована видеофиксация волеизъявления"
     elif age is not None and age >= 70:
-        age_factor = "повышенная осторожность: желательно проверить понимание условий сделки и отсутствие давления"
+        age_factor = "70+: справка из ПНД и медицинское освидетельствование желательны до сделки"
 
     return {
         "seller": {
@@ -1518,28 +1519,29 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
         return fallback
     payload = build_gigachat_safe_payload(req, checklist, scoring, recs)
     prompt = (
-        "Ты практикующий юрист по недвижимости в Санкт-Петербурге с опытом более 15 лет. "
-        "На основе структурированных данных сформируй подробное юридическое заключение для покупателя квартиры "
-        "уровня платной правовой экспертизы стоимостью около 30 000 рублей. "
-        "Пиши уверенно, дорого, конкретно и по делу: не общими словами, а с объяснением, как каждый риск влияет на аванс, ПДКП, расчеты и регистрацию. "
-        "Ссылайся на нормы права, когда это уместно: ГК РФ, СК РФ, ЖК РФ, ФЗ №218-ФЗ, ФЗ №127-ФЗ, ФЗ №229-ФЗ, ФЗ №256-ФЗ. "
-        "Не придумывай факты. Если данных нет — прямо пиши: 'по предоставленным данным не проверялось'. "
-        "Не называй объект юридически чистым и не обещай 100% безопасность. "
-        "Не указывай ИНН, серию/номер паспорта и полную дату рождения. "
-        "Если ИНН был использован для проверки, пиши только: 'ИНН был передан для автоматической проверки'. "
-        "По судебным делам без надежного совпадения используй формулировку 'вероятные совпадения' или 'слабые совпадения', а не утверждай, что дело точно относится к продавцу. "
-        "Возрастной риск формулируй практично: 70+ — справки ПНД/НД желательно; 75+ — крайне желательно; 80+ — критически необходимо до аванса/сделки. "
-        "Не используй markdown-разметку: не ставь ###, **, --- и кодовые блоки. "
+        "Ты практикующий юрист-эксперт по недвижимости в Санкт-Петербурге с 20-летним стажем сопровождения сделок. "
+        "Сформируй юридическое заключение для покупателя квартиры уровня дорогой платной экспертизы: сильное, экспертное, спокойное, без воды и без технического мусора. "
+        "Пиши как юрист, который отвечает за практическую безопасность сделки: объясняй не только что найдено, но и как это влияет на аванс (задаток), ПДКП, расчеты, регистрацию перехода права и риск оспаривания. "
+        "Где уместно, вставляй ссылки на нормы права: ст. 166, 167, 177, 181, 250, 253, 302, 450, 454, 549, 550, 551, 558 ГК РФ; ст. 34, 35, 60 СК РФ; ст. 37 ГК РФ; ФЗ №218-ФЗ о государственной регистрации недвижимости; ФЗ №127-ФЗ о банкротстве; ФЗ №229-ФЗ об исполнительном производстве; ФЗ №256-ФЗ о материнском капитале. "
+        "Главное правило: не придумывай факты и не противоречь чек-листу. Если ЕГРН имеет статус ok и encumbrances_count = 0, запрещено писать, что на объекте зарегистрированы ограничения или обременения. "
+        "Если ФССП имеет статус ok и active_count = 0, запрещено писать, что у продавца есть активные долги или активные исполнительные производства. "
+        "Если паспорт МВД имеет статус ok, запрещено писать, что паспортные данные отсутствуют или не проверены; можно писать, что реквизиты паспорта не раскрываются в тексте заключения. "
+        "Дата рождения, ИНН, серия и номер паспорта намеренно не передаются в текстовый анализ. Не делай из этого вывод о ненадежности данных. "
+        "Не указывай ИНН, серию/номер паспорта и полную дату рождения в заключении. Если ИНН был использован для проверки, пиши только: 'ИНН был использован только для автоматической проверки'. "
+        "По судебным делам без точного совпадения пиши только 'вероятные совпадения по ФИО' или 'слабые совпадения', не утверждай, что это точно дела продавца. "
+        "Скрытые риски описывай строго как риски, которые автоматическая проверка не подтверждает и не исключает; нельзя писать, что супруг, маткапитал, дети, отказники, доверенность или зарегистрированные лица реально есть, если этого нет в данных. "
+        "Возрастной блок включай только если seller.age >= 70. Если возраст меньше 70 или не указан, не пиши рекомендации про ПНД/НД как применимые к этому продавцу. Правило: старше 70 лет — справка из ПНД и медицинское освидетельствование до сделки желательны; старше 75 лет — обязательны, дополнительно рекомендована видеофиксация. "
+        "Не используй markdown-разметку: не ставь ###, **, --- и кодовые блоки. Не пиши английские технические ключи. Не делай текст простыней: короткие абзацы, четкие выводы, аккуратные списки. "
         "Вместо слова 'Дисклеймер' используй только слово 'Важно'. "
         "Структура строго:\n"
         "1. Краткий вывод\n"
         "2. Надежность полученных данных\n"
         "3. Риски продавца\n"
         "4. Риски объекта\n"
-        "5. Скрытые риски, которые не всегда видны в реестрах\n"
-        "6. Можно ли передавать аванс\n"
-        "7. Что проверить до аванса\n"
-        "8. Что прописать в авансовом соглашении / ПДКП\n"
+        "5. Скрытые риски, которые нужно проверить документами\n"
+        "6. Можно ли передавать аванс (задаток)\n"
+        "7. Что проверить до аванса (задатка)\n"
+        "8. Что прописать в авансовом соглашении / соглашении о задатке / ПДКП\n"
         "9. Безопасная схема расчетов\n"
         "10. Итоговое заключение\n"
         "11. Важно\n\n"
@@ -1557,6 +1559,36 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
     except Exception:
         return fallback
 
+
+
+def pdf_report_blocks(text: str) -> List[Tuple[str, str]]:
+    """Return (kind, text) blocks for readable PDF rendering."""
+    text = strip_markdown_noise(text or "")
+    text = re.sub(r"(?m)^\s*[-–—]\s+", "• ", text)
+    lines = [ln.strip() for ln in text.splitlines()]
+    blocks: List[Tuple[str, str]] = []
+    buf: List[str] = []
+
+    def flush() -> None:
+        nonlocal buf
+        if buf:
+            blocks.append(("p", " ".join(buf).strip()))
+            buf = []
+
+    for ln in lines:
+        if not ln:
+            flush()
+            continue
+        if re.match(r"^\d{1,2}\.\s+", ln):
+            flush()
+            blocks.append(("h", ln))
+        elif ln.startswith("•"):
+            flush()
+            blocks.append(("bullet", ln[1:].strip()))
+        else:
+            buf.append(ln)
+    flush()
+    return blocks
 
 # ---------- PDF ----------
 
@@ -1590,48 +1622,58 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
 
     font = register_pdf_font()
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18*mm, rightMargin=18*mm, topMargin=16*mm, bottomMargin=16*mm)
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=17*mm,
+        rightMargin=17*mm,
+        topMargin=15*mm,
+        bottomMargin=15*mm,
+    )
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="TitleRu", fontName=font, fontSize=22, leading=28, alignment=TA_CENTER, spaceAfter=10, textColor=colors.HexColor("#0F3D56")))
-    styles.add(ParagraphStyle(name="H1Ru", fontName=font, fontSize=15, leading=19, spaceBefore=10, spaceAfter=6, textColor=colors.HexColor("#0F3D56")))
-    styles.add(ParagraphStyle(name="TextRu", fontName=font, fontSize=9.5, leading=13, spaceAfter=4, textColor=colors.HexColor("#111827")))
-    styles.add(ParagraphStyle(name="SmallRu", fontName=font, fontSize=8, leading=10, textColor=colors.HexColor("#3C4853")))
+    styles.add(ParagraphStyle(name="TitleRu", fontName=font, fontSize=20, leading=25, alignment=TA_CENTER, spaceAfter=8, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="H1Ru", fontName=font, fontSize=14, leading=18, spaceBefore=10, spaceAfter=6, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="TextRu", fontName=font, fontSize=10, leading=14.5, spaceAfter=5, textColor=colors.HexColor("#111827")))
+    styles.add(ParagraphStyle(name="SmallRu", fontName=font, fontSize=8.7, leading=12, textColor=colors.HexColor("#27313A")))
+    styles.add(ParagraphStyle(name="TableHeadRu", fontName=font, fontSize=9.2, leading=12, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="BulletRu", fontName=font, fontSize=9.2, leading=13, leftIndent=4*mm, firstLineIndent=-2*mm, textColor=colors.HexColor("#111827")))
     styles.add(ParagraphStyle(name="BadgeRu", fontName=font, fontSize=13, leading=16, alignment=TA_CENTER, textColor=colors.white))
 
     story: List[Any] = []
     scoring = report.get("risk_scoring") or {}
-    screen = report.get("screen_report") or {}
     checklist = report.get("checklist") or []
     recs = report.get("recommendations") or []
     norm = report.get("normalized_input") or {}
+    advance = report.get("advance_decision") or build_advance_decision(scoring)
 
     story.append(Paragraph("Юридический отчет по проверке продавца и объекта недвижимости", styles["TitleRu"]))
     story.append(Paragraph(f"Дата формирования: {p(report.get('created_at'))}", styles["SmallRu"]))
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 7))
 
     label = scoring.get("label") or scoring.get("level") or "Оценка риска"
     score = scoring.get("score", 0)
-    badge_color = colors.HexColor("#8B1E1E") if score >= 80 else (colors.HexColor("#B7791F") if score >= 35 else colors.HexColor("#1F7A4D"))
-    badge = Table([[Paragraph(f"{p(label).upper()}<br/>{score}/100", styles["BadgeRu"])]], colWidths=[170*mm])
+    badge_color = colors.HexColor("#8B1E1E") if score >= 85 else (colors.HexColor("#B7791F") if score >= 35 else colors.HexColor("#1F7A4D"))
+    badge = Table([[Paragraph(f"{p(label).upper()}<br/>{score}/100", styles["BadgeRu"])]], colWidths=[176*mm])
     badge.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), badge_color),
         ("BOX", (0, 0), (-1, -1), 0.5, badge_color),
-        ("TOPPADDING", (0, 0), (-1, -1), 10),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
     ]))
     story.append(badge)
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 7))
     story.append(Paragraph(p(scoring.get("conclusion")), styles["TextRu"]))
+    story.append(Paragraph(f"Решение по авансу (задатку): {p(advance.get('decision'))}. {p(advance.get('comment'))}", styles["TextRu"]))
 
     story.append(Paragraph("1. Данные проверки", styles["H1Ru"]))
     seller = norm
     prop = norm.get("property") or {}
     info_table = Table([
-        [Paragraph("Продавец", styles["SmallRu"]), Paragraph(p(" ".join([seller.get("last", ""), seller.get("first", ""), seller.get("middle", "")]).strip()), styles["TextRu"])],
-        [Paragraph("Дата рождения", styles["SmallRu"]), Paragraph(p(seller.get("dob")), styles["TextRu"])],
-        [Paragraph("ИНН", styles["SmallRu"]), Paragraph(p(seller.get("inn") or ("передан" if seller.get("inn_provided") else "не передан")), styles["TextRu"])],
-        [Paragraph("Объект", styles["SmallRu"]), Paragraph(p(prop.get("query")), styles["TextRu"])],
-    ], colWidths=[45*mm, 125*mm])
+        [Paragraph("Продавец", styles["TableHeadRu"]), Paragraph(p(" ".join([seller.get("last", ""), seller.get("first", ""), seller.get("middle", "")]).strip()), styles["TextRu"])],
+        [Paragraph("Дата рождения", styles["TableHeadRu"]), Paragraph(p(seller.get("dob")), styles["TextRu"])],
+        [Paragraph("ИНН", styles["TableHeadRu"]), Paragraph(p(seller.get("inn") or ("передан" if seller.get("inn_provided") else "не передан")), styles["TextRu"])],
+        [Paragraph("Объект", styles["TableHeadRu"]), Paragraph(p(prop.get("query")), styles["TextRu"])],
+    ], colWidths=[45*mm, 131*mm])
     info_table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F5F3EF")),
@@ -1645,23 +1687,24 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     if risks:
         for item in risks:
             story.append(Paragraph(f"<b>{p(item.get('title'))}</b>: {p(item.get('summary'))}", styles["TextRu"]))
-            for d in (item.get("details") or [])[:8]:
+            for d in (item.get("details") or [])[:7]:
                 story.append(Paragraph(f"• {p(d)}", styles["SmallRu"]))
+            story.append(Spacer(1, 2))
     else:
         story.append(Paragraph("По автоматическим источникам явные риски не выявлены.", styles["TextRu"]))
 
     story.append(Paragraph("3. Чек-лист проверок", styles["H1Ru"]))
-    rows = [[Paragraph("Источник", styles["SmallRu"]), Paragraph("Статус", styles["SmallRu"]), Paragraph("Вывод", styles["SmallRu"])] ]
+    rows = [[Paragraph("Источник", styles["TableHeadRu"]), Paragraph("Статус", styles["TableHeadRu"]), Paragraph("Вывод", styles["TableHeadRu"])] ]
     for item in checklist:
         status = {"ok": "Проверено", "risk": "Риск", "manual_check": "Ручная проверка"}.get(item.get("status"), item.get("status"))
         rows.append([Paragraph(p(item.get("title")), styles["SmallRu"]), Paragraph(p(status), styles["SmallRu"]), Paragraph(p(item.get("summary")), styles["SmallRu"])])
-    tbl = Table(rows, colWidths=[45*mm, 32*mm, 93*mm])
+    tbl = Table(rows, colWidths=[45*mm, 32*mm, 99*mm], repeatRows=1)
     tbl.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAF1F5")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("PADDING", (0, 0), (-1, -1), 5),
+        ("PADDING", (0, 0), (-1, -1), 5.5),
     ]))
     story.append(tbl)
 
@@ -1671,17 +1714,22 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         story.append(Paragraph(p(rec.get("text")), styles["SmallRu"]))
 
     story.append(Paragraph("5. Юридическое заключение", styles["H1Ru"]))
-    for block in str(report.get("legal_report") or "").split("\n\n"):
-        if block.strip():
-            story.append(Paragraph(p(block.strip()), styles["TextRu"]))
+    legal_report = strip_markdown_noise(str(report.get("legal_report") or ""))
+    for kind, text in pdf_report_blocks(legal_report):
+        if kind == "h":
+            story.append(Paragraph(p(text), styles["H1Ru"]))
+        elif kind == "bullet":
+            story.append(Paragraph(f"• {p(text)}", styles["BulletRu"]))
+        else:
+            story.append(Paragraph(p(text), styles["TextRu"]))
 
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Важно", styles["H1Ru"]))
-    story.append(Paragraph("Отчет носит информационно-аналитический характер, не является гарантией полной юридической безопасности сделки и не заменяет ручную юридическую проверку документов специалистом.", styles["SmallRu"]))
+    if "Важно" not in legal_report:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("Важно", styles["H1Ru"]))
+        story.append(Paragraph("Отчет носит информационно-аналитический характер, не является гарантией полной юридической безопасности сделки и не заменяет ручную юридическую проверку документов специалистом.", styles["SmallRu"]))
 
     doc.build(story)
     return buf.getvalue()
-
 
 # ---------- pipeline ----------
 
