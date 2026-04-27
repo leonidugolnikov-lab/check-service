@@ -44,7 +44,7 @@ except Exception:
     GIGACHAT_AVAILABLE = False
 
 
-APP_VERSION = "1.4.1-gigachat-living-legal-format"
+APP_VERSION = "1.4.2-premium-pdf-gigachat-structured"
 NEWDB_URL = "https://api.newdb.net/v2"
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
@@ -1545,12 +1545,51 @@ def redact_sensitive_from_ai_text(text: str) -> str:
     return text.strip()
 
 
+
+def normalize_legal_report_format(text: str) -> str:
+    """Normalize LLM output into readable legal sections before PDF rendering."""
+    if not text:
+        return ""
+    s = strip_markdown_noise(text)
+
+    # Remove literal template arrows if the model echoed instructions instead of using them naturally.
+    s = s.replace("Факт → Юридическое значение → Риск для покупателя → Что сделать до аванса", "")
+    s = s.replace("Факт -> Юридическое значение -> Риск для покупателя -> Что сделать до аванса", "")
+
+    # Ensure major sections start on separate lines even if GigaChat returned a continuous paragraph.
+    section_titles = [
+        "Краткий вывод",
+        "Надежность полученных данных",
+        "Риски продавца",
+        "Риски объекта",
+        "Скрытые риски, которые нужно проверить документами",
+        "Можно ли передавать аванс (задаток)",
+        "Что проверить до аванса (задатка)",
+        "Что прописать в авансовом соглашении / соглашении о задатке / ПДКП",
+        "Безопасная схема расчетов",
+        "Итоговое заключение",
+        "Важно",
+    ]
+    for title in section_titles:
+        # If a title appears in the middle of a sentence-like line, make it a new paragraph.
+        s = re.sub(rf"(?<!^)(?<!\n)(\s*)({re.escape(title)})(\s*)", rf"\n\n\2\n", s)
+
+    # Number unnumbered headings for PDF parser consistency.
+    for i, title in enumerate(section_titles, start=1):
+        s = re.sub(rf"(?m)^\s*(?:{i}\.\s*)?{re.escape(title)}\s*$", f"{i}. {title}", s)
+
+    # Normalize list markers.
+    s = re.sub(r"(?m)^\s*[-–—]\s+", "• ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
 def enforce_ai_report_text(text: str, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], req: CheckRequest) -> str:
     """Post-process LLM text so it cannot override backend facts."""
     if not text:
         return ""
 
-    text = strip_markdown_noise(text)
+    text = normalize_legal_report_format(text)
 
     egrn_ok = any("ЕГРН" in x.get("title", "") and x.get("status") == "ok" for x in checklist)
     fssp_ok = any("ФССП" in x.get("title", "") and x.get("status") == "ok" for x in checklist)
@@ -1559,28 +1598,34 @@ def enforce_ai_report_text(text: str, checklist: List[Dict[str, Any]], scoring: 
 
     # Correct common overstatements from generative output.
     replacements = {
-        "судебные дела продавца": "вероятные судебные совпадения по ФИО",
-        "продавец участвовал в судебных делах": "найдены вероятные судебные совпадения по ФИО",
+        "судебные дела продавца": "судебные совпадения, требующие идентификации",
+        "продавец участвовал в судебных делах": "найдены судебные совпадения, требующие идентификации",
         "вероятности участия продавца": "вероятные совпадения по ФИО",
+        "предположительно затрагивающих интересы последнего": "требующих ручной проверки роли и предмета",
         "конфликтах имущественного характера": "судебных материалах, требующих ручной идентификации",
-        "высокую степень риска данной сделки": "условный уровень риска данной сделки",
-        "высокая степень риска данной сделки": "условный уровень риска данной сделки",
+        "сделка крайне опасна": "сделка требует усиленной ручной проверки",
+        "категорически недопустима": "недопустима без предварительной ручной проверки и защитных условий",
+        "убедиться, что жилье приобреталось с использованием средств материнского капитала": "проверить, не приобреталось ли жилье с использованием средств материнского капитала",
+        "использовалось с использованием материнского капитала": "не использовалось ли с применением материнского капитала",
+        "высокую степень риска данной сделки": "уровень риска данной сделки согласно скорингу",
+        "высокая степень риска данной сделки": "уровень риска данной сделки согласно скорингу",
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
 
     if egrn_ok:
-        # Do not remove the correct sentence "обременения не выявлены"; remove only overstatements.
-        bad_phrases = [
-            "имеются обременения",
-            "имеются ограничения",
-            "на объекте зарегистрированы ограничения",
-            "на объекте зарегистрированы обременения",
-            "наличие зарегистрированных ограничений",
-            "наличие зарегистрированных обременений",
+        # Do not remove the correct sentence "обременения не выявлены"; replace only overstatements.
+        bad_patterns = [
+            r"имеются\s+обременения",
+            r"имеются\s+ограничения",
+            r"на\s+объекте\s+зарегистрированы\s+ограничения",
+            r"на\s+объекте\s+зарегистрированы\s+обременения",
+            r"наличие\s+зарегистрированных\s+ограничений",
+            r"наличие\s+зарегистрированных\s+обременений",
+            r"доказательства\s+отсутствия\s+обременений\s+и\s+ограничений",
         ]
-        for phrase in bad_phrases:
-            text = re.sub(re.escape(phrase), "по данным ЕГРН ограничения и обременения не выявлены", text, flags=re.IGNORECASE)
+        for pat in bad_patterns:
+            text = re.sub(pat, "по данным ЕГРН явные ограничения и обременения не выявлены", text, flags=re.IGNORECASE)
 
     if fssp_ok:
         text = re.sub(r"активн\w+\s+исполнительн\w+\s+производств\w+", "активные исполнительные производства по данным проверки не выявлены", text, flags=re.IGNORECASE)
@@ -1596,49 +1641,19 @@ def enforce_ai_report_text(text: str, checklist: List[Dict[str, Any]], scoring: 
         text = re.sub(r"(?im)^.*медицинск\w+\s+освидетельствован.*$", "", text)
         text = re.sub(r"(?im)^.*видеофиксац.*$", "", text)
 
-    # Make GigaChat output readable even if it returned headings in one paragraph.
-    numbered_headings = [
-        "1. Краткий вывод",
-        "2. Надежность полученных данных",
-        "3. Риски продавца",
-        "4. Риски объекта",
-        "5. Скрытые риски, которые нужно проверить документами",
-        "6. Можно ли передавать аванс (задаток)",
-        "7. Что проверить до аванса (задатка)",
-        "8. Что прописать в авансовом соглашении / соглашении о задатке / ПДКП",
-        "9. Безопасная схема расчетов",
-        "10. Итоговое заключение",
-        "11. Важно",
-    ]
-    for h in numbered_headings:
-        text = text.replace(h + " ", h + "\n")
-        text = text.replace("\n" + h, "\n\n" + h)
-
-    plain_headings = [
-        "Краткий вывод",
-        "Надежность полученных данных",
-        "Риски продавца",
-        "Риски объекта",
-        "Скрытые риски, которые нужно проверить документами",
-        "Можно ли передавать аванс (задаток)?",
-        "Что проверить до аванса (задатка)",
-        "Что прописать в авансовом соглашении / соглашении о задатке / ПДКП",
-        "Безопасная схема расчетов",
-        "Итоговое заключение",
-        "Важно",
-    ]
-    for h in plain_headings:
-        text = re.sub(rf"(?<!\d\.\s)({re.escape(h)})\s+", rf"\n\n\1\n", text)
-
     # Backend score is the single source of truth.
     label = str(scoring.get("label") or "")
     score = scoring.get("score")
     if label and score is not None:
-        text = re.sub(r"(?i)сделка\s+представляет\s+высокий\s+риск", f"сделка имеет оценку: {label.lower()} ({score}/100)", text)
-        text = re.sub(r"(?i)относится\s+к\s+категории\s+высокорискованных", f"имеет оценку: {label.lower()} ({score}/100)", text)
+        if int(score) < 85:
+            text = re.sub(r"(?i)сделка\s+представляет\s+высокий\s+риск", f"сделка имеет оценку: {label.lower()} ({score}/100)", text)
+            text = re.sub(r"(?i)относится\s+к\s+категории\s+высокорискованных", f"имеет оценку: {label.lower()} ({score}/100)", text)
+            text = re.sub(r"(?i)передача\s+аванса\s+\(задатка\)\s+категорически\s+недопустима", "передача аванса (задатка) недопустима без предварительной ручной проверки и защитных условий", text)
+            text = re.sub(r"(?i)передача\s+аванса\s+невозможна", "передача аванса возможна только после ручной проверки и с защитными условиями", text)
 
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = normalize_legal_report_format(text)
     return text.strip()
+
 
 
 async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], recs: List[Dict[str, str]]) -> str:
@@ -1648,73 +1663,72 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
 
     payload = build_gigachat_safe_payload(req, checklist, scoring, recs)
     prompt = (
-        "Ты практикующий юрист-эксперт по недвижимости в Санкт-Петербурге с 20-летним стажем сопровождения сделок. "
-        "Ты готовишь платное юридическое заключение для покупателя квартиры. Текст должен звучать живо и уверенно: "
-        "как опытный юрист объясняет клиенту риски перед авансом, а не как сухая выгрузка из сервиса. "
-        "При этом ты НЕ принимаешь решений самостоятельно: backend уже определил факты, уровень риска и рекомендации. "
-        "Единственный источник итоговой оценки: risk_scoring.label, risk_scoring.score, risk_scoring.conclusion и advance_decision. "
-        "Запрещено менять итоговый уровень риска, завышать его, занижать или писать выводы, которых нет в данных.\n\n"
-        "КЛЮЧЕВОЙ ПРИНЦИП: backend = юридическая логика, ты = экспертное оформление. "
-        "Твоя задача — превратить факты в понятное и сильное заключение, сохранив точность. "
-        "Не придумывай факты, не додумывай связи, не противоречь чек-листу. "
-        "Если факт не подтвержден, пиши: 'по предоставленным данным не установлено' или 'требует ручной проверки'.\n\n"
+        "Ты практикующий юрист-эксперт по недвижимости в Санкт-Петербурге с 20-летним стажем. "
+        "Ты готовишь премиальное юридическое заключение для покупателя квартиры. "
+        "Текст должен звучать как личное объяснение опытного юриста клиенту: уверенно, понятно, дорого, без канцелярской воды. "
+        "Но ты НЕ принимаешь решений вместо backend. Backend уже определил риск и выводы.\n\n"
+
+        "ГЛАВНОЕ ПРАВИЛО:\n"
+        "Backend = факты и юридическая оценка. GigaChat = экспертная подача и понятное объяснение. "
+        "Нельзя менять итоговый уровень риска, завышать его или занижать. "
+        "Единственный источник итоговой оценки: risk_scoring.label, risk_scoring.score и risk_scoring.conclusion.\n\n"
+
         "СТИЛЬ ОТЧЕТА:\n"
-        "- Пиши не сухо, но профессионально: уверенно, спокойно, без рекламных фраз и без паники.\n"
-        "- Не используй формулировки вроде 'возможно всё плохо'. Объясняй: что найдено, чем это важно, что нужно сделать.\n"
-        "- Каждый существенный вывод раскрывай по логике: факт → юридическое значение → риск для покупателя → действие до аванса (задатка).\n"
-        "- Не превращай текст в простыню: короткие абзацы по 2–4 строки, отдельные подзаголовки, аккуратные списки.\n"
-        "- Не используй markdown: никаких ###, **, ---, таблиц markdown и английских технических ключей. Допустимы только обычные нумерованные разделы и пункты с символом •.\n"
-        "- Перед каждым разделом ставь пустую строку. Заголовок раздела всегда отдельной строкой.\n"
-        "- Не пиши одно длинное полотно. После каждого важного вывода делай перенос строки.\n\n"
-        "ОБЯЗАТЕЛЬНЫЕ ЮРИДИЧЕСКИЕ ССЫЛКИ:\n"
-        "Указывай нормы права только там, где они действительно относятся к выводу. Не набрасывай статьи ради вида.\n"
-        "- банкротство и оспаривание: ст. 61.2, 61.3 ФЗ №127-ФЗ;\n"
-        "- недействительность сделок: ст. 166–181 ГК РФ; при вопросах воли/дееспособности — ст. 177 ГК РФ;\n"
-        "- супруг и совместное имущество: ст. 34, 35 СК РФ, ст. 253 ГК РФ;\n"
-        "- доли и преимущественное право: ст. 250 ГК РФ;\n"
-        "- несовершеннолетние и опека: ст. 37 ГК РФ, ст. 60 СК РФ;\n"
-        "- доверенность: ст. 185–189 ГК РФ;\n"
-        "- регистрация права и обременения: ФЗ №218-ФЗ;\n"
-        "- исполнительные производства: ФЗ №229-ФЗ;\n"
-        "- материнский капитал: ФЗ №256-ФЗ.\n\n"
-        "СТРОГИЕ ЗАПРЕТЫ ПО ФАКТАМ:\n"
-        "1. Если ЕГРН имеет status='ok' и encumbrances_count=0, запрещено писать, что на объекте есть аресты, залоги, запреты или обременения. "
-        "Разрешено писать только: по полученным данным ЕГРН явные ограничения и обременения не выявлены, но история объекта проверяется документами.\n"
-        "2. Если ФССП имеет status='ok' и active_count=0, запрещено писать, что у продавца есть активные долги или активные исполнительные производства.\n"
-        "3. Если паспорт МВД имеет status='ok', запрещено писать, что паспорт не проверен.\n"
-        "4. Дата рождения, ИНН, серия и номер паспорта намеренно не передаются в GigaChat. Не делай из этого вывод о ненадежности данных. Не указывай ИНН, серию и номер паспорта в заключении.\n"
-        "5. По судебным делам: если match_level не 'точное совпадение', пиши только 'вероятные совпадения по ФИО' или 'слабые совпадения'. "
-        "Запрещено писать, что это установленные дела продавца или что они связаны с квартирой/имуществом, если такая связь прямо не указана в данных.\n"
-        "6. Скрытые риски описывай только как то, что нужно проверить документами. Нельзя писать, что супруг, маткапитал, дети, отказники, доверенность или зарегистрированные лица реально есть, если этого нет в данных.\n"
-        "7. Возрастной блок применяй только если seller.age >= 70. Если возраст меньше 70 или не указан, не пиши про ПНД, медицинское освидетельствование и видеофиксацию как применимые к этому продавцу. "
-        "Правило возраста: старше 70 лет — справка из ПНД и медицинское освидетельствование до сделки желательны; старше 75 лет — обязательны, дополнительно рекомендована видеофиксация.\n\n"
+        "Пиши как юрист, который объясняет покупателю, можно ли двигаться к авансу (задатку), где слабые места и чем их закрыть. "
+        "Не сухая таблица и не рекламный текст. Нужны короткие абзацы, сильные выводы, нормальный человеческий язык. "
+        "Каждый раздел должен быть читаемым: 2-4 коротких абзаца или список. Не делай длинную простыню. "
+        "Не используй markdown-разметку: без ###, **, ---, ``` и технических ключей JSON. "
+        "Не пиши буквальную фразу 'Факт → Юридическое значение → Риск → Что сделать'. Раскрывай эту логику естественно.\n\n"
+
+        "СТРОГИЕ ЗАПРЕТЫ:\n"
+        "1. Не придумывай факты и не додумывай связи. "
+        "2. Не противоречь чек-листу и risk_scoring. "
+        "3. Если ЕГРН status='ok' и encumbrances_count=0 — запрещено писать, что есть аресты, залоги, запреты или обременения. "
+        "Разрешено: 'по полученным данным ЕГРН явные ограничения и обременения не выявлены, но историю объекта нужно проверить документами'. "
+        "4. Если ФССП status='ok' и active_count=0 — запрещено писать про активные долги или активные ИП. "
+        "5. Если паспорт МВД status='ok' — запрещено писать, что паспорт не проверен. "
+        "6. ИНН, серия и номер паспорта не передаются в GigaChat специально. Нельзя писать, что из-за этого данные ненадежны. Не указывай ИНН и паспорт в заключении. "
+        "7. По судам: точное совпадение не означает автоматическую связь с квартирой. Пиши: 'найдены судебные совпадения, требуется проверить роль, предмет и результат'. "
+        "Если match_level='вероятное совпадение' — пиши только 'вероятные совпадения по ФИО'. Запрещено называть их установленными делами продавца. "
+        "8. Если арбитражные дела завершены, не пиши, что они сами по себе блокируют сделку. Пиши, что нужно проверить предмет спора и имущественные последствия. "
+        "9. Если банкротство завершено — не называй это автоматическим стоп-фактором. Пиши: 'стоп-фактор не подтвержден, но нужна проверка дат, конкурсной массы и связи объекта с процедурой'. "
+        "10. Скрытые риски описывай только как то, что нужно проверить документами. Нельзя писать, что супруг, маткапитал, дети, отказники, доверенность или зарегистрированные лица реально есть, если этого нет в данных. "
+        "11. Возрастной блок применяй только если seller.age >= 70. Если возраст меньше 70 или не указан — не пиши про ПНД, медицинское освидетельствование и видеофиксацию как применимые к продавцу. "
+        "Правило возраста: старше 70 лет — справка из ПНД и медицинское освидетельствование желательны; старше 75 лет — обязательны, плюс рекомендована видеофиксация.\n\n"
+
+        "НОРМЫ ПРАВА:\n"
+        "Вставляй ссылки на нормы закона там, где они реально относятся к выводу, но не превращай отчет в учебник. "
+        "Банкротство и оспаривание: ст. 61.2, 61.3 ФЗ №127-ФЗ. "
+        "Недействительность сделок: ст. 166–181 ГК РФ, по воле/дееспособности — ст. 177 ГК РФ. "
+        "Супруг: ст. 34, 35 СК РФ и ст. 253 ГК РФ. "
+        "Доли: ст. 250 ГК РФ. "
+        "Несовершеннолетние и опека: ст. 37 ГК РФ, ст. 60 СК РФ. "
+        "Доверенность: ст. 185–189 ГК РФ. "
+        "Регистрация права: ФЗ №218-ФЗ. "
+        "Исполнительные производства: ФЗ №229-ФЗ. "
+        "Материнский капитал: ФЗ №256-ФЗ.\n\n"
+
+        "ФОРМАТИРОВАНИЕ ДЛЯ PDF:\n"
+        "Каждый раздел начинай с отдельной строки и номера. После заголовка сразу перенос строки. "
+        "Списки начинай символом '•'. Между разделами оставляй пустую строку. "
+        "Не объединяй заголовок и текст в одну строку.\n\n"
+
         "СТРУКТУРА СТРОГО:\n"
         "1. Краткий вывод\n"
-        "Начни с человеческого, но юридически точного вывода: сделка стоповая или нет, можно ли рассматривать, почему нельзя идти на доверии. 2–3 коротких абзаца.\n\n"
         "2. Надежность полученных данных\n"
-        "Поясни, какие источники дали понятный результат, а где требуется ручная проверка. Не называй скрытые от модели паспорт/ИНН отсутствующими данными.\n\n"
         "3. Риски продавца\n"
-        "Раздели установленные факты и вероятные совпадения. По банкротству пиши аккуратно: завершенное банкротство не стоп-фактор, но требует проверки по ст. 61.2–61.3 ФЗ №127-ФЗ.\n\n"
         "4. Риски объекта\n"
-        "Опирайся только на ЕГРН. Если ограничений нет — прямо напиши, что по ЕГРН они не выявлены. Не придумывай обременения.\n\n"
         "5. Скрытые риски, которые нужно проверить документами\n"
-        "Сделай не сухой список, а короткий экспертный чек-лист: супруг, маткапитал, доли, наследство, приватизация/отказники, зарегистрированные лица, доверенность, опека. Рядом уместно укажи статьи закона.\n\n"
         "6. Можно ли передавать аванс (задаток)\n"
-        "Используй advance_decision. Пиши уверенно: допустимо только при каких условиях.\n\n"
         "7. Что проверить до аванса (задатка)\n"
-        "Дай конкретные действия: какие документы запросить и какие факты закрыть.\n\n"
         "8. Что прописать в авансовом соглашении / соглашении о задатке / ПДКП\n"
-        "Дай конкретные защитные условия, а не общие слова.\n\n"
         "9. Безопасная схема расчетов\n"
-        "Опиши аккредитив/депозит/ячейку в зависимости от риска. Без лишней воды.\n\n"
         "10. Итоговое заключение\n"
-        "Финальный сильный вывод: сделка допустима/недопустима/допустима только при условиях. Не противоречь скорингу.\n\n"
-        "11. Важно\n"
-        "Краткое предупреждение: отчет не гарантирует 100% безопасность и не заменяет ручную проверку документов. Не используй слово 'Дисклеймер'.\n\n"
-        "Данные для заключения:\n"
+        "11. Важно\n\n"
+
+        "ДАННЫЕ ДЛЯ ЗАКЛЮЧЕНИЯ:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
-
 
     try:
         def _call() -> str:
@@ -1731,10 +1745,30 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
         return fallback
 
 
+
 def pdf_report_blocks(text: str) -> List[Tuple[str, str]]:
     """Return (kind, text) blocks for readable PDF rendering."""
-    text = strip_markdown_noise(text or "")
+    text = normalize_legal_report_format(text or "")
     text = re.sub(r"(?m)^\s*[-–—]\s+", "• ", text)
+
+    # Additional protection: if model still put heading and body on one line,
+    # split after known numbered headings.
+    section_titles = [
+        "Краткий вывод",
+        "Надежность полученных данных",
+        "Риски продавца",
+        "Риски объекта",
+        "Скрытые риски, которые нужно проверить документами",
+        "Можно ли передавать аванс (задаток)",
+        "Что проверить до аванса (задатка)",
+        "Что прописать в авансовом соглашении / соглашении о задатке / ПДКП",
+        "Безопасная схема расчетов",
+        "Итоговое заключение",
+        "Важно",
+    ]
+    for i, title in enumerate(section_titles, start=1):
+        text = re.sub(rf"(?m)^({i}\.\s*{re.escape(title)})\s+(.+)$", rf"\1\n\2", text)
+
     lines = [ln.strip() for ln in text.splitlines()]
     blocks: List[Tuple[str, str]] = []
     buf: List[str] = []
@@ -1786,6 +1820,7 @@ def p(text: Any) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
 
 
+
 def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     if not REPORTLAB_AVAILABLE:
         return ("PDF generation unavailable: reportlab is not installed.\n\n" + json.dumps(report, ensure_ascii=False, indent=2)).encode("utf-8")
@@ -1795,19 +1830,23 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     doc = SimpleDocTemplate(
         buf,
         pagesize=A4,
-        leftMargin=17*mm,
-        rightMargin=17*mm,
-        topMargin=15*mm,
-        bottomMargin=15*mm,
+        leftMargin=15*mm,
+        rightMargin=15*mm,
+        topMargin=14*mm,
+        bottomMargin=14*mm,
     )
+
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="TitleRu", fontName=font, fontSize=20, leading=25, alignment=TA_CENTER, spaceAfter=8, textColor=colors.HexColor("#0F3D56")))
-    styles.add(ParagraphStyle(name="H1Ru", fontName=font, fontSize=14, leading=18, spaceBefore=10, spaceAfter=6, textColor=colors.HexColor("#0F3D56")))
-    styles.add(ParagraphStyle(name="TextRu", fontName=font, fontSize=10, leading=14.5, spaceAfter=5, textColor=colors.HexColor("#111827")))
-    styles.add(ParagraphStyle(name="SmallRu", fontName=font, fontSize=8.7, leading=12, textColor=colors.HexColor("#27313A")))
-    styles.add(ParagraphStyle(name="TableHeadRu", fontName=font, fontSize=9.2, leading=12, textColor=colors.HexColor("#0F3D56")))
-    styles.add(ParagraphStyle(name="BulletRu", fontName=font, fontSize=9.2, leading=13, leftIndent=4*mm, firstLineIndent=-2*mm, textColor=colors.HexColor("#111827")))
+    styles.add(ParagraphStyle(name="TitleRu", fontName=font, fontSize=21, leading=26, alignment=TA_CENTER, spaceAfter=6, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="SubtitleRu", fontName=font, fontSize=9.5, leading=13, alignment=TA_CENTER, textColor=colors.HexColor("#3C4853")))
+    styles.add(ParagraphStyle(name="H1Ru", fontName=font, fontSize=14.2, leading=18, spaceBefore=10, spaceAfter=5, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="H2Ru", fontName=font, fontSize=11.5, leading=15, spaceBefore=5, spaceAfter=3, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="TextRu", fontName=font, fontSize=9.7, leading=14.2, spaceAfter=4.5, textColor=colors.HexColor("#111827")))
+    styles.add(ParagraphStyle(name="SmallRu", fontName=font, fontSize=8.4, leading=11.5, textColor=colors.HexColor("#3C4853")))
+    styles.add(ParagraphStyle(name="TableHeadRu", fontName=font, fontSize=8.8, leading=11.5, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="BulletRu", fontName=font, fontSize=9.2, leading=13.2, leftIndent=4*mm, firstLineIndent=-2*mm, textColor=colors.HexColor("#111827")))
     styles.add(ParagraphStyle(name="BadgeRu", fontName=font, fontSize=13, leading=16, alignment=TA_CENTER, textColor=colors.white))
+    styles.add(ParagraphStyle(name="BoxTitleRu", fontName=font, fontSize=10.2, leading=13, textColor=colors.HexColor("#0F3D56")))
 
     story: List[Any] = []
     scoring = report.get("risk_scoring") or {}
@@ -1815,91 +1854,187 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     recs = report.get("recommendations") or []
     norm = report.get("normalized_input") or {}
     advance = report.get("advance_decision") or build_advance_decision(scoring)
+    hidden_risks = report.get("hidden_risks") or []
 
-    story.append(Paragraph("Юридический отчет по проверке продавца и объекта недвижимости", styles["TitleRu"]))
-    story.append(Paragraph(f"Дата формирования: {p(report.get('created_at'))}", styles["SmallRu"]))
-    story.append(Spacer(1, 7))
+    def add_card(title: str, body: Any, *, bg: str = "#FFFFFF", border: str = "#D8DEE5") -> None:
+        content: List[Any] = []
+        if title:
+            content.append(Paragraph(p(title), styles["BoxTitleRu"]))
+        if isinstance(body, list):
+            for x in body:
+                content.append(Paragraph(p(x), styles["SmallRu"]))
+        else:
+            content.append(Paragraph(p(body), styles["SmallRu"]))
+        tbl = Table([[content]], colWidths=[180*mm])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(bg)),
+            ("BOX", (0, 0), (-1, -1), 0.45, colors.HexColor(border)),
+            ("LEFTPADDING", (0, 0), (-1, -1), 7),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 5))
+
+    # Cover / header
+    story.append(Paragraph("Юридическое заключение", styles["TitleRu"]))
+    story.append(Paragraph("по проверке продавца и объекта недвижимости", styles["SubtitleRu"]))
+    story.append(Paragraph(f"Дата формирования: {p(report.get('created_at'))}", styles["SubtitleRu"]))
+    story.append(Spacer(1, 8))
 
     label = scoring.get("label") or scoring.get("level") or "Оценка риска"
-    score = scoring.get("score", 0)
-    badge_color = colors.HexColor("#8B1E1E") if score >= 85 else (colors.HexColor("#B7791F") if score >= 35 else colors.HexColor("#1F7A4D"))
-    badge = Table([[Paragraph(f"{p(label).upper()}<br/>{score}/100", styles["BadgeRu"])]], colWidths=[176*mm])
+    score = int(scoring.get("score") or 0)
+    badge_color = "#8B1E1E" if score >= 85 else ("#B7791F" if score >= 35 else "#1F7A4D")
+    badge = Table([[Paragraph(f"{p(label).upper()}<br/>{score}/100", styles["BadgeRu"])]], colWidths=[180*mm])
     badge.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), badge_color),
-        ("BOX", (0, 0), (-1, -1), 0.5, badge_color),
-        ("TOPPADDING", (0, 0), (-1, -1), 9),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(badge_color)),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor(badge_color)),
+        ("TOPPADDING", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
     ]))
     story.append(badge)
     story.append(Spacer(1, 7))
-    story.append(Paragraph(p(scoring.get("conclusion")), styles["TextRu"]))
-    story.append(Paragraph(f"Решение по авансу (задатку): {p(advance.get('decision'))}. {p(advance.get('comment'))}", styles["TextRu"]))
 
+    add_card(
+        "Главный вывод",
+        scoring.get("conclusion") or "Итоговый вывод не сформирован.",
+        bg="#F5F3EF",
+        border="#E4D9C8",
+    )
+    add_card(
+        "Решение по авансу (задатку)",
+        f"{advance.get('decision')}. {advance.get('comment')}",
+        bg="#FFF8EA" if score >= 35 else "#EDF7F1",
+        border="#E8C98A" if score >= 35 else "#B8D9C1",
+    )
+
+    # Input data
     story.append(Paragraph("1. Данные проверки", styles["H1Ru"]))
     seller = norm
     prop = norm.get("property") or {}
-    info_table = Table([
-        [Paragraph("Продавец", styles["TableHeadRu"]), Paragraph(p(" ".join([seller.get("last", ""), seller.get("first", ""), seller.get("middle", "")]).strip()), styles["TextRu"])],
+    seller_fio = " ".join([seller.get("last", ""), seller.get("first", ""), seller.get("middle", "")]).strip()
+    info_rows = [
+        [Paragraph("Продавец", styles["TableHeadRu"]), Paragraph(p(seller_fio), styles["TextRu"])],
         [Paragraph("Дата рождения", styles["TableHeadRu"]), Paragraph(p(seller.get("dob")), styles["TextRu"])],
         [Paragraph("ИНН", styles["TableHeadRu"]), Paragraph(p(seller.get("inn") or ("передан" if seller.get("inn_provided") else "не передан")), styles["TextRu"])],
         [Paragraph("Объект", styles["TableHeadRu"]), Paragraph(p(prop.get("query")), styles["TextRu"])],
-    ], colWidths=[45*mm, 131*mm])
+    ]
+    info_table = Table(info_rows, colWidths=[42*mm, 138*mm])
     info_table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F5F3EF")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("PADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
     story.append(info_table)
+    story.append(Spacer(1, 5))
 
-    story.append(Paragraph("2. Ключевые риски", styles["H1Ru"]))
-    risks = [x for x in checklist if x.get("status") == "risk"]
-    if risks:
-        for item in risks:
-            story.append(Paragraph(f"<b>{p(item.get('title'))}</b>: {p(item.get('summary'))}", styles["TextRu"]))
-            for d in (item.get("details") or [])[:7]:
-                story.append(Paragraph(f"• {p(d)}", styles["SmallRu"]))
-            story.append(Spacer(1, 2))
-    else:
-        story.append(Paragraph("По автоматическим источникам явные риски не выявлены.", styles["TextRu"]))
-
-    story.append(Paragraph("3. Чек-лист проверок", styles["H1Ru"]))
-    rows = [[Paragraph("Источник", styles["TableHeadRu"]), Paragraph("Статус", styles["TableHeadRu"]), Paragraph("Вывод", styles["TableHeadRu"])] ]
+    # Checklist as premium matrix
+    story.append(Paragraph("2. Карта автоматических проверок", styles["H1Ru"]))
+    rows = [[Paragraph("Источник", styles["TableHeadRu"]), Paragraph("Статус", styles["TableHeadRu"]), Paragraph("Вывод", styles["TableHeadRu"])]]
     for item in checklist:
-        status = {"ok": "Проверено", "risk": "Риск", "manual_check": "Ручная проверка"}.get(item.get("status"), item.get("status"))
-        rows.append([Paragraph(p(item.get("title")), styles["SmallRu"]), Paragraph(p(status), styles["SmallRu"]), Paragraph(p(item.get("summary")), styles["SmallRu"])])
-    tbl = Table(rows, colWidths=[45*mm, 32*mm, 99*mm], repeatRows=1)
+        status = {"ok": "Проверено", "risk": "Требует внимания", "manual_check": "Ручная проверка"}.get(item.get("status"), item.get("status"))
+        rows.append([
+            Paragraph(p(item.get("title")), styles["SmallRu"]),
+            Paragraph(p(status), styles["SmallRu"]),
+            Paragraph(p(item.get("summary")), styles["SmallRu"]),
+        ])
+    tbl = Table(rows, colWidths=[43*mm, 34*mm, 103*mm], repeatRows=1)
     tbl.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAF1F5")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F0F5F8")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("PADDING", (0, 0), (-1, -1), 5.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
     story.append(tbl)
 
-    story.append(Paragraph("4. Рекомендации юриста", styles["H1Ru"]))
-    for rec in recs:
-        story.append(Paragraph(f"<b>{p(rec.get('title'))}</b>", styles["TextRu"]))
-        story.append(Paragraph(p(rec.get("text")), styles["SmallRu"]))
+    # Key risks
+    story.append(Paragraph("3. Ключевые юридические риски", styles["H1Ru"]))
+    risks = [x for x in checklist if x.get("status") == "risk"]
+    if risks:
+        for item in risks:
+            lines = [item.get("summary") or ""]
+            for d in (item.get("details") or [])[:5]:
+                lines.append(f"• {d}")
+            add_card(item.get("title") or "Риск", lines, bg="#FFFDF8", border="#E6D3A4")
+    else:
+        add_card("Риски по автоматическим источникам", "Явные риски по автоматическим источникам не выявлены.", bg="#EDF7F1", border="#B8D9C1")
 
-    story.append(Paragraph("5. Юридическое заключение", styles["H1Ru"]))
-    legal_report = strip_markdown_noise(str(report.get("legal_report") or ""))
+    # Recommendations
+    story.append(Paragraph("4. Что сделать до аванса (задатка)", styles["H1Ru"]))
+    rec_rows = [[Paragraph("Приоритет", styles["TableHeadRu"]), Paragraph("Действие", styles["TableHeadRu"]), Paragraph("Зачем это нужно", styles["TableHeadRu"])]]
+    for rec in recs[:8]:
+        priority = {"critical": "Критично", "high": "Важно", "medium": "Проверить"}.get(rec.get("priority"), rec.get("priority") or "Проверить")
+        rec_rows.append([
+            Paragraph(p(priority), styles["SmallRu"]),
+            Paragraph(p(rec.get("title")), styles["SmallRu"]),
+            Paragraph(p(rec.get("text")), styles["SmallRu"]),
+        ])
+    rec_table = Table(rec_rows, colWidths=[25*mm, 55*mm, 100*mm], repeatRows=1)
+    rec_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F0F5F8")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(rec_table)
+
+    # Hidden risk matrix
+    if hidden_risks:
+        story.append(Paragraph("5. Скрытые риски, которые не всегда видны в реестрах", styles["H1Ru"]))
+        hidden_rows = [[Paragraph("Риск", styles["TableHeadRu"]), Paragraph("Что проверить", styles["TableHeadRu"]), Paragraph("Правовая опора", styles["TableHeadRu"])]]
+        for h in hidden_risks[:10]:
+            hidden_rows.append([
+                Paragraph(p(h.get("risk")), styles["SmallRu"]),
+                Paragraph(p(h.get("why")), styles["SmallRu"]),
+                Paragraph(p(h.get("law")), styles["SmallRu"]),
+            ])
+        hidden_table = Table(hidden_rows, colWidths=[38*mm, 95*mm, 47*mm], repeatRows=1)
+        hidden_table.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F3EF")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(hidden_table)
+
+    # Legal conclusion from GigaChat/local fallback
+    story.append(Paragraph("6. Юридическое заключение", styles["H1Ru"]))
+    legal_report = normalize_legal_report_format(str(report.get("legal_report") or ""))
     for kind, text in pdf_report_blocks(legal_report):
         if kind == "h":
-            story.append(Paragraph(p(text), styles["H1Ru"]))
+            story.append(Paragraph(p(text), styles["H2Ru"]))
         elif kind == "bullet":
             story.append(Paragraph(f"• {p(text)}", styles["BulletRu"]))
         else:
             story.append(Paragraph(p(text), styles["TextRu"]))
 
     if "Важно" not in legal_report:
-        story.append(Spacer(1, 8))
-        story.append(Paragraph("Важно", styles["H1Ru"]))
-        story.append(Paragraph("Отчет носит информационно-аналитический характер, не является гарантией полной юридической безопасности сделки и не заменяет ручную юридическую проверку документов специалистом.", styles["SmallRu"]))
+        add_card(
+            "Важно",
+            "Отчет носит информационно-аналитический характер, не является гарантией полной юридической безопасности сделки и не заменяет ручную юридическую проверку документов специалистом.",
+            bg="#F5F3EF",
+            border="#E4D9C8",
+        )
 
     doc.build(story)
     return buf.getvalue()
+
 
 # ---------- pipeline ----------
 
