@@ -44,7 +44,7 @@ except Exception:
     GIGACHAT_AVAILABLE = False
 
 
-APP_VERSION = "1.2.0-premium-legal-report-clean"
+APP_VERSION = "1.1.0-premium-newdb-gigachat-credentials"
 NEWDB_URL = "https://api.newdb.net/v2"
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
@@ -108,7 +108,7 @@ def now_ru() -> str:
 
 
 def digits_only(value: Any) -> str:
-    return re.sub(r"\\D+", "", str(value or ""))
+    return re.sub(r"\D+", "", str(value or ""))
 
 
 def clean_str(value: Any) -> str:
@@ -124,11 +124,11 @@ def normalize_dob(value: str) -> Tuple[str, str]:
     raw = clean_str(value)
     if not raw:
         return "", ""
-    m = re.match(r"^(\\d{2})[.\\-/](\\d{2})[.\\-/](\\d{4})$", raw)
+    m = re.match(r"^(\d{2})[.\-/](\d{2})[.\-/](\d{4})$", raw)
     if m:
         d, mo, y = m.groups()
         return f"{d}.{mo}.{y}", f"{y}-{mo}-{d}"
-    m = re.match(r"^(\\d{4})[.\\-/](\\d{2})[.\\-/](\\d{2})$", raw)
+    m = re.match(r"^(\d{4})[.\-/](\d{2})[.\-/](\d{2})$", raw)
     if m:
         y, mo, d = m.groups()
         return f"{d}.{mo}.{y}", f"{y}-{mo}-{d}"
@@ -158,7 +158,7 @@ def normalize_region(req: CheckRequest) -> int:
 
 def normalize_property(req: CheckRequest) -> Dict[str, str]:
     query = clean_str(req.cadastral_number or req.cadnum or req.cadastral or req.property_query or req.address)
-    is_cad = bool(re.match(r"^\\d{2}:\\d{2}:\\d+", query))
+    is_cad = bool(re.match(r"^\d{2}:\d{2}:\d+", query))
     return {
         "query": query,
         "cadastral_number": query if is_cad else "",
@@ -275,7 +275,7 @@ async def newdb_run(
             return last
 
     last["state"] = "timeout"
-    last["error"] = "Источник не отвечает по техническим причинам на стороне реестра. Требуется ручная проверка."
+    last["error"] = f"Источник не вернул итоговый результат за {timeout_sec} секунд. Требуется ручная проверка."
     return last
 
 
@@ -444,7 +444,7 @@ def generic_error_details(response: Dict[str, Any]) -> List[str]:
     if "баланс" in text or "x-api-key" in text or "token" in text:
         return ["Источник вернул ошибку доступа/баланса API. Требуется ручная проверка."]
     if response.get("state") == "timeout":
-        return ["Источник не отвечает по техническим причинам на стороне реестра. Требуется ручная проверка."]
+        return ["Источник не успел вернуть результат в установленное время. Требуется ручная проверка."]
     if response.get("state") in {"queued", "restart", "in progress"}:
         return ["Источник еще обрабатывает запрос. Требуется повторить позже или проверить вручную."]
     if has_result_status_500(response):
@@ -470,8 +470,8 @@ def extract_debt_amount(text: str, prefer_remainder: bool = True) -> float:
         return 0.0
     patterns = []
     if prefer_remainder:
-        patterns.append(r"Остаток долга[^:]*:\\s*([\\d\\s]+(?:[,.]\\d+)?)\\s*руб")
-    patterns.append(r"Сумма долга:\\s*([\\d\\s]+(?:[,.]\\d+)?)\\s*руб")
+        patterns.append(r"Остаток долга[^:]*:\s*([\d\s]+(?:[,.]\d+)?)\s*руб")
+    patterns.append(r"Сумма долга:\s*([\d\s]+(?:[,.]\d+)?)\s*руб")
     for pat in patterns:
         m = re.search(pat, text, flags=re.IGNORECASE)
         if m:
@@ -716,16 +716,16 @@ def risk_scoring(checklist: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     score = max(0, min(100, int(score)))
     if score >= 80:
-        level = "опасно"
-        label = "Опасно при самостоятельной сделке"
+        level = "опасная"
+        label = "Опасная при самостоятельной сделке"
         conclusion = "Сделку не рекомендуется проводить самостоятельно без юридического сопровождения. Сделка может быть реализуема только после устранения ключевых рисков и настройки безопасной схемы расчетов."
     elif score >= 35:
-        level = "рискованно"
-        label = "Рискованно при самостоятельной сделке"
+        level = "условно рискованная"
+        label = "Условно рискованная при самостоятельной сделке"
         conclusion = "Сделку можно рассматривать только после уточнения рисков, ручной проверки документов и защитных условий в авансе/ПДКП."
     else:
-        level = "допустимо"
-        label = "Допустимо к дальнейшему рассмотрению"
+        level = "допустимая"
+        label = "Допустимая к дальнейшему рассмотрению"
         conclusion = "По автоматическим источникам критичных рисков не выявлено, но отчет не заменяет ручную юридическую проверку документов."
     return {"score": score, "max_score": 100, "level": level, "label": label, "conclusion": conclusion, "factors": factors}
 
@@ -752,7 +752,7 @@ def build_recommendations(checklist: List[Dict[str, Any]]) -> List[Dict[str, str
     if pravosud and pravosud.get("status") == "risk":
         recs.append({"priority": "medium", "title": "Разобрать дела судов общей юрисдикции", "text": "Нужно проверить роль продавца в делах, предмет спора и возможные имущественные последствия."})
     if any(x.get("status") == "manual_check" for x in checklist):
-        recs.append({"priority": "medium", "title": "Закрыть ручные проверки до аванса", "text": "Все источники со статусом \'abтребуется ручная проверка\'bb нужно проверить вручную до передачи денег."})
+        recs.append({"priority": "medium", "title": "Закрыть ручные проверки до аванса", "text": "Все источники со статусом «требуется ручная проверка» нужно проверить вручную до передачи денег."})
     recs.append({"priority": "high", "title": "Авансовое соглашение делать с защитными условиями", "text": "Включить обязанность продавца раскрыть долги, запреты, банкротство, судебные споры; предусмотреть возврат аванса/задатка и ответственность при неподтверждении данных."})
     return recs
 
@@ -835,122 +835,7 @@ def build_local_legal_report(req: CheckRequest, checklist: List[Dict[str, Any]],
     lines.append("")
     lines.append("7. Итоговое заключение")
     lines.append("Отчет не обещает 100% безопасность сделки. При выявленных ограничениях, активных ИП или судебных делах сделка должна проходить только после ручного юридического анализа документов и условий расчетов.")
-    return "\\n".join(lines)
-
-
-
-def calculate_age_from_dob(dob: str) -> Optional[int]:
-    dob_ru, _ = normalize_dob(dob)
-    m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", dob_ru or "")
-    if not m:
-        return None
-    day, month, year = map(int, m.groups())
-    today = datetime.now()
-    age = today.year - year - ((today.month, today.day) < (month, day))
-    return age
-
-
-def normalize_legal_words(text: str) -> str:
-    if not text:
-        return ""
-    replacements = {
-        "Опасная": "Опасно",
-        "опасная": "опасно",
-        "Допустимая": "Допустимо",
-        "допустимая": "допустимо",
-        "Рискованная": "Рискованно",
-        "рискованная": "рискованно",
-        "Условно рискованная": "Рискованно",
-        "условно рискованная": "рискованно",
-        "Дисклеймер": "Важно",
-        "дисклеймер": "Важно",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return text
-
-
-def clean_legal_report_text(text: str) -> str:
-    if not text:
-        return ""
-
-    text = normalize_legal_words(text)
-
-    # Убираем markdown и служебные разделители, которые портят PDF.
-    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^\s*---+\s*$", "", text, flags=re.MULTILINE)
-    text = text.replace("**", "")
-    text = text.replace("__", "")
-
-    # Убираем дубли заголовков внутри блока юридического заключения.
-    text = re.sub(r"(?im)^\s*Юридическое заключение\s*$", "", text)
-    text = re.sub(r"(?im)^\s*Заключение\s*$", "", text)
-
-    # Нормализуем ручные проверки.
-    text = re.sub(
-        r"Источник не успел вернуть результат в установленное время\. Требуется ручная проверка\.",
-        "Источник не отвечает по техническим причинам на стороне реестра. Требуется ручная проверка.",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def add_spouse_block(text: str) -> str:
-    text = text or ""
-    low = text.lower()
-    if "супруг" in low or "супруга" in low or "согласие супруга" in low:
-        return text
-
-    spouse_block = """
-5. Согласие супруга/супруги и риск оспаривания сделки
-
-По предоставленным данным семейное положение продавца, дата приобретения объекта и режим имущества не проверялись.
-
-До передачи аванса необходимо установить:
-- состоял ли продавец в браке на дату приобретения объекта;
-- на каком основании возникло право собственности;
-- является ли объект совместно нажитым имуществом.
-
-Если объект приобретался в браке на возмездной основе, требуется нотариальное согласие супруга/супруги либо документы, подтверждающие личный характер имущества.
-
-Отсутствие необходимого согласия супруга/супруги может стать основанием для последующего оспаривания сделки третьими лицами.
-"""
-    return (text.rstrip() + "\n\n" + spouse_block.strip()).strip()
-
-
-def add_age_risk_block(text: str, dob: str) -> str:
-    text = text or ""
-    age = calculate_age_from_dob(dob)
-    if age is None or age < 60:
-        return text
-
-    low = text.lower()
-    if "пнд" in low or "дееспособ" in low or "освидетельств" in low:
-        return text
-
-    age_block = f"""
-6. Возраст продавца, дееспособность и риск оспаривания
-
-Возраст продавца по указанной дате рождения: {age} лет.
-
-Продавцы старше 60 лет относятся к отдельной группе риска при сделках с недвижимостью, поскольку в дальнейшем сделка может оспариваться со ссылкой на состояние здоровья, понимание характера сделки и способность осознавать последствия подписываемых документов.
-
-Если сделка является прямой продажей, до аванса желательно запросить справку из ПНД о том, что продавец не состоит на учете, а также рассмотреть медицинское освидетельствование на дату сделки.
-
-Данный пункт не означает, что у продавца имеются медицинские ограничения. Это превентивная мера для снижения риска последующего оспаривания сделки третьими лицами.
-"""
-    return (text.rstrip() + "\n\n" + age_block.strip()).strip()
-
-
-def postprocess_legal_report(text: str, req: CheckRequest) -> str:
-    text = clean_legal_report_text(text)
-    text = add_spouse_block(text)
-    text = add_age_risk_block(text, req.dob)
-    text = clean_legal_report_text(text)
-    return text
+    return "\n".join(lines)
 
 
 async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], recs: List[Dict[str, str]]) -> str:
@@ -964,55 +849,12 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
         "recommendations": recs,
     }
     prompt = (
-        "Ты юрист по недвижимости в Санкт-Петербурге.\n\n"
-        "Сформируй комплексный юридический отчет по проверке продавца и объекта недвижимости.\n\n"
-        "Пиши строго, без разговорного стиля, маркетинга, эмоций и призывов. Тон — как в юридическом заключении для покупателя.\n"
-        "Не используй markdown: ###, ##, --- или жирное выделение звездочками.\n"
-        "Не используй слово 'Дисклеймер', используй 'Важно'.\n"
-        "Используй только формулировки оценки: Опасно / Рискованно / Допустимо. Не пиши: Опасная, Допустимая, Рискованная.\n"
-        "Не придумывай факты. Если данных нет — прямо пиши: 'по предоставленным данным не проверялось'.\n"
-        "Не называй сделку юридически чистой и не обещай 100% безопасность.\n\n"
-
-        "Обязательная структура отчета:\n\n"
-        "1. Краткий вывод\n"
-        "Оцени сделку: Опасно / Рискованно / Допустимо. Кратко объясни причину.\n\n"
-
-        "2. Что проверено\n"
-        "Перечисли источники: МВД, ФССП, Федресурс, арбитраж, суды общей юрисдикции, Росреестр. Укажи результат по каждому.\n\n"
-
-        "3. Риски продавца\n"
-        "Проанализируй долги, исполнительные производства, банкротство, суды, арбитраж и скрытые риски.\n\n"
-
-        "4. Риски объекта\n"
-        "Проанализируй ЕГРН, ограничения, обременения, назначение объекта, кадастровые данные и возможные последствия для покупателя.\n\n"
-
-        "5. Согласие супруга/супруги и риск оспаривания сделки\n"
-        "Если семейное положение, дата приобретения объекта и основание права не проверялись — прямо укажи это. "
-        "Обязательно напиши, что если объект приобретался в браке на возмездной основе, требуется нотариальное согласие супруга/супруги либо документы, подтверждающие личный характер имущества. "
-        "Укажи риск последующего оспаривания сделки третьими лицами при отсутствии необходимого согласия.\n\n"
-
-        "6. Возраст продавца, дееспособность и риск оспаривания\n"
-        "Если продавец старше 60 лет, укажи, что это отдельная группа риска при сделках с недвижимостью. "
-        "При прямой продаже желательно запросить справку из ПНД о том, что продавец не состоит на учете, и рассмотреть медицинское освидетельствование на дату сделки. "
-        "Не утверждай наличие заболеваний или недееспособность. Пиши только как о превентивной мере снижения риска оспаривания.\n\n"
-
-        "7. Что обязательно проверить до аванса\n"
-        "Дай строгий чек-лист: оригиналы документов, основание права, историю переходов права, семейное положение, задолженности, зарегистрированных лиц, технические документы, актуальную ЕГРН.\n\n"
-
-        "8. Что прописать в авансовом соглашении / ПДКП\n"
-        "Укажи защитные условия: раскрытие долгов, судов, банкротства, согласие супруга, ответственность за недостоверные сведения, возврат аванса/задатка, сроки устранения рисков.\n\n"
-
-        "9. Безопасная схема расчетов\n"
-        "Рекомендуй аккредитив, эскроу или депозит с раскрытием денег после регистрации перехода права и выполнения условий.\n\n"
-
-        "10. Когда от сделки лучше отказаться\n"
-        "Перечисли ситуации, когда риск для покупателя неоправдан.\n\n"
-
-        "11. Итоговое заключение\n"
-        "Сформулируй итог: можно ли рассматривать сделку и при каких обязательных условиях.\n\n"
-
-        "Важно\n"
-        "Отчет носит информационно-аналитический характер и не заменяет полноценную ручную юридическую проверку документов специалистом.\n\n"
+        "Ты юрист-эксперт по недвижимости в Санкт-Петербурге. На основе структурированных данных "
+        "сформируй краткое, понятное юридическое заключение для покупателя. Не придумывай факты. "
+        "Если данных нет — пиши 'по предоставленным данным не проверялось'. "
+        "Формулируй риск как риск самостоятельной сделки без сопровождения юриста/риелтора. "
+        "Не называй объект юридически чистым. Структура: 1. Краткий вывод 2. Риски продавца "
+        "3. Риски объекта 4. Что сделать до аванса 5. Схема расчетов 6. Итог.\n\n"
         + json.dumps(payload, ensure_ascii=False)
     )
     try:
@@ -1049,12 +891,12 @@ def register_pdf_font() -> str:
 def p(text: Any) -> str:
     # reportlab basic escaping
     s = str(text or "")
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\\n", "<br/>")
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
 
 
 def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     if not REPORTLAB_AVAILABLE:
-        return ("PDF generation unavailable: reportlab is not installed.\\n\\n" + json.dumps(report, ensure_ascii=False, indent=2)).encode("utf-8")
+        return ("PDF generation unavailable: reportlab is not installed.\n\n" + json.dumps(report, ensure_ascii=False, indent=2)).encode("utf-8")
 
     font = register_pdf_font()
     buf = io.BytesIO()
@@ -1073,11 +915,11 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     recs = report.get("recommendations") or []
     norm = report.get("normalized_input") or {}
 
-    story.append(Paragraph("Комплексный юридический отчет по проверке продавца и объекта недвижимости", styles["TitleRu"]))
+    story.append(Paragraph("Юридический отчет по проверке продавца и объекта недвижимости", styles["TitleRu"]))
     story.append(Paragraph(f"Дата формирования: {p(report.get('created_at'))}", styles["SmallRu"]))
     story.append(Spacer(1, 8))
 
-    label = normalize_legal_words(scoring.get("label") or scoring.get("level") or "Оценка риска")
+    label = scoring.get("label") or scoring.get("level") or "Оценка риска"
     score = scoring.get("score", 0)
     badge_color = colors.HexColor("#8B1E1E") if score >= 80 else (colors.HexColor("#B7791F") if score >= 35 else colors.HexColor("#1F7A4D"))
     badge = Table([[Paragraph(f"{p(label).upper()}<br/>{score}/100", styles["BadgeRu"])]], colWidths=[170*mm])
@@ -1097,7 +939,7 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     info_table = Table([
         [Paragraph("Продавец", styles["SmallRu"]), Paragraph(p(" ".join([seller.get("last", ""), seller.get("first", ""), seller.get("middle", "")]).strip()), styles["TextRu"])],
         [Paragraph("Дата рождения", styles["SmallRu"]), Paragraph(p(seller.get("dob")), styles["TextRu"])],
-        [Paragraph("ИНН", styles["SmallRu"]), Paragraph(p(seller.get("inn") or "не передан"), styles["TextRu"])],
+        [Paragraph("ИНН", styles["SmallRu"]), Paragraph("передан" if seller.get("inn") else "не передан", styles["TextRu"])],
         [Paragraph("Объект", styles["SmallRu"]), Paragraph(p(prop.get("query")), styles["TextRu"])],
     ], colWidths=[45*mm, 125*mm])
     info_table.setStyle(TableStyle([
@@ -1114,7 +956,7 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         for item in risks:
             story.append(Paragraph(f"<b>{p(item.get('title'))}</b>: {p(item.get('summary'))}", styles["TextRu"]))
             for d in (item.get("details") or [])[:8]:
-                story.append(Paragraph(f"\'95 {p(d)}", styles["SmallRu"]))
+                story.append(Paragraph(f"• {p(d)}", styles["SmallRu"]))
     else:
         story.append(Paragraph("По автоматическим источникам явные риски не выявлены.", styles["TextRu"]))
 
@@ -1126,9 +968,8 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     tbl = Table(rows, colWidths=[45*mm, 32*mm, 93*mm])
     tbl.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F3EF")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
-        ("FONTNAME", (0, 0), (-1, 0), font),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("PADDING", (0, 0), (-1, -1), 5),
     ]))
@@ -1140,12 +981,12 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         story.append(Paragraph(p(rec.get("text")), styles["SmallRu"]))
 
     story.append(Paragraph("5. Юридическое заключение", styles["H1Ru"]))
-    for block in str(report.get("legal_report") or "").split("\\n\\n"):
+    for block in str(report.get("legal_report") or "").split("\n\n"):
         if block.strip():
             story.append(Paragraph(p(block.strip()), styles["TextRu"]))
 
     story.append(Spacer(1, 8))
-    story.append(Paragraph("Важно", styles["H1Ru"]))
+    story.append(Paragraph("Дисклеймер", styles["H1Ru"]))
     story.append(Paragraph("Отчет носит информационно-аналитический характер, не является гарантией полной юридической безопасности сделки и не заменяет ручную юридическую проверку документов специалистом.", styles["SmallRu"]))
 
     doc.build(story)
@@ -1190,7 +1031,6 @@ async def build_full_report(req: CheckRequest, include_debug: bool = False) -> D
     registry = build_registry_data(checklist)
     screen = build_screen_report(req, checklist, scoring, recs)
     legal = await maybe_gigachat_report(req, checklist, scoring, recs)
-    legal = postprocess_legal_report(legal, req)
 
     report_id = str(uuid.uuid4())
     result = {
@@ -1258,7 +1098,7 @@ async def check_report(req: CheckRequest) -> Dict[str, Any]:
     except Exception as e:
         return {
             "success": False,
-            "message": "Не удалось сформировать отчет. Проверьте данные и повторите запрос. Если ошибка повторяется \'97 требуется ручная проверка.",
+            "message": "Не удалось сформировать отчет. Проверьте данные и повторите запрос. Если ошибка повторяется — требуется ручная проверка.",
             "warnings": ["Техническая ошибка скрыта от пользователя и не влияет на юридический вывод."],
         }
 
