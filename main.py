@@ -1676,19 +1676,19 @@ def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRe
             profile = {}
 
         if profile.get("registration_ban"):
-            recs.append({"priority": "critical", "title": "Разобрать основание запрета/ареста по ЕГРН", "text": "По ЕГРН есть признаки запрета/ареста/ограничения регистрационных действий. До аванса нужно получить основание ограничения, срок и порядок снятия. Деньги передавать только по схеме, где раскрытие происходит после снятия ограничения и регистрации перехода права."})
+            recs.append({"priority": "critical", "title": "Разобрать основание запрета/ареста по ЕГРН", "text": "Получить документ-основание, срок действия записи и порядок снятия. Деньги передавать только через схему, где раскрытие зависит от снятия ограничения и регистрации перехода права."})
         elif profile.get("manageable_encumbrance"):
             recs.append({"priority": "high", "title": "Выстроить схему снятия ипотеки/залога", "text": "Ипотека или залог не всегда мешают сделке, но требуют правильной схемы: банк, аккредитив, депозит, погашение с контролем снятия записи и регистрация перехода права только после выполнения условий."})
         elif profile.get("other_encumbrance"):
             recs.append({"priority": "high", "title": "Проверить условия обременения", "text": "По ЕГРН есть обременение без явного запрета регистрации. Нужно понять его основание, срок действия, порядок прекращения и влияние на возможность продажи."})
 
         if profile.get("recent_right_level") in {"high", "medium", "low"}:
-            recs.append({"priority": "high", "title": "Проверить свежую регистрацию права", "text": "Право или значимая регистрационная запись появились недавно. До аванса нужно проверить основание приобретения, документы-основания, причину быстрой продажи и связь с возможными долгами/банкротством/судами."})
+            recs.append({"priority": "high", "title": "Проверить свежую регистрацию права", "text": "Проверить документ-основание, дату приобретения, цену, участников, причину быстрой продажи и связь ситуации с долгами, судами или банкротством."})
         if profile.get("frequent_transitions_level") in {"high", "medium", "low"}:
-            recs.append({"priority": "high", "title": "Проверить цепочку переходов права", "text": "Есть признаки частых регистрационных событий / возможных переходов права. Нужно запросить историю переходов права, проверить предыдущие основания и исключить оспоримые сделки в цепочке."})
+            recs.append({"priority": "high", "title": "Проверить цепочку переходов права", "text": "Запросить историю переходов права, сверить предыдущие основания и исключить оспоримые сделки в цепочке."})
     if fssp and fssp.get("status") == "risk":
         actual = ((fssp.get("data") or {}).get("actual_debt") or 0) if isinstance(fssp.get("data"), dict) else 0
-        recs.append({"priority": "high", "title": "Закрыть активные ИП до сделки или через контролируемые расчеты", "text": f"Актуальная сумма по активным/неоднозначным ИП: {rub(actual)}. В ПДКП прописать порядок погашения и последствия неснятия ограничений."})
+        recs.append({"priority": "high", "title": "Закрыть активные ИП до сделки или через контролируемые расчеты", "text": f"Прописать порядок погашения {rub(actual)}, срок подтверждения оплаты и последствия, если ограничения не будут сняты до регистрации."})
     if bankruptcy and bankruptcy.get("status") == "risk":
         bdata = bankruptcy.get("data") or {}
         bstatus = bdata.get("bankruptcy_status") if isinstance(bdata, dict) else None
@@ -1704,8 +1704,8 @@ def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRe
     if pravosud and pravosud.get("status") == "risk":
         recs.append({"priority": "medium", "title": "Разобрать судебные совпадения", "text": "Нужно вручную идентифицировать совпадения по ФИО: сверить дату рождения, регион, стороны, предмет дела и результат. Без точной идентификации не считать записи установленными делами продавца."})
     if any(x.get("status") == "manual_check" for x in checklist):
-        recs.append({"priority": "medium", "title": "Закрыть ручные проверки до аванса (задатка)", "text": "Все источники со статусом «требуется ручная проверка» нужно проверить вручную до передачи денег."})
-    recs.append({"priority": "high", "title": "Авансовое соглашение / соглашение о задатке делать с защитными условиями", "text": "Включить обязанность продавца раскрыть долги, запреты, банкротство, судебные споры; предусмотреть возврат аванса (задатка) и ответственность при неподтверждении данных."})
+        recs.append({"priority": "medium", "title": "Закрыть ручные проверки до аванса (задатка)", "text": "Получить результат ручной сверки и приложить его к пакету документов до подписания соглашения."})
+    recs.append({"priority": "high", "title": "Авансовое соглашение / соглашение о задатке делать с защитными условиями", "text": "Закрепить перечень раскрываемых сведений, документы для подтверждения, основания возврата денег и ответственность за недостоверные заявления."})
     return recs
 
 
@@ -1754,10 +1754,15 @@ def build_screen_report(req: CheckRequest, checklist: List[Dict[str, Any]], scor
 
 
 def build_local_legal_report(req: CheckRequest, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], recs: List[Dict[str, str]]) -> str:
-    """Deterministic legal conclusion with separated roles for sections.
+    """Deterministic legal conclusion with strict anti-repeat section roles.
 
-    The PDF already contains: score, checklist, risk map and action table.
-    This section must not repeat the same sentences; it gives a compact legal interpretation.
+    Role separation:
+    - conclusion = decision level only;
+    - confirmed/manual = source reliability only;
+    - risks = facts only;
+    - before advance = actions only;
+    - payment = transaction mechanics;
+    - final = strategy, not a repeated ban.
     """
     risks = [x for x in checklist if x.get("status") == "risk"]
     oks = [x for x in checklist if x.get("status") == "ok"]
@@ -1767,46 +1772,101 @@ def build_local_legal_report(req: CheckRequest, checklist: List[Dict[str, Any]],
 
     def short_source_title(title: str) -> str:
         t = title or "Источник"
-        return t.replace(" / Росреестр", "").replace(" / Федресурс", "").replace(" / ГАС Правосудие", "")
+        return (
+            t.replace(" / Росреестр", "")
+             .replace(" / Федресурс", "")
+             .replace(" / ГАС Правосудие", "")
+             .replace("Суды общей юрисдикции", "Суды общей юрисдикции")
+        )
 
-    def compact_summary(item: Dict[str, Any]) -> str:
+    def clean_sentence(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip().rstrip(".")
+
+    def confirmed_line(item: Dict[str, Any]) -> str:
+        title = str(item.get("title") or "")
+        if "Паспорт" in title:
+            return "паспорт прошел автоматическую проверку"
+        if "ФССП" in title:
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            if data.get("all_count") == 0:
+                return "исполнительные производства по полученному ответу не найдены"
+            if data.get("active_count") == 0:
+                return "активные ИП по полученному ответу не выделены"
+        if "Банкрот" in title:
+            return "сведения о банкротстве по полученному ответу не выявлены"
+        if "Арбитраж" in title:
+            return "арбитражные дела по полученному ответу не выявлены"
+        if "ГАС" in title or "Суды общей" in title:
+            return "дела судов общей юрисдикции по полученному ответу не выявлены"
+        if "ЕГРН" in title:
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            profile = data.get("_egrn_risk_profile") if isinstance(data.get("_egrn_risk_profile"), dict) else {}
+            if profile.get("ownership_over_3_years"):
+                return "объект найден, право выглядит старше 3 лет"
+            return "объект найден, явный красный флаг по выписке не выделен"
+        return clean_sentence(item.get("summary"))
+
+    def risk_fact(item: Dict[str, Any]) -> str:
         title = str(item.get("title") or "")
         data = item.get("data") if isinstance(item.get("data"), dict) else {}
         if "ФССП" in title and isinstance(data, dict):
-            active = data.get("active_count") or 0
-            actual = data.get("actual_debt") or 0
-            if active:
-                return f"активных/неоднозначных ИП: {active}, сумма для оценки — {rub(actual)}"
-            return "активные ИП по полученному ответу не выделены"
+            return f"активных/неоднозначных ИП: {data.get('active_count') or data.get('unknown_count') or 0}; сумма для оценки — {rub(data.get('actual_debt') or 0)}"
         if "ЕГРН" in title and isinstance(data, dict):
             profile = data.get("_egrn_risk_profile") if isinstance(data.get("_egrn_risk_profile"), dict) else {}
             parts = []
             if profile.get("registration_ban"):
-                parts.append("есть запись о запрете/аресте/ограничении регистрации")
+                parts.append("запись о запрете/аресте/ограничении регистрации")
             elif profile.get("manageable_encumbrance"):
-                parts.append("есть ипотека/залог или управляемое обременение")
+                parts.append("ипотека/залог или управляемое обременение")
             elif profile.get("other_encumbrance"):
-                parts.append("есть обременение, требующее проверки условий")
-            else:
-                parts.append("явные ограничения и обременения не выделены")
+                parts.append("обременение без автоматического стоп-фактора")
             if profile.get("recent_right_date"):
-                parts.append(f"значимая регистрационная дата: {profile.get('recent_right_date')}")
-            return "; ".join(parts)
+                parts.append(f"регистрационная дата: {profile.get('recent_right_date')}")
+            if profile.get("frequent_transitions_level") in {"high", "medium", "low"}:
+                parts.append("есть частые регистрационные события / возможные переходы права")
+            return "; ".join(parts) if parts else "объект требует уточнения по данным выписки"
         if "Банкрот" in title and isinstance(data, dict):
             st = data.get("bankruptcy_status")
             months = data.get("months_after_latest")
             if st == "active":
-                return "есть признаки действующей или незавершенной процедуры"
+                return "признаки действующей или незавершенной процедуры"
             if st == "completed":
-                tail = f", последняя значимая публикация примерно {months} мес. назад" if months is not None else ", дату завершения нужно уточнить вручную"
-                return "процедура выглядит завершенной" + tail
-        return str(item.get("summary") or "требуется анализ")
+                return "процедура выглядит завершенной" + (f", последняя значимая публикация примерно {months} мес. назад" if months is not None else ", дату завершения нужно уточнить")
+        return clean_sentence(item.get("summary"))
 
-    def unique_recs(items: List[Dict[str, str]], limit: int = 6) -> List[Dict[str, str]]:
+    def action_only(rec: Dict[str, str]) -> str:
+        title = clean_sentence(rec.get("title")) or "Проверка"
+        text = clean_sentence(rec.get("text"))
+        # Remove fact repetition. This block should answer only “что сделать”.
+        removals = [
+            r"^По ЕГРН есть признаки[^.]*\.\s*",
+            r"^Право или значимая регистрационная запись появились недавно\.\s*",
+            r"^Есть признаки частых регистрационных событий[^.]*\.\s*",
+            r"^Актуальная сумма[^.]*\.\s*",
+            r"^Все источники со статусом[^.]*\.\s*",
+            r"^По банкротству есть признаки[^.]*\.\s*",
+            r"^После значимой публикации по банкротству прошло[^.]*\.\s*",
+        ]
+        for pat in removals:
+            text = re.sub(pat, "", text, flags=re.IGNORECASE).strip()
+        if not text:
+            # Fallbacks by title to avoid empty bullets.
+            tl = title.lower()
+            if "ручн" in tl:
+                text = "Сверить источник вручную и приложить результат к пакету документов до подписания соглашения."
+            elif "егрн" in tl or "запрет" in tl or "арест" in tl:
+                text = "Получить документ-основание, срок действия записи и понятный порядок ее снятия либо учета в расчетах."
+            elif "ип" in tl or "исполнитель" in tl:
+                text = "Зафиксировать порядок погашения, срок снятия ограничений и последствия нарушения этого срока."
+            else:
+                text = "Закрепить результат проверки и условие возврата денег в тексте соглашения."
+        return f"• {title}: {text}"
+
+    def unique_recs(items: List[Dict[str, str]], limit: int = 5) -> List[Dict[str, str]]:
         seen = set()
         out = []
         for rec in items:
-            title = str(rec.get("title") or "").strip()
+            title = clean_sentence(rec.get("title"))
             key = re.sub(r"\s+", " ", title.lower())
             if not key or key in seen:
                 continue
@@ -1820,74 +1880,73 @@ def build_local_legal_report(req: CheckRequest, checklist: List[Dict[str, Any]],
 
     lines.append("Краткий вывод")
     if score >= 85:
-        lines.append(f"Оценка: {label} ({score}/100). Главная проблема — не количество найденных записей, а их сочетание: денежные требования к продавцу и регистрационные ограничения по объекту могут сорвать переход права или расчеты.")
+        lines.append(f"Оценка: {label} ({score}/100). В проверке есть связка факторов, которую нельзя закрыть формальной распиской или устным обещанием продавца.")
     elif score >= 60:
-        lines.append(f"Оценка: {label} ({score}/100). Сделку нельзя оценивать по одному источнику: перед авансом нужно закрыть спорные пункты и подтвердить, что выявленные обстоятельства управляемы.")
+        lines.append(f"Оценка: {label} ({score}/100). Сделка требует управляемого сценария: спорные пункты должны быть подтверждены документами до аванса.")
     elif score >= 35:
-        lines.append(f"Оценка: {label} ({score}/100). Автоматическая проверка не показала безусловного стоп-фактора, но оставила вопросы, которые должны быть закрыты документами.")
+        lines.append(f"Оценка: {label} ({score}/100). Безусловный стоп-фактор не выделен, но часть вопросов должна быть закрыта до передачи денег.")
     else:
-        lines.append(f"Оценка: {label} ({score}/100). Выраженных стоп-факторов по автоматическим источникам не видно; дальше нужна обычная проверка документов и истории объекта.")
+        lines.append(f"Оценка: {label} ({score}/100). Автоматические источники не показали выраженного красного сигнала; дальше решают документы по объекту и продавцу.")
     lines.append("")
 
     lines.append("Что подтверждено автоматическими источниками")
     if oks:
         for item in oks:
-            lines.append(f"• {short_source_title(str(item.get('title') or ''))}: {compact_summary(item)}.")
+            lines.append(f"• {short_source_title(str(item.get('title') or ''))}: {confirmed_line(item)}.")
     else:
-        lines.append("• Полностью подтвержденных безопасных блоков нет; отчет опирается на выявленные риски и ручные проверки.")
+        lines.append("• Нет блока, который можно считать полностью закрытым по автоматическому ответу.")
     lines.append("")
 
     lines.append("Что не подтверждено и требует ручной проверки")
     if manual:
         for item in manual:
-            lines.append(f"• {short_source_title(str(item.get('title') or ''))}: автоматический ответ недостаточен, источник нужно проверить вручную.")
+            lines.append(f"• {short_source_title(str(item.get('title') or ''))}: автоматического ответа недостаточно; результат нужно сверить вручную.")
     else:
-        lines.append("• Автоматические источники не пометили отдельные проверки как технически неполные.")
+        lines.append("• Технически неполных автоматических проверок не выделено.")
     lines.append("")
 
     lines.append("Ключевые риски")
     if risks:
         for item in risks:
-            lines.append(f"• {short_source_title(str(item.get('title') or ''))}: {compact_summary(item)}.")
+            lines.append(f"• {short_source_title(str(item.get('title') or ''))}: {risk_fact(item)}.")
     else:
-        lines.append("• По реестрам не выделен самостоятельный красный флаг; скрытые риски проверяются документами, а не автоматикой.")
+        lines.append("• Самостоятельный красный флаг по автоматическим источникам не выделен.")
     lines.append("")
 
     lines.append("Что проверить до аванса")
     for rec in unique_recs(recs):
-        title = str(rec.get("title") or "Проверка")
-        text = str(rec.get("text") or "")
-        # Make this block action-oriented, not a repeat of the risk map.
-        text = re.sub(r"^По ЕГРН есть признаки[^.]*\.\s*", "", text)
-        text = re.sub(r"^Актуальная сумма[^.]*\.\s*", "", text)
-        text = re.sub(r"^Все источники со статусом[^.]*\.\s*", "", text)
-        lines.append(f"• {title}: {text}".strip())
+        lines.append(action_only(rec))
     lines.append("")
 
     lines.append("Как передавать аванс")
     if score >= 85:
-        lines.append("Прямую передачу денег продавцу исключить. Допустим только сценарий, где сумма, сроки, документы для снятия ограничений и момент раскрытия денег заранее зафиксированы в соглашении и подтверждаются независимыми источниками.")
+        lines.append("Использовать только контролируемую расчетную конструкцию: деньги не должны раскрыться продавцу раньше выполнения заранее перечисленных условий и подтверждения результата независимыми источниками.")
     elif score >= 60:
-        lines.append("Деньги передавать через контролируемый механизм: аккредитив, депозит нотариуса, банковскую ячейку с условиями доступа или иной вариант, где возврат и раскрытие завязаны на конкретные документы.")
+        lines.append("Подходит аккредитив, депозит нотариуса, банковская ячейка с условиями доступа или иной механизм, где возврат и раскрытие привязаны к конкретным документам.")
+    elif score >= 35:
+        lines.append("Аванс допустим только как инструмент бронирования, а не как безусловная передача денег: срок проверки, перечень документов и основания возврата должны быть написаны прямо в соглашении.")
     else:
-        lines.append("Даже при умеренном риске аванс должен быть связан с проверяемыми условиями: документами продавца, отсутствием скрытых ограничений, сроками выхода на сделку и понятным возвратом денег при несоответствии данных.")
+        lines.append("Стандартный аванс возможен после сверки оригиналов документов, но условия возврата и срок выхода на сделку все равно лучше закрепить письменно.")
     lines.append("")
 
     lines.append("Итоговое заключение")
     if score >= 85:
-        lines.append("Сделка может обсуждаться только после устранения или документального контроля выявленных препятствий. Практически это означает: сначала основание ограничения, порядок погашения/снятия, проверка документов, затем — расчетная схема.")
+        lines.append("Практический сценарий такой: сначала документы-основания, порядок снятия препятствий и расчетная модель; только потом — подписание соглашения и движение денег.")
     elif score >= 60:
-        lines.append("Сделку нельзя вести в упрощенном режиме. Нужен короткий перечень условий, после выполнения которых покупатель действительно понимает, за что платит и как защищен при срыве регистрации.")
+        lines.append("Покупателю нужно не отказываться автоматически, а перевести сделку в режим условий: каждый спорный пункт должен иметь документ, срок и последствие нарушения.")
     elif score >= 35:
-        lines.append("Риск не выглядит критическим, но аванс без проверки превратит открытые вопросы в проблему покупателя. Сначала документы и условия, потом обязательства по деньгам.")
+        lines.append("Ситуация управляемая только при дисциплине документов. Если продавец не раскрывает основания и сроки, умеренный риск быстро становится проблемой покупателя.")
     else:
-        lines.append("Автоматические источники не заменяют юридическую проверку договора, основания права, зарегистрированных лиц и семейного статуса продавца. Но по данным реестров выраженного красного сигнала не сформировано.")
+        lines.append("По автоматическим источникам сделка выглядит пригодной для дальнейшего анализа, но окончательный вывод возможен только после проверки правоустанавливающих документов и зарегистрированных лиц.")
     lines.append("")
 
     lines.append("Важно")
     lines.append("Отчет является аналитическим ориентиром по открытым и автоматизированным источникам. Он помогает понять, какие вопросы закрывать до аванса, но не заменяет изучение оригиналов документов и очную юридическую оценку сделки.")
 
-    return strip_markdown_noise("\n".join(lines))
+    text = strip_markdown_noise("\n".join(lines))
+    # remove accidental duplicate punctuation after generated summaries
+    text = re.sub(r"\.\.", ".", text)
+    return text
 
 def build_gigachat_safe_payload(req: CheckRequest, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], recs: List[Dict[str, str]]) -> Dict[str, Any]:
     """Send the model facts, not a full personal profile.
@@ -2430,6 +2489,99 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     def status_fg(status: str) -> str:
         return {"ok": "#1F7A4D", "risk": "#8B1E1E", "manual_check": "#9A6B12"}.get(status, "#3C4853")
 
+    def short_badge_label(value: str) -> str:
+        v = (value or "").strip()
+        mapping = {
+            "Опасно при самостоятельной сделке": "ОПАСНО БЕЗ ПРОВЕРКИ",
+            "Высокий риск при самостоятельной сделке": "ВЫСОКИЙ РИСК",
+            "Условно рискованно при самостоятельной сделке": "ТРЕБУЕТ ПРОВЕРКИ",
+            "Допустимо к дальнейшему рассмотрению": "ДОПУСТИМО К ПРОВЕРКЕ",
+        }
+        return mapping.get(v, v.upper())
+
+    def clean_sentence_pdf(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip().rstrip(".")
+
+    def checklist_summary_for_pdf(item: Dict[str, Any]) -> str:
+        title = str(item.get("title") or "")
+        status = item.get("status")
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        if status == "manual_check":
+            return "Автоматический ответ недостаточен. Нужна ручная сверка источника."
+        if "ЕГРН" in title and isinstance(data, dict):
+            profile = data.get("_egrn_risk_profile") if isinstance(data.get("_egrn_risk_profile"), dict) else {}
+            if profile.get("registration_ban"):
+                return "Объект найден. В выписке есть запись, влияющая на регистрацию перехода права."
+            if profile.get("manageable_encumbrance"):
+                return "Объект найден. Есть управляемое обременение, требующее схемы расчетов."
+            if profile.get("other_encumbrance"):
+                return "Объект найден. Есть обременение, условия которого нужно проверить."
+        return clean_sentence_pdf(item.get("summary")) + "."
+
+    def risk_lines_for_pdf(item: Dict[str, Any]) -> List[str]:
+        title = str(item.get("title") or "")
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        lines: List[str] = []
+        if "ФССП" in title and isinstance(data, dict):
+            lines.append(f"Активных/неоднозначных ИП: {data.get('active_count') or data.get('unknown_count') or 0}.")
+            lines.append(f"Сумма для оценки: {rub(data.get('actual_debt') or 0)}.")
+            lines.append(f"Всего записей в ответе: {data.get('all_count') or 0}; закрытых: {data.get('closed_count') or 0}.")
+            return lines
+        if "ЕГРН" in title and isinstance(data, dict):
+            profile = data.get("_egrn_risk_profile") if isinstance(data.get("_egrn_risk_profile"), dict) else {}
+            if profile.get("registration_ban"):
+                lines.append("В выписке есть запись о запрете/аресте/ограничении регистрации.")
+            elif profile.get("manageable_encumbrance"):
+                lines.append("Есть ипотека/залог или иное управляемое обременение.")
+            elif profile.get("other_encumbrance"):
+                lines.append("Есть обременение без автоматического стоп-фактора.")
+            if profile.get("recent_right_date"):
+                lines.append(f"Значимая регистрационная дата: {profile.get('recent_right_date')}.")
+            if profile.get("frequent_transitions_level") in {"high", "medium", "low"}:
+                lines.append("Есть частые регистрационные события / возможные переходы права.")
+            obj = data
+            if obj.get("cadNumber"):
+                lines.append(f"Кадастровый номер: {obj.get('cadNumber')}")
+            addr = (obj.get("address") or {}).get("readableAddress") if isinstance(obj.get("address"), dict) else ""
+            if addr:
+                lines.append(f"Адрес: {addr}")
+            if obj.get("objType_text"):
+                lines.append(f"Тип объекта: {obj.get('objType_text')}")
+            if obj.get("purpose_text"):
+                lines.append(f"Назначение: {obj.get('purpose_text')}")
+            if obj.get("area"):
+                lines.append(f"Площадь: {obj.get('area')} кв.м")
+            if obj.get("cadCost"):
+                try:
+                    lines.append(f"Кадастровая стоимость: {rub(float(obj.get('cadCost')))}")
+                except Exception:
+                    lines.append(f"Кадастровая стоимость: {obj.get('cadCost')}")
+            return lines
+        # Fallback: first line is a short fact, not the full checklist summary repeated.
+        base = clean_sentence_pdf(item.get("summary"))
+        if base:
+            lines.append(base + ".")
+        for d in (item.get("details") or [])[:4]:
+            dd = clean_sentence_pdf(d)
+            if dd and dd.lower() != base.lower():
+                lines.append(dd + ".")
+        return lines
+
+    def action_text_for_pdf(rec: Dict[str, str]) -> str:
+        text = clean_sentence_pdf(rec.get("text"))
+        removals = [
+            r"^По ЕГРН есть признаки[^.]*\.\s*",
+            r"^Право или значимая регистрационная запись появились недавно\.\s*",
+            r"^Есть признаки частых регистрационных событий[^.]*\.\s*",
+            r"^Актуальная сумма[^.]*\.\s*",
+            r"^Все источники со статусом[^.]*\.\s*",
+            r"^По банкротству есть признаки[^.]*\.\s*",
+            r"^После значимой публикации по банкротству прошло[^.]*\.\s*",
+        ]
+        for pat in removals:
+            text = re.sub(pat, "", text, flags=re.IGNORECASE).strip()
+        return text or "Зафиксировать результат проверки и условие возврата денег в соглашении."
+
     # Header
     header_left = [
         Paragraph("Комплексный юридический отчет по продавцу и объекту недвижимости", styles["TitleRu"]),
@@ -2437,7 +2589,7 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         Paragraph(f"Дата формирования: {p(report.get('created_at'))}", styles["SubtitleRu"]),
     ]
     header_right = Table(
-        [[Paragraph(p(label).upper(), styles["BadgeRu"])], [Paragraph(f"{score}/100", styles["BigScoreRu"])]],
+        [[Paragraph(p(short_badge_label(label)), styles["BadgeRu"])], [Paragraph(f"{score}/100", styles["BigScoreRu"])]],
         colWidths=[44*mm],
     )
     header_right.setStyle(TableStyle([
@@ -2535,7 +2687,7 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         rows.append([
             Paragraph(p(item.get("title")), styles["TableCellRu"]),
             Paragraph(p(status_label(st)), status_style),
-            Paragraph(p(item.get("summary")), styles["TableCellRu"]),
+            Paragraph(p(checklist_summary_for_pdf(item)), styles["TableCellRu"]),
         ])
     tbl = Table(rows, colWidths=[44*mm, 35*mm, 103*mm], repeatRows=1)
     table_style = [
@@ -2567,9 +2719,7 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     risks = [x for x in checklist if x.get("status") == "risk"]
     if risks:
         for item in risks:
-            lines = [item.get("summary") or ""]
-            for d in (item.get("details") or [])[:6]:
-                lines.append(f"• {d}")
+            lines = risk_lines_for_pdf(item)
             add_card(item.get("title") or "Риск", lines, bg="#FFFDF8", border="#E6D3A4", title_color="#8B1E1E")
     else:
         add_card("Риски по автоматическим источникам", "Явные риски по автоматическим источникам не выявлены.", bg="#EDF7F1", border="#B8D9C1")
@@ -2583,7 +2733,7 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         rec_rows.append([
             Paragraph(p(priority), styles["TableCellRu"]),
             Paragraph(p(rec.get("title")), styles["TableCellRu"]),
-            Paragraph(p(rec.get("text")), styles["TableCellRu"]),
+            Paragraph(p(action_text_for_pdf(rec)), styles["TableCellRu"]),
         ])
     rec_table = Table(rec_rows, colWidths=[25*mm, 55*mm, 102*mm], repeatRows=1)
     rec_table.setStyle(TableStyle([
