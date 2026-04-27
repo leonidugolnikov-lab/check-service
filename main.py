@@ -667,10 +667,13 @@ def bankruptcy_deep_flags(data: Any) -> Dict[str, Any]:
     has_completed = any(word in text for word in completed_words)
     has_active = any(word in text for word in active_words)
 
-    if has_completed:
-        status = "completed"
-    elif has_active:
+    # Важно: активная/незавершенная процедура имеет приоритет над признаками завершения.
+    # В публикациях могут одновременно встречаться слова о введении процедуры и о завершении
+    # отдельных этапов, поэтому сначала отсекаем активный риск.
+    if has_active:
         status = "active"
+    elif has_completed:
+        status = "completed"
     else:
         status = "unknown"
 
@@ -927,53 +930,66 @@ def collect_dates_recursive(value: Any, *, skip_birth_dates: bool = True) -> Lis
 
 
 def egrn_deep_flags(obj: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract useful property-risk signals from the Rosreestr/NewDB response.
+    """Fact-only EGRN profile.
 
-    The logic is deliberately softer than before:
-    - an encumbrance is not automatically a catastrophe;
-    - mortgage/pledge is usually a manageable transaction-structure issue;
-    - registration ban/arrest is serious, but becomes a true stop-factor mainly in combination
-      with seller debt/bankruptcy or until the basis and release route are clear;
-    - recent ownership and frequent transitions are caution factors, not proof of a bad deal.
+    EGRN should not pretend to see risks that are normally checked from documents:
+    spouse consent, inheritance, matcapital, minor shares, privatization, registered persons.
+    Those risks belong to the manual-check block.
+
+    This function extracts only what can reasonably be treated as EGRN signals:
+    - object is found;
+    - restrictions/encumbrances are present or absent;
+    - recent registration of right / ownership over 3 years;
+    - frequent registration events / possible frequent transfers of rights.
     """
+    base = {
+        "encumbrance_level": "none",
+        "registration_ban": False,
+        "registration_restriction": False,
+        "manageable_encumbrance": False,
+        "other_encumbrance": False,
+        "recent_right_months": None,
+        "recent_right_date": "",
+        "recent_right_level": "unknown",
+        "ownership_over_3_years": False,
+        "frequent_transitions_level": "none",
+        "rights_count": 0,
+        "transition_dates": [],
+        "details": [],
+        "points_hint": 0,
+    }
     if not isinstance(obj, dict):
-        return {
-            "encumbrance_level": "none",
-            "registration_ban": False,
-            "manageable_encumbrance": False,
-            "other_encumbrance": False,
-            "recent_right_months": None,
-            "recent_right_level": "unknown",
-            "frequent_transitions_level": "unknown",
-            "rights_count": 0,
-            "transition_dates": [],
-            "basis_flags": [],
-            "share_or_multiple_rights": False,
-            "details": [],
-            "points_hint": 0,
-        }
+        return base
 
     enc = obj.get("encumbrances") if isinstance(obj.get("encumbrances"), list) else []
     rights = obj.get("rights") if isinstance(obj.get("rights"), list) else []
-    text = flatten_text(obj).lower()
 
     enc_text = flatten_text(enc).lower()
-    registration_ban = any(w in enc_text for w in ["запрещ", "запрет", "арест", "ограничение регистрац", "регистрационных действий"])
-    registration_restriction = registration_ban
+    registration_ban = any(w in enc_text for w in [
+        "запрещ", "запрет", "арест", "ограничение регистрац", "регистрационных действий"
+    ])
     manageable_encumbrance = any(w in enc_text for w in ["ипотек", "залог"])
     other_encumbrance = bool(enc) and not registration_ban and not manageable_encumbrance
 
     details: List[str] = []
-    if registration_ban:
-        details.append("ЕГРН: обнаружены признаки запрета/ареста/ограничения регистрационных действий. Это серьезный риск, но не автоматическая катастрофа: нужно понять основание, сумму/держателя ограничения и порядок снятия до регистрации перехода права.")
-    elif manageable_encumbrance:
-        details.append("ЕГРН: обнаружены признаки ипотеки/залога. Обычно это управляемый риск при правильной схеме расчетов через банк, аккредитив, депозит или погашение с контролем регистрации.")
-    elif other_encumbrance:
-        details.append("ЕГРН: обнаружены ограничения/обременения без явного признака регистрационного запрета. Это не означает невозможность сделки, но требует проверки основания, срока, условий прекращения и схемы безопасных расчетов.")
-    else:
-        details.append("ЕГРН: явные ограничения/обременения по полученным данным не выявлены.")
+    points_hint = 0
+    encumbrance_level = "none"
 
-    # Registration/right dates. Prefer rights dates; fall back to any object dates.
+    if registration_ban:
+        encumbrance_level = "registration_ban"
+        points_hint += 30
+        details.append("По ЕГРН есть ограничение/запрет/арест регистрационных действий. Это не автоматическая катастрофа, но до аванса нужно понять основание ограничения и порядок его снятия.")
+    elif manageable_encumbrance:
+        encumbrance_level = "manageable"
+        points_hint += 12
+        details.append("По ЕГРН есть ипотека/залог или похожее управляемое обременение. Сделка возможна при правильной схеме расчетов и контроле снятия записи.")
+    elif other_encumbrance:
+        encumbrance_level = "other"
+        points_hint += 12
+        details.append("По ЕГРН есть ограничение или обременение. Само по себе это не запрещает сделку, но требует проверки основания и условий прекращения.")
+    else:
+        details.append("По данным ЕГРН явные ограничения и обременения не выявлены.")
+
     right_dates: List[datetime] = []
     for r in rights:
         if isinstance(r, dict):
@@ -988,16 +1004,25 @@ def egrn_deep_flags(obj: Dict[str, Any]) -> Dict[str, Any]:
     recent_months = months_between_dates(latest_right_date) if latest_right_date else None
 
     recent_right_level = "unknown"
+    ownership_over_3_years = False
     if recent_months is not None:
         if recent_months < 3:
             recent_right_level = "high"
-            details.append(f"Право/значимая регистрационная запись выглядит свежей: менее 3 месяцев ({latest_right_date.strftime('%d.%m.%Y')}). Проверить основание приобретения и цепочку переходов права до аванса.")
+            points_hint += 20
+            details.append(f"Право/значимая регистрационная запись зарегистрирована недавно: менее 3 месяцев ({latest_right_date.strftime('%d.%m.%Y')}).")
         elif recent_months < 12:
             recent_right_level = "medium"
-            details.append(f"Право/значимая регистрационная запись появилась менее 1 года назад ({latest_right_date.strftime('%d.%m.%Y')}). Нужна проверка основания приобретения и причины быстрой продажи.")
+            points_hint += 12
+            details.append(f"Право/значимая регистрационная запись зарегистрирована менее 1 года назад ({latest_right_date.strftime('%d.%m.%Y')}).")
         elif recent_months < 36:
             recent_right_level = "low"
-            details.append(f"Право/значимая регистрационная запись младше 3 лет ({latest_right_date.strftime('%d.%m.%Y')}). Это не стоп-фактор, но важно проверить основание и историю объекта.")
+            points_hint += 5
+            details.append(f"Право/значимая регистрационная запись младше 3 лет ({latest_right_date.strftime('%d.%m.%Y')}).")
+        else:
+            ownership_over_3_years = True
+            details.append(f"По датам ЕГРН объект выглядит в собственности более 3 лет: последняя значимая дата {latest_right_date.strftime('%d.%m.%Y')}.")
+    else:
+        details.append("Дату регистрации права автоматически определить не удалось; ее нужно проверить по выписке ЕГРН/правоустанавливающим документам.")
 
     dates_12m = [d for d in valid_dates if months_between_dates(d) is not None and months_between_dates(d) < 12]
     dates_36m = [d for d in valid_dates if months_between_dates(d) is not None and months_between_dates(d) < 36]
@@ -1005,90 +1030,32 @@ def egrn_deep_flags(obj: Dict[str, Any]) -> Dict[str, Any]:
     frequent_transitions_level = "none"
     if len(dates_12m) >= 2:
         frequent_transitions_level = "high"
-        details.append(f"Обнаружены признаки частых регистрационных событий: {len(dates_12m)} даты за последние 12 месяцев. Нужна проверка всей цепочки переходов права.")
+        points_hint += 18
+        details.append(f"Есть признаки частых регистрационных событий: {len(dates_12m)} даты за последние 12 месяцев.")
     elif len(dates_36m) >= 3:
         frequent_transitions_level = "medium"
-        details.append(f"Обнаружены признаки частых регистрационных событий: {len(dates_36m)} даты за последние 3 года. Проверить цепочку переходов права и основания сделок.")
+        points_hint += 12
+        details.append(f"Есть признаки частых регистрационных событий: {len(dates_36m)} даты за последние 3 года.")
     elif len(valid_dates) >= 4:
         frequent_transitions_level = "low"
-        details.append(f"В объекте много регистрационных дат/записей: {len(valid_dates)}. Это повод запросить историю переходов права, но не самостоятельный стоп-фактор.")
-
-    basis_flags: List[str] = []
-    basis_patterns = [
-        ("наследство", ["наслед", "свидетельство о праве на наследство"]),
-        ("дарение", ["дарен", "договор дарения"]),
-        ("приватизация", ["приватизац"]),
-        ("решение суда", ["решение суда", "судебн"]),
-        ("рента", ["рента", "пожизненное содержание"]),
-        ("раздел имущества / брачный режим", ["раздел имущества", "брачн", "соглашение о разделе"]),
-        ("торги / банкротство", ["торги", "банкрот", "конкурсн", "реализация имущества"]),
-        ("материнский капитал", ["материнск", "маткапитал", "256-фз"]),
-    ]
-    for label, words in basis_patterns:
-        if any(w in text for w in words):
-            basis_flags.append(label)
-
-    if basis_flags:
-        details.append("По тексту ЕГРН/ответа найдены основания или признаки, требующие отдельной проверки: " + ", ".join(basis_flags) + ".")
-
-    share_or_multiple_rights = False
-    if len(rights) >= 2:
-        share_or_multiple_rights = True
-    if any(w in text for w in ["долевая", "доля", "доли", "1/", "общая совместная", "общая долевая"]):
-        share_or_multiple_rights = True
-    if share_or_multiple_rights:
-        details.append("Есть признаки нескольких прав/долей или совместной собственности. Проверить всех правообладателей, согласия, преимущественное право и возможные детские доли.")
-
-    # Soft point hint for scoring. It is intentionally moderate.
-    points_hint = 0
-    encumbrance_level = "none"
-    if registration_ban:
-        encumbrance_level = "registration_ban"
-        points_hint += 34
-    elif manageable_encumbrance:
-        encumbrance_level = "manageable"
-        points_hint += 14
-    elif other_encumbrance:
-        encumbrance_level = "other"
-        points_hint += 14
-
-    if recent_right_level == "high":
-        points_hint += 22
-    elif recent_right_level == "medium":
-        points_hint += 14
-    elif recent_right_level == "low":
-        points_hint += 7
-
-    if frequent_transitions_level == "high":
-        points_hint += 20
-    elif frequent_transitions_level == "medium":
-        points_hint += 14
-    elif frequent_transitions_level == "low":
-        points_hint += 6
-
-    if basis_flags:
-        # Several risky bases should not explode the score, but must be visible.
-        points_hint += min(16, 6 + len(basis_flags) * 3)
-
-    if share_or_multiple_rights:
-        points_hint += 8
+        points_hint += 4
+        details.append(f"В ЕГРН много регистрационных дат/записей: {len(valid_dates)}. Это повод запросить историю переходов права, но автоматический ответ не всегда позволяет уверенно отделить переход права от иных регистрационных действий.")
 
     return {
         "encumbrance_level": encumbrance_level,
         "registration_ban": registration_ban,
-        "registration_restriction": registration_restriction,
+        "registration_restriction": registration_ban,
         "manageable_encumbrance": manageable_encumbrance,
         "other_encumbrance": other_encumbrance,
         "recent_right_months": recent_months,
         "recent_right_date": latest_right_date.strftime("%d.%m.%Y") if latest_right_date else "",
         "recent_right_level": recent_right_level,
+        "ownership_over_3_years": ownership_over_3_years,
         "frequent_transitions_level": frequent_transitions_level,
         "rights_count": len(rights),
         "transition_dates": [d.strftime("%d.%m.%Y") for d in valid_dates[-8:]],
-        "basis_flags": basis_flags,
-        "share_or_multiple_rights": share_or_multiple_rights,
         "details": details,
-        "points_hint": min(points_hint, 55),
+        "points_hint": min(points_hint, 45),
     }
 
 
@@ -1122,7 +1089,7 @@ def classify_egrn(resp: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             details.append(f"Кадастровая стоимость: {obj.get('cadCost')}")
 
-    details.append(f"Записей о правах: {len(rights)}")
+    details.append(f"Записей о правах в ответе ЕГРН: {len(rights)}")
 
     enc_details = []
     for e in enc:
@@ -1142,44 +1109,50 @@ def classify_egrn(resp: Dict[str, Any]) -> Dict[str, Any]:
         details.append("Ограничения/обременения из ЕГРН:")
         details.extend(enc_details)
 
+    transition_dates = profile.get("transition_dates") or []
+    if transition_dates:
+        details.append("Даты регистрационных записей/событий, найденные в ответе: " + ", ".join(transition_dates))
+
     details.extend(profile.get("details") or [])
 
     obj_with_profile = dict(obj)
     obj_with_profile["_egrn_risk_profile"] = profile
 
-    has_soft_risk = bool(
+    has_egrn_risk = bool(
         enc
         or profile.get("recent_right_level") in {"high", "medium", "low"}
         or profile.get("frequent_transitions_level") in {"high", "medium", "low"}
-        or profile.get("basis_flags")
-        or profile.get("share_or_multiple_rights")
     )
 
-    if has_soft_risk:
+    if has_egrn_risk:
         if profile.get("registration_ban"):
             summary = (
-                "Данные по объекту получены. Есть признаки запрета/ареста/ограничения регистрационных действий. "
-                "Это серьезный риск, но не всегда означает невозможность сделки: нужно проверить основание и схему снятия до регистрации."
+                "Данные по объекту получены. В ЕГРН есть ограничение/запрет/арест регистрационных действий. "
+                "Это серьезный, но не автоматический запрет сделки: нужно проверить основание и порядок снятия."
             )
         elif profile.get("manageable_encumbrance"):
             summary = (
-                "Данные по объекту получены. Есть признаки ипотеки/залога или иного ограничения/обременения, которое не является автоматическим запретом сделки. "
+                "Данные по объекту получены. В ЕГРН есть ипотека/залог или похожее управляемое обременение. "
                 "Сделка возможна при правильной схеме расчетов и контроле снятия записи."
             )
-        else:
+        elif profile.get("other_encumbrance"):
             summary = (
-                "Данные по объекту получены. Критический запрет не подтвержден, но есть факторы для проверки: "
-                "история права, свежая регистрация, частые регистрационные события, доли или основание приобретения."
+                "Данные по объекту получены. В ЕГРН есть ограничение или обременение. "
+                "Нужно проверить основание и условия прекращения, но это не автоматическая катастрофа."
             )
+        elif profile.get("frequent_transitions_level") in {"high", "medium", "low"}:
+            summary = "Данные по объекту получены. Ограничения/обременения не выявлены, но есть признаки частых регистрационных событий / возможных переходов права."
+        else:
+            summary = "Данные по объекту получены. Ограничения/обременения не выявлены, но право зарегистрировано относительно недавно."
         return risk_item(title, summary, url, [d for d in details if d and not d.endswith(':')], obj_with_profile)
 
-    return ok_item(
-        title,
-        "Данные по объекту получены. По полученным данным явные ограничения, обременения и дополнительные ЕГРН-факторы риска не выявлены.",
-        url,
-        [d for d in details if d],
-        obj_with_profile,
-    )
+    if profile.get("ownership_over_3_years"):
+        summary = "Данные по объекту получены. По ЕГРН явные ограничения и обременения не выявлены; право выглядит зарегистрированным более 3 лет назад."
+    else:
+        summary = "Данные по объекту получены. По ЕГРН явные ограничения и обременения не выявлены."
+
+    return ok_item(title, summary, url, [d for d in details if d], obj_with_profile)
+
 
 def classify_all(responses: Dict[str, Dict[str, Any]], req: Optional[CheckRequest] = None) -> List[Dict[str, Any]]:
     return [
@@ -1249,7 +1222,7 @@ def build_advance_decision(scoring: Dict[str, Any]) -> Dict[str, str]:
     if score >= 60:
         return {"decision": "Только с жесткими защитными условиями", "level": "strict_conditions", "comment": "Аванс возможен только после ручной проверки и с условиями возврата/ответственности продавца."}
     if score >= 35:
-        return {"decision": "Осторожно, после проверки документов", "level": "caution", "comment": "Критический стоп-фактор не подтвержден, но до аванса (задатка) нужно закрыть ручные проверки и прописать условия в ПДКП."}
+        return {"decision": "Осторожно, после проверки документов", "level": "caution", "comment": "До аванса (задатка) нужно закрыть ручные проверки и прописать защитные условия в ПДКП."}
     return {"decision": "Можно рассматривать, но не без документов", "level": "allowed_with_standard_checks", "comment": "По автоматическим источникам критичных рисков не выявлено, но ручная проверка правоустанавливающих документов обязательна."}
 
 
@@ -1511,13 +1484,11 @@ def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> 
             if profile.get("recent_right_level") in {"high", "medium", "low"}:
                 parts.append(f"свежая регистрационная запись: {profile.get('recent_right_date') or 'дата не определена'}")
             if profile.get("frequent_transitions_level") in {"high", "medium", "low"}:
-                parts.append("частые регистрационные события/переходы")
-            if profile.get("basis_flags"):
-                parts.append("особое основание: " + ", ".join(profile.get("basis_flags") or []))
-            if profile.get("share_or_multiple_rights"):
-                parts.append("доли/несколько прав")
+                parts.append("частые регистрационные события / возможные переходы права")
+            if profile.get("ownership_over_3_years"):
+                parts.append("право выглядит зарегистрированным более 3 лет назад")
 
-            add_factor("ЕГРН", pts, ", ".join(parts) if parts else "объект требует дополнительной проверки", severity)
+            add_factor("ЕГРН", pts, ", ".join(parts) if parts else "фактологические ЕГРН-факторы требуют проверки", severity)
 
         elif "ФССП" in title:
             actual = ((item.get("data") or {}).get("actual_debt") or 0) if isinstance(item.get("data"), dict) else 0
@@ -1541,14 +1512,14 @@ def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> 
 
             if bstatus == "active":
                 add_factor("Банкротство", 75, "есть признаки действующей/незавершенной процедуры", "critical")
-            elif months is not None and months < 12:
-                add_factor("Банкротство", 38, "после значимой публикации прошло менее 1 года", "high")
-            elif months is not None and months < 36:
-                add_factor("Банкротство", 28, "после значимой публикации прошло менее 3 лет", "high")
-            elif property_words:
-                add_factor("Банкротство", 24, "есть имущественные формулировки в публикациях", "medium")
+            elif bstatus == "completed" and months is not None and months < 12:
+                add_factor("Банкротство", 38, "процедура завершена менее 1 года назад", "high")
+            elif bstatus == "completed" and months is not None and months < 36:
+                add_factor("Банкротство", 28, "процедура завершена менее 3 лет назад", "high")
             elif bstatus == "completed":
-                add_factor("Банкротство", 16, "процедура выглядит завершенной, нужен контроль документов", "medium")
+                add_factor("Банкротство", 16, "процедура выглядит завершенной; проверить дату завершения и связь объекта с делом", "medium")
+            elif property_words:
+                add_factor("Банкротство", 22, "статус неясен, в публикациях есть имущественные признаки", "medium")
             else:
                 add_factor("Банкротство", 22, "сведения найдены, статус требует ручной проверки", "medium")
 
@@ -1630,7 +1601,7 @@ def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> 
     elif score >= 35:
         level = "условно рискованная"
         label = "Условно рискованно при самостоятельной сделке"
-        conclusion = "Критический стоп-фактор по автоматическим данным не подтвержден, но до аванса (задатка) нужно закрыть ручные проверки и внести защитные условия в документы."
+        conclusion = "По автоматическим данным жесткий запрет на сделку не выявлен, но до аванса (задатка) нужно закрыть ручные проверки и внести защитные условия в документы."
     else:
         level = "допустимая"
         label = "Допустимо к дальнейшему рассмотрению"
@@ -1680,11 +1651,7 @@ def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRe
         if profile.get("recent_right_level") in {"high", "medium", "low"}:
             recs.append({"priority": "high", "title": "Проверить свежую регистрацию права", "text": "Право или значимая регистрационная запись появились недавно. До аванса нужно проверить основание приобретения, документы-основания, причину быстрой продажи и связь с возможными долгами/банкротством/судами."})
         if profile.get("frequent_transitions_level") in {"high", "medium", "low"}:
-            recs.append({"priority": "high", "title": "Проверить цепочку переходов права", "text": "Есть признаки частых регистрационных событий или переходов. Нужно запросить историю переходов права, проверить предыдущие основания и исключить оспоримые сделки в цепочке."})
-        if profile.get("basis_flags"):
-            recs.append({"priority": "medium", "title": "Разобрать основание приобретения", "text": "В ЕГРН/ответе найдены признаки особого основания: " + ", ".join(profile.get("basis_flags") or []) + ". Для каждого основания нужен отдельный комплект документов и проверка риска оспаривания."})
-        if profile.get("share_or_multiple_rights"):
-            recs.append({"priority": "medium", "title": "Проверить доли, сособственников и согласия", "text": "Есть признаки долей, нескольких прав или совместной собственности. Нужно проверить всех правообладателей, согласия, преимущественное право покупки, брачный режим и возможные детские доли."})
+            recs.append({"priority": "high", "title": "Проверить цепочку переходов права", "text": "Есть признаки частых регистрационных событий / возможных переходов права. Нужно запросить историю переходов права, проверить предыдущие основания и исключить оспоримые сделки в цепочке."})
     if fssp and fssp.get("status") == "risk":
         actual = ((fssp.get("data") or {}).get("actual_debt") or 0) if isinstance(fssp.get("data"), dict) else 0
         recs.append({"priority": "high", "title": "Закрыть активные ИП до сделки или через контролируемые расчеты", "text": f"Актуальная сумма по активным/неоднозначным ИП: {rub(actual)}. В ПДКП прописать порядок погашения и последствия неснятия ограничений."})
@@ -1812,7 +1779,7 @@ def build_local_legal_report(req: CheckRequest, checklist: List[Dict[str, Any]],
     elif score >= 60:
         lines.append("Сделку можно рассматривать только как условно допустимую: до аванса необходимо закрыть ручные проверки, закрепить защитные условия в соглашении и не передавать деньги без понятной схемы выхода из сделки.")
     elif score >= 35:
-        lines.append("Критический стоп-фактор автоматически не подтвержден, но до передачи денег нужно закрыть открытые вопросы и получить документы, которые подтверждают юридическую чистоту продавца и объекта.")
+        lines.append("До передачи денег нужно закрыть открытые вопросы, получить документы по продавцу и объекту и закрепить защитные условия в соглашении.")
     else:
         lines.append("По автоматическим источникам критичные признаки не выявлены, но отчет не заменяет анализ правоустанавливающих документов, истории объекта, семейного статуса продавца и зарегистрированных лиц.")
     lines.append("")
@@ -2645,9 +2612,9 @@ async def build_full_report(req: CheckRequest, include_debug: bool = False) -> D
         result["payloads"] = payloads
         result["responses"] = responses
 
-    # Public API response uses masked INN. Stored PDF version may show full INN in the report header.
+    # Public API response and PDF use masked INN. Full INN is used only inside backend/newDB payloads.
     stored_report = dict(result)
-    stored_report["normalized_input"] = normalized_input(req, expose_full_inn=True)
+    stored_report["normalized_input"] = normalized_input(req, expose_full_inn=False)
     REPORTS[report_id] = stored_report
     return result
 
