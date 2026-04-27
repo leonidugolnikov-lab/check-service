@@ -1237,13 +1237,28 @@ def build_hidden_risks(req: Optional[CheckRequest] = None) -> List[Dict[str, str
 def build_advance_decision(scoring: Dict[str, Any]) -> Dict[str, str]:
     score = int(scoring.get("score") or 0)
     if score >= 85:
-        return {"decision": "Нельзя передавать аванс (задаток) до устранения рисков", "level": "stop", "comment": "Есть критические признаки. Сначала ручная проверка, документы, условия снятия рисков и безопасная схема расчетов."}
+        return {
+            "decision": "Аванс не передавать до документального снятия ключевых вопросов",
+            "level": "stop",
+            "comment": "Сначала получить основание ограничения, порядок его снятия и схему расчетов, где деньги не уходят продавцу до выполнения условий."
+        }
     if score >= 60:
-        return {"decision": "Только с жесткими защитными условиями", "level": "strict_conditions", "comment": "Аванс возможен только после ручной проверки и с условиями возврата/ответственности продавца."}
+        return {
+            "decision": "Аванс возможен только в защищенной конструкции",
+            "level": "strict_conditions",
+            "comment": "Нужны документы по каждому спорному пункту, условия возврата денег и ответственность продавца за неподтвержденные сведения."
+        }
     if score >= 35:
-        return {"decision": "Осторожно, после проверки документов", "level": "caution", "comment": "До аванса (задатка) нужно закрыть ручные проверки и прописать защитные условия в ПДКП."}
-    return {"decision": "Можно рассматривать, но не без документов", "level": "allowed_with_standard_checks", "comment": "По автоматическим источникам критичных рисков не выявлено, но ручная проверка правоустанавливающих документов обязательна."}
-
+        return {
+            "decision": "Сначала документы, потом деньги",
+            "level": "caution",
+            "comment": "Открытые вопросы нужно закрыть до подписания авансового соглашения или прямо сделать их условиями возврата."
+        }
+    return {
+        "decision": "Можно переходить к стандартной проверке документов",
+        "level": "allowed_with_standard_checks",
+        "comment": "Автоматические источники не показали выраженных стоп-факторов, но правоустанавливающие документы и зарегистрированных лиц все равно нужно проверить вручную."
+    }
 
 def build_data_reliability(checklist: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     reliability = []
@@ -1612,19 +1627,19 @@ def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> 
     if score >= 85:
         level = "опасная"
         label = "Опасно при самостоятельной сделке"
-        conclusion = "Аванс (задаток) и сделку нельзя проводить без ручной юридической проверки, устранения ключевых рисков и безопасной схемы расчетов."
+        conclusion = "Высокий риск: выявлена связка факторов, которую нельзя закрыть одной формальной проверкой."
     elif score >= 60:
         level = "высокорискованная"
         label = "Высокий риск при самостоятельной сделке"
-        conclusion = "Сделку можно рассматривать только после уточнения рисков, проверки документов и жестких защитных условий в авансе (задатке)/ПДКП."
+        conclusion = "Есть значимые вопросы к продавцу или объекту; сделка допустима только после документального подтверждения спорных пунктов."
     elif score >= 35:
         level = "условно рискованная"
         label = "Условно рискованно при самостоятельной сделке"
-        conclusion = "По автоматическим данным жесткий запрет на сделку не выявлен, но до аванса (задатка) нужно закрыть ручные проверки и внести защитные условия в документы."
+        conclusion = "Критичный запрет не подтвержден, но остаются вопросы, которые должны быть закрыты до передачи денег."
     else:
         level = "допустимая"
         label = "Допустимо к дальнейшему рассмотрению"
-        conclusion = "По автоматическим источникам критичных рисков не выявлено, но отчет не заменяет ручную юридическую проверку документов."
+        conclusion = "Автоматическая проверка не показала выраженных стоп-факторов; следующий этап — анализ документов по объекту."
 
     factor_rows_sorted = sorted(factor_rows, key=lambda x: int(x.get("points") or 0), reverse=True)
     return {
@@ -1739,72 +1754,138 @@ def build_screen_report(req: CheckRequest, checklist: List[Dict[str, Any]], scor
 
 
 def build_local_legal_report(req: CheckRequest, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], recs: List[Dict[str, str]]) -> str:
-    """Deterministic legal conclusion. It is intentionally structured without numbered headings
-    so the PDF never gets an empty “6.” section from model output.
+    """Deterministic legal conclusion with separated roles for sections.
+
+    The PDF already contains: score, checklist, risk map and action table.
+    This section must not repeat the same sentences; it gives a compact legal interpretation.
     """
     risks = [x for x in checklist if x.get("status") == "risk"]
     oks = [x for x in checklist if x.get("status") == "ok"]
     manual = [x for x in checklist if x.get("status") == "manual_check"]
     score = int(scoring.get("score") or 0)
-    label = scoring.get("label") or "оценка не определена"
-    advance = build_advance_decision(scoring)
+    label = str(scoring.get("label") or "оценка не определена")
 
-    def names(items: List[Dict[str, Any]]) -> str:
-        return ", ".join([str(x.get("title") or "источник") for x in items]) or "нет"
+    def short_source_title(title: str) -> str:
+        t = title or "Источник"
+        return t.replace(" / Росреестр", "").replace(" / Федресурс", "").replace(" / ГАС Правосудие", "")
+
+    def compact_summary(item: Dict[str, Any]) -> str:
+        title = str(item.get("title") or "")
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        if "ФССП" in title and isinstance(data, dict):
+            active = data.get("active_count") or 0
+            actual = data.get("actual_debt") or 0
+            if active:
+                return f"активных/неоднозначных ИП: {active}, сумма для оценки — {rub(actual)}"
+            return "активные ИП по полученному ответу не выделены"
+        if "ЕГРН" in title and isinstance(data, dict):
+            profile = data.get("_egrn_risk_profile") if isinstance(data.get("_egrn_risk_profile"), dict) else {}
+            parts = []
+            if profile.get("registration_ban"):
+                parts.append("есть запись о запрете/аресте/ограничении регистрации")
+            elif profile.get("manageable_encumbrance"):
+                parts.append("есть ипотека/залог или управляемое обременение")
+            elif profile.get("other_encumbrance"):
+                parts.append("есть обременение, требующее проверки условий")
+            else:
+                parts.append("явные ограничения и обременения не выделены")
+            if profile.get("recent_right_date"):
+                parts.append(f"значимая регистрационная дата: {profile.get('recent_right_date')}")
+            return "; ".join(parts)
+        if "Банкрот" in title and isinstance(data, dict):
+            st = data.get("bankruptcy_status")
+            months = data.get("months_after_latest")
+            if st == "active":
+                return "есть признаки действующей или незавершенной процедуры"
+            if st == "completed":
+                tail = f", последняя значимая публикация примерно {months} мес. назад" if months is not None else ", дату завершения нужно уточнить вручную"
+                return "процедура выглядит завершенной" + tail
+        return str(item.get("summary") or "требуется анализ")
+
+    def unique_recs(items: List[Dict[str, str]], limit: int = 6) -> List[Dict[str, str]]:
+        seen = set()
+        out = []
+        for rec in items:
+            title = str(rec.get("title") or "").strip()
+            key = re.sub(r"\s+", " ", title.lower())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(rec)
+            if len(out) >= limit:
+                break
+        return out
 
     lines: List[str] = []
 
     lines.append("Краткий вывод")
-    lines.append(f"Итоговая оценка риска: {label} ({score}/100). {scoring.get('conclusion') or ''}")
-    lines.append(f"Решение по авансу: {advance.get('decision')}. {advance.get('comment')}")
+    if score >= 85:
+        lines.append(f"Оценка: {label} ({score}/100). Главная проблема — не количество найденных записей, а их сочетание: денежные требования к продавцу и регистрационные ограничения по объекту могут сорвать переход права или расчеты.")
+    elif score >= 60:
+        lines.append(f"Оценка: {label} ({score}/100). Сделку нельзя оценивать по одному источнику: перед авансом нужно закрыть спорные пункты и подтвердить, что выявленные обстоятельства управляемы.")
+    elif score >= 35:
+        lines.append(f"Оценка: {label} ({score}/100). Автоматическая проверка не показала безусловного стоп-фактора, но оставила вопросы, которые должны быть закрыты документами.")
+    else:
+        lines.append(f"Оценка: {label} ({score}/100). Выраженных стоп-факторов по автоматическим источникам не видно; дальше нужна обычная проверка документов и истории объекта.")
     lines.append("")
 
     lines.append("Что подтверждено автоматическими источниками")
     if oks:
         for item in oks:
-            lines.append(f"• {item.get('title')}: {item.get('summary')}")
+            lines.append(f"• {short_source_title(str(item.get('title') or ''))}: {compact_summary(item)}.")
     else:
-        lines.append("• По автоматическим источникам нет полностью подтвержденных блоков; требуется ручная проверка.")
+        lines.append("• Полностью подтвержденных безопасных блоков нет; отчет опирается на выявленные риски и ручные проверки.")
     lines.append("")
 
     lines.append("Что не подтверждено и требует ручной проверки")
     if manual:
         for item in manual:
-            lines.append(f"• {item.get('title')}: {item.get('summary')}")
+            lines.append(f"• {short_source_title(str(item.get('title') or ''))}: автоматический ответ недостаточен, источник нужно проверить вручную.")
     else:
-        lines.append("• Источников со статусом ручной проверки нет.")
+        lines.append("• Автоматические источники не пометили отдельные проверки как технически неполные.")
     lines.append("")
 
     lines.append("Ключевые риски")
     if risks:
         for item in risks:
-            lines.append(f"• {item.get('title')}: {item.get('summary')}")
+            lines.append(f"• {short_source_title(str(item.get('title') or ''))}: {compact_summary(item)}.")
     else:
-        lines.append("• Явные риски по автоматическим источникам не выявлены. Это не отменяет проверки документов по объекту и истории переходов права.")
+        lines.append("• По реестрам не выделен самостоятельный красный флаг; скрытые риски проверяются документами, а не автоматикой.")
     lines.append("")
 
     lines.append("Что проверить до аванса")
-    for rec in recs[:8]:
-        lines.append(f"• {rec.get('title')}: {rec.get('text')}")
+    for rec in unique_recs(recs):
+        title = str(rec.get("title") or "Проверка")
+        text = str(rec.get("text") or "")
+        # Make this block action-oriented, not a repeat of the risk map.
+        text = re.sub(r"^По ЕГРН есть признаки[^.]*\.\s*", "", text)
+        text = re.sub(r"^Актуальная сумма[^.]*\.\s*", "", text)
+        text = re.sub(r"^Все источники со статусом[^.]*\.\s*", "", text)
+        lines.append(f"• {title}: {text}".strip())
     lines.append("")
 
     lines.append("Как передавать аванс")
-    lines.append("Аванс или задаток передавать только после сверки документов и ручной проверки всех источников со статусом «ручная проверка» или «требует внимания». В соглашении нужно прямо прописать раскрытие продавцом долгов, банкротства, судебных споров, ограничений, зарегистрированных лиц и оснований возврата денег, если сведения не подтвердятся.")
+    if score >= 85:
+        lines.append("Прямую передачу денег продавцу исключить. Допустим только сценарий, где сумма, сроки, документы для снятия ограничений и момент раскрытия денег заранее зафиксированы в соглашении и подтверждаются независимыми источниками.")
+    elif score >= 60:
+        lines.append("Деньги передавать через контролируемый механизм: аккредитив, депозит нотариуса, банковскую ячейку с условиями доступа или иной вариант, где возврат и раскрытие завязаны на конкретные документы.")
+    else:
+        lines.append("Даже при умеренном риске аванс должен быть связан с проверяемыми условиями: документами продавца, отсутствием скрытых ограничений, сроками выхода на сделку и понятным возвратом денег при несоответствии данных.")
     lines.append("")
 
     lines.append("Итоговое заключение")
     if score >= 85:
-        lines.append("Передавать аванс и выходить на сделку без устранения выявленных рисков нельзя. Сначала нужно вручную подтвердить судебные и имущественные обстоятельства, закрыть вопросы по банкротству/долгам/ограничениям и только после этого обсуждать безопасную схему расчетов.")
+        lines.append("Сделка может обсуждаться только после устранения или документального контроля выявленных препятствий. Практически это означает: сначала основание ограничения, порядок погашения/снятия, проверка документов, затем — расчетная схема.")
     elif score >= 60:
-        lines.append("Сделку можно рассматривать только как условно допустимую: до аванса необходимо закрыть ручные проверки, закрепить защитные условия в соглашении и не передавать деньги без понятной схемы выхода из сделки.")
+        lines.append("Сделку нельзя вести в упрощенном режиме. Нужен короткий перечень условий, после выполнения которых покупатель действительно понимает, за что платит и как защищен при срыве регистрации.")
     elif score >= 35:
-        lines.append("До передачи денег нужно закрыть открытые вопросы, получить документы по продавцу и объекту и закрепить защитные условия в соглашении.")
+        lines.append("Риск не выглядит критическим, но аванс без проверки превратит открытые вопросы в проблему покупателя. Сначала документы и условия, потом обязательства по деньгам.")
     else:
-        lines.append("По автоматическим источникам критичные признаки не выявлены, но отчет не заменяет анализ правоустанавливающих документов, истории объекта, семейного статуса продавца и зарегистрированных лиц.")
+        lines.append("Автоматические источники не заменяют юридическую проверку договора, основания права, зарегистрированных лиц и семейного статуса продавца. Но по данным реестров выраженного красного сигнала не сформировано.")
     lines.append("")
 
     lines.append("Важно")
-    lines.append("Отчет носит информационно-аналитический характер, не является гарантией полной юридической безопасности сделки и не заменяет ручную юридическую проверку документов специалистом.")
+    lines.append("Отчет является аналитическим ориентиром по открытым и автоматизированным источникам. Он помогает понять, какие вопросы закрывать до аванса, но не заменяет изучение оригиналов документов и очную юридическую оценку сделки.")
 
     return strip_markdown_noise("\n".join(lines))
 
@@ -2084,7 +2165,9 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
         "8) Судебные совпадения без точной идентификации называй совпадениями, а не установленными делами продавца. Вероятные и слабые совпадения — это ручная проверка, не доказанный риск.\n"
         "9) Завершенное банкротство не является автоматическим запретом сделки, но требует проверки дела и связи объекта с процедурой.\n"
         "9.1) Если bankruptcy_status = completed — запрещено писать, что банкротство активное, действующее или незавершенное.\n"
-        "10) ИНН, паспорт и дату рождения в тексте не раскрывай.\n\n"
+        "10) ИНН, паспорт и дату рождения в тексте не раскрывай.\n"
+        "11) Не повторяй один и тот же вывод в разных разделах. Разделы должны выполнять разные роли: вывод = суть, риски = факты, до аванса = действия, итог = практический сценарий.\n"
+        "12) Не копируй дословно summary из чек-листа в несколько разделов. Перефразируй коротко и без воды.\n\n"
         "СТРУКТУРА, строго в таком порядке, без цифр:\n"
         "Краткий вывод\n"
         "Что подтверждено автоматическими источниками\n"
@@ -2112,6 +2195,13 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
         text = enforce_ai_report_text(text, checklist, scoring, req)
         text = normalize_legal_report_format(text)
         if not text or is_gigachat_refusal(text):
+            return fallback
+        # If the model starts repeating the same legal conclusion in several sections,
+        # deterministic local report is safer and cleaner.
+        sentences = [re.sub(r"\s+", " ", x.strip().lower()) for x in re.split(r"[.!?]", text) if len(x.strip()) > 45]
+        duplicate_sentences = len(sentences) - len(set(sentences))
+        repeated_money_phrases = sum(text.lower().count(p) for p in ["нельзя передавать аванс", "безопасная схема расчетов", "устранения рисков", "ручной юридической проверки"])
+        if duplicate_sentences > 0 or repeated_money_phrases >= 5:
             return fallback
         # If model produced a suspiciously short, structurally broken or fact-conflicting answer,
         # use deterministic fallback.
