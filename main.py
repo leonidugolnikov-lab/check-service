@@ -31,8 +31,8 @@ try:
         Table,
         TableStyle,
         PageBreak,
+        Flowable,
     )
-    from reportlab.graphics.shapes import Drawing, Rect, String, Polygon, Line
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
@@ -45,7 +45,7 @@ except Exception:
     GIGACHAT_AVAILABLE = False
 
 
-APP_VERSION = "1.4.2-premium-pdf-gigachat-structured"
+APP_VERSION = "1.7.0-legal-risk-balanced-report"
 NEWDB_URL = "https://api.newdb.net/v2"
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
@@ -792,29 +792,53 @@ def classify_bankruptcy(resp: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def classify_arbitr(resp: Dict[str, Any], req: Optional[CheckRequest] = None) -> Dict[str, Any]:
+    """Classify arbitration matches conservatively.
+
+    Key idea: court search often returns namesakes. Only a reliably identified match is a
+    confirmed risk. Probable and weak matches are shown to the user, but they are not
+    treated as established seller's cases until manual identification is completed.
+    """
     title, url = "Арбитражные суды", "https://kad.arbitr.ru"
     data, result = result_data(resp, "arbitr_person")
     if has_result_status_500(resp) or is_newdb_error(resp) or data is None:
         return manual_item(title, "Источник арбитражных судов не вернул данные. Требуется ручная проверка.", url, generic_error_details(resp))
 
     raw_cases = extract_arbitr_cases(data)
-    if raw_cases:
-        normalized_cases = [normalize_court_case(c, req or CheckRequest(), source="arbitr") for c in raw_cases]
-        strong = [c for c in normalized_cases if c.get("match_level") == "точное совпадение"]
-        probable = [c for c in normalized_cases if c.get("match_level") == "вероятное совпадение"]
-        weak = [c for c in normalized_cases if c.get("match_level") == "слабое совпадение"]
-        details = court_details_for_screen(normalized_cases)
-        details.insert(0, f"Всего найдено записей: {len(normalized_cases)}")
-        details.insert(1, f"Точные совпадения: {len(strong)}; вероятные: {len(probable)}; слабые/однофамильцы: {len(weak)}")
-        if strong or probable:
-            summary = f"Найдены арбитражные совпадения: {len(normalized_cases)}. Точных совпадений: {len(strong)}, вероятных: {len(probable)}, слабых: {len(weak)}. Без точной идентификации это не считается установленными делами продавца."
-            return risk_item(title, summary, url, details, normalized_cases[:30])
-        return manual_item(title, "Найдены слабые судебные совпадения по арбитражу. Это не считается установленным фактом по продавцу без ручной проверки.", url, details)
+    if not raw_cases:
+        return ok_item(title, "По полученным данным арбитражные дела не выявлены.", url, [], [])
 
-    return ok_item(title, "По полученным данным арбитражные дела не выявлены.", url, [], [])
+    normalized_cases = [normalize_court_case(c, req or CheckRequest(), source="arbitr") for c in raw_cases]
+    strong = [c for c in normalized_cases if c.get("match_level") == "точное совпадение"]
+    probable = [c for c in normalized_cases if c.get("match_level") == "вероятное совпадение"]
+    weak = [c for c in normalized_cases if c.get("match_level") == "слабое совпадение"]
+    details = court_details_for_screen(normalized_cases, limit=10)
+    details.insert(0, f"Всего найдено записей: {len(normalized_cases)}")
+    details.insert(1, f"Точные совпадения: {len(strong)}; вероятные: {len(probable)}; слабые/однофамильцы: {len(weak)}")
+    details.insert(2, "Важно: вероятные и слабые совпадения не считаются установленными делами продавца без ручной идентификации по дате рождения, ИНН, роли, региону и материалам дела.")
 
+    if strong:
+        summary = (
+            f"Найдены арбитражные материалы с надежной идентификацией: {len(strong)}. "
+            f"Дополнительно: вероятных совпадений {len(probable)}, слабых/однофамильцев {len(weak)}. "
+            "Точные совпадения требуют юридической оценки предмета дела, роли продавца и результата."
+        )
+        return risk_item(title, summary, url, details, normalized_cases[:30])
+
+    if probable:
+        summary = (
+            f"Найдены вероятные арбитражные совпадения: {len(probable)}. "
+            "Это не считается установленными делами продавца до ручной идентификации."
+        )
+        return manual_item(title, summary, url, details)
+
+    return manual_item(title, "Найдены только слабые арбитражные совпадения/возможные однофамильцы. Это не является установленным риском продавца без ручной проверки.", url, details)
 
 def classify_pravosud(resp: Dict[str, Any], req: Optional[CheckRequest] = None) -> Dict[str, Any]:
+    """Classify courts of general jurisdiction conservatively.
+
+    GАС/СОЮ searches are especially noisy by FIO. Probable/weak hits are displayed as
+    manual-check items, not as confirmed seller litigation.
+    """
     title, url = "Суды общей юрисдикции / ГАС Правосудие", "https://sudrf.ru"
     data, result = result_data(resp, "pravo_search")
     if data is None:
@@ -826,20 +850,246 @@ def classify_pravosud(resp: Dict[str, Any], req: Optional[CheckRequest] = None) 
         return manual_item(title, "Источник судов общей юрисдикции не вернул данные. Требуется ручная проверка.", url, generic_error_details(resp))
 
     raw_cases = extract_pravosud_cases(data)
-    if raw_cases:
-        normalized_cases = [normalize_court_case(c, req or CheckRequest(), source="pravosud") for c in raw_cases]
-        strong = [c for c in normalized_cases if c.get("match_level") == "точное совпадение"]
-        probable = [c for c in normalized_cases if c.get("match_level") == "вероятное совпадение"]
-        weak = [c for c in normalized_cases if c.get("match_level") == "слабое совпадение"]
-        details = court_details_for_screen(normalized_cases)
-        details.insert(0, f"Всего найдено записей: {len(normalized_cases)}")
-        details.insert(1, f"Точные совпадения: {len(strong)}; вероятные: {len(probable)}; слабые/однофамильцы: {len(weak)}")
-        if strong or probable:
-            summary = f"Найдены судебные совпадения по ФИО: {len(normalized_cases)}. Точных совпадений: {len(strong)}, вероятных: {len(probable)}, слабых: {len(weak)}. Без точной идентификации это не считается установленными делами продавца."
-            return risk_item(title, summary, url, details, normalized_cases[:30])
-        return manual_item(title, "Найдены слабые совпадения в судах общей юрисдикции. Это не считается установленным фактом по продавцу без ручной проверки.", url, details)
+    if not raw_cases:
+        return ok_item(title, "По полученным данным дела в судах общей юрисдикции не выявлены.", url, [], [])
 
-    return ok_item(title, "По полученным данным дела в судах общей юрисдикции не выявлены.", url, [], [])
+    normalized_cases = [normalize_court_case(c, req or CheckRequest(), source="pravosud") for c in raw_cases]
+    strong = [c for c in normalized_cases if c.get("match_level") == "точное совпадение"]
+    probable = [c for c in normalized_cases if c.get("match_level") == "вероятное совпадение"]
+    weak = [c for c in normalized_cases if c.get("match_level") == "слабое совпадение"]
+    details = court_details_for_screen(normalized_cases, limit=10)
+    details.insert(0, f"Всего найдено записей: {len(normalized_cases)}")
+    details.insert(1, f"Точные совпадения: {len(strong)}; вероятные: {len(probable)}; слабые/однофамильцы: {len(weak)}")
+    details.insert(2, "Важно: совпадение только по ФИО часто дает однофамильцев. До ручной сверки это не установленный факт участия продавца в деле.")
+
+    if strong:
+        summary = (
+            f"Найдены судебные материалы с надежной идентификацией: {len(strong)}. "
+            f"Дополнительно: вероятных совпадений {len(probable)}, слабых/однофамильцев {len(weak)}. "
+            "Нужно проверить роль, предмет спора, результат и связь с имущественными рисками."
+        )
+        return risk_item(title, summary, url, details, normalized_cases[:30])
+
+    if probable:
+        summary = (
+            f"Найдены вероятные судебные совпадения по ФИО: {len(probable)}. "
+            "Это не считается установленными делами продавца до ручной идентификации."
+        )
+        return manual_item(title, summary, url, details)
+
+    return manual_item(title, "Найдены только слабые совпадения/возможные однофамильцы в судах общей юрисдикции. Это не является установленным риском продавца без ручной проверки.", url, details)
+
+def first_parseable_date_from_dict(data: Dict[str, Any], preferred_keys: Optional[List[str]] = None) -> Optional[datetime]:
+    """Find a useful date inside a registry dict. Prefer registration/right dates."""
+    if not isinstance(data, dict):
+        return None
+    preferred_keys = preferred_keys or [
+        "registrationDate", "registration_date", "rightRegistrationDate", "right_reg_date",
+        "dateRegistration", "date_registration", "regDate", "reg_date", "startDate",
+        "start_date", "date", "Дата регистрации", "Дата", "date_begin",
+    ]
+    for key in preferred_keys:
+        if key in data:
+            dt = parse_date_any(data.get(key))
+            if dt:
+                return dt
+    for key, value in data.items():
+        key_l = str(key).lower()
+        if any(w in key_l for w in ["date", "дата", "reg", "registr", "начал"]):
+            dt = parse_date_any(value)
+            if dt:
+                return dt
+    return None
+
+
+def collect_dates_recursive(value: Any, *, skip_birth_dates: bool = True) -> List[datetime]:
+    """Collect dates from arbitrary NewDB/Rosreestr structures without crashing on provider changes."""
+    dates: List[datetime] = []
+
+    def walk(x: Any, parent_key: str = "") -> None:
+        if isinstance(x, dict):
+            for k, v in x.items():
+                key = str(k).lower()
+                if skip_birth_dates and any(b in key for b in ["birth", "birthday", "dob", "рожд"]):
+                    continue
+                if isinstance(v, (dict, list)):
+                    walk(v, key)
+                elif any(w in key for w in ["date", "дата", "reg", "registr", "начал"]):
+                    dt = parse_date_any(v)
+                    if dt:
+                        dates.append(dt)
+        elif isinstance(x, list):
+            for row in x:
+                walk(row, parent_key)
+
+    walk(value)
+    return dates
+
+
+def egrn_deep_flags(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract useful property-risk signals from the Rosreestr/NewDB response.
+
+    The logic is deliberately softer than before:
+    - an encumbrance is not automatically a catastrophe;
+    - mortgage/pledge is usually a manageable transaction-structure issue;
+    - registration ban/arrest is serious, but becomes a true stop-factor mainly in combination
+      with seller debt/bankruptcy or until the basis and release route are clear;
+    - recent ownership and frequent transitions are caution factors, not proof of a bad deal.
+    """
+    if not isinstance(obj, dict):
+        return {
+            "encumbrance_level": "none",
+            "registration_ban": False,
+            "manageable_encumbrance": False,
+            "other_encumbrance": False,
+            "recent_right_months": None,
+            "recent_right_level": "unknown",
+            "frequent_transitions_level": "unknown",
+            "rights_count": 0,
+            "transition_dates": [],
+            "basis_flags": [],
+            "share_or_multiple_rights": False,
+            "details": [],
+            "points_hint": 0,
+        }
+
+    enc = obj.get("encumbrances") if isinstance(obj.get("encumbrances"), list) else []
+    rights = obj.get("rights") if isinstance(obj.get("rights"), list) else []
+    text = flatten_text(obj).lower()
+
+    enc_text = flatten_text(enc).lower()
+    registration_ban = any(w in enc_text for w in ["запрещ", "запрет", "арест", "ограничение регистрац", "регистрационных действий"])
+    registration_restriction = registration_ban
+    manageable_encumbrance = any(w in enc_text for w in ["ипотек", "залог"])
+    other_encumbrance = bool(enc) and not registration_ban and not manageable_encumbrance
+
+    details: List[str] = []
+    if registration_ban:
+        details.append("ЕГРН: обнаружены признаки запрета/ареста/ограничения регистрационных действий. Это серьезный риск, но не автоматическая катастрофа: нужно понять основание, сумму/держателя ограничения и порядок снятия до регистрации перехода права.")
+    elif manageable_encumbrance:
+        details.append("ЕГРН: обнаружены признаки ипотеки/залога. Обычно это управляемый риск при правильной схеме расчетов через банк, аккредитив, депозит или погашение с контролем регистрации.")
+    elif other_encumbrance:
+        details.append("ЕГРН: обнаружены ограничения/обременения без явного признака регистрационного запрета. Это не означает невозможность сделки, но требует проверки основания, срока, условий прекращения и схемы безопасных расчетов.")
+    else:
+        details.append("ЕГРН: явные ограничения/обременения по полученным данным не выявлены.")
+
+    # Registration/right dates. Prefer rights dates; fall back to any object dates.
+    right_dates: List[datetime] = []
+    for r in rights:
+        if isinstance(r, dict):
+            dt = first_parseable_date_from_dict(r)
+            if dt:
+                right_dates.append(dt)
+
+    all_dates = right_dates or collect_dates_recursive(obj)
+    today = datetime.now()
+    valid_dates = sorted({d.date(): d for d in all_dates if d.year >= 1998 and d <= today}.values())
+    latest_right_date = max(valid_dates) if valid_dates else None
+    recent_months = months_between_dates(latest_right_date) if latest_right_date else None
+
+    recent_right_level = "unknown"
+    if recent_months is not None:
+        if recent_months < 3:
+            recent_right_level = "high"
+            details.append(f"Право/значимая регистрационная запись выглядит свежей: менее 3 месяцев ({latest_right_date.strftime('%d.%m.%Y')}). Проверить основание приобретения и цепочку переходов права до аванса.")
+        elif recent_months < 12:
+            recent_right_level = "medium"
+            details.append(f"Право/значимая регистрационная запись появилась менее 1 года назад ({latest_right_date.strftime('%d.%m.%Y')}). Нужна проверка основания приобретения и причины быстрой продажи.")
+        elif recent_months < 36:
+            recent_right_level = "low"
+            details.append(f"Право/значимая регистрационная запись младше 3 лет ({latest_right_date.strftime('%d.%m.%Y')}). Это не стоп-фактор, но важно проверить основание и историю объекта.")
+
+    dates_12m = [d for d in valid_dates if months_between_dates(d) is not None and months_between_dates(d) < 12]
+    dates_36m = [d for d in valid_dates if months_between_dates(d) is not None and months_between_dates(d) < 36]
+
+    frequent_transitions_level = "none"
+    if len(dates_12m) >= 2:
+        frequent_transitions_level = "high"
+        details.append(f"Обнаружены признаки частых регистрационных событий: {len(dates_12m)} даты за последние 12 месяцев. Нужна проверка всей цепочки переходов права.")
+    elif len(dates_36m) >= 3:
+        frequent_transitions_level = "medium"
+        details.append(f"Обнаружены признаки частых регистрационных событий: {len(dates_36m)} даты за последние 3 года. Проверить цепочку переходов права и основания сделок.")
+    elif len(valid_dates) >= 4:
+        frequent_transitions_level = "low"
+        details.append(f"В объекте много регистрационных дат/записей: {len(valid_dates)}. Это повод запросить историю переходов права, но не самостоятельный стоп-фактор.")
+
+    basis_flags: List[str] = []
+    basis_patterns = [
+        ("наследство", ["наслед", "свидетельство о праве на наследство"]),
+        ("дарение", ["дарен", "договор дарения"]),
+        ("приватизация", ["приватизац"]),
+        ("решение суда", ["решение суда", "судебн"]),
+        ("рента", ["рента", "пожизненное содержание"]),
+        ("раздел имущества / брачный режим", ["раздел имущества", "брачн", "соглашение о разделе"]),
+        ("торги / банкротство", ["торги", "банкрот", "конкурсн", "реализация имущества"]),
+        ("материнский капитал", ["материнск", "маткапитал", "256-фз"]),
+    ]
+    for label, words in basis_patterns:
+        if any(w in text for w in words):
+            basis_flags.append(label)
+
+    if basis_flags:
+        details.append("По тексту ЕГРН/ответа найдены основания или признаки, требующие отдельной проверки: " + ", ".join(basis_flags) + ".")
+
+    share_or_multiple_rights = False
+    if len(rights) >= 2:
+        share_or_multiple_rights = True
+    if any(w in text for w in ["долевая", "доля", "доли", "1/", "общая совместная", "общая долевая"]):
+        share_or_multiple_rights = True
+    if share_or_multiple_rights:
+        details.append("Есть признаки нескольких прав/долей или совместной собственности. Проверить всех правообладателей, согласия, преимущественное право и возможные детские доли.")
+
+    # Soft point hint for scoring. It is intentionally moderate.
+    points_hint = 0
+    encumbrance_level = "none"
+    if registration_ban:
+        encumbrance_level = "registration_ban"
+        points_hint += 34
+    elif manageable_encumbrance:
+        encumbrance_level = "manageable"
+        points_hint += 14
+    elif other_encumbrance:
+        encumbrance_level = "other"
+        points_hint += 14
+
+    if recent_right_level == "high":
+        points_hint += 22
+    elif recent_right_level == "medium":
+        points_hint += 14
+    elif recent_right_level == "low":
+        points_hint += 7
+
+    if frequent_transitions_level == "high":
+        points_hint += 20
+    elif frequent_transitions_level == "medium":
+        points_hint += 14
+    elif frequent_transitions_level == "low":
+        points_hint += 6
+
+    if basis_flags:
+        # Several risky bases should not explode the score, but must be visible.
+        points_hint += min(16, 6 + len(basis_flags) * 3)
+
+    if share_or_multiple_rights:
+        points_hint += 8
+
+    return {
+        "encumbrance_level": encumbrance_level,
+        "registration_ban": registration_ban,
+        "registration_restriction": registration_restriction,
+        "manageable_encumbrance": manageable_encumbrance,
+        "other_encumbrance": other_encumbrance,
+        "recent_right_months": recent_months,
+        "recent_right_date": latest_right_date.strftime("%d.%m.%Y") if latest_right_date else "",
+        "recent_right_level": recent_right_level,
+        "frequent_transitions_level": frequent_transitions_level,
+        "rights_count": len(rights),
+        "transition_dates": [d.strftime("%d.%m.%Y") for d in valid_dates[-8:]],
+        "basis_flags": basis_flags,
+        "share_or_multiple_rights": share_or_multiple_rights,
+        "details": details,
+        "points_hint": min(points_hint, 55),
+    }
 
 
 def classify_egrn(resp: Dict[str, Any]) -> Dict[str, Any]:
@@ -849,10 +1099,14 @@ def classify_egrn(resp: Dict[str, Any]) -> Dict[str, Any]:
         return manual_item(title, "Источник ЕГРН не вернул данные. Требуется ручная проверка.", url, generic_error_details(resp))
     if not isinstance(data, list) or not data:
         return manual_item(title, "Росреестр не вернул данные по объекту. Требуется ручная проверка.", url)
+
     obj = data[0] if isinstance(data[0], dict) else {}
-    enc = obj.get("encumbrances") if isinstance(obj, dict) else []
-    if not isinstance(enc, list):
-        enc = []
+    if not isinstance(obj, dict):
+        return manual_item(title, "Росреестр вернул нестандартный ответ по объекту. Требуется ручная проверка.", url)
+
+    enc = obj.get("encumbrances") if isinstance(obj.get("encumbrances"), list) else []
+    rights = obj.get("rights") if isinstance(obj.get("rights"), list) else []
+    profile = egrn_deep_flags(obj)
 
     addr = (obj.get("address") or {}).get("readableAddress") if isinstance(obj.get("address"), dict) else ""
     details = [
@@ -867,7 +1121,7 @@ def classify_egrn(resp: Dict[str, Any]) -> Dict[str, Any]:
             details.append(f"Кадастровая стоимость: {rub(float(obj.get('cadCost')))}")
         except Exception:
             details.append(f"Кадастровая стоимость: {obj.get('cadCost')}")
-    rights = obj.get("rights") if isinstance(obj.get("rights"), list) else []
+
     details.append(f"Записей о правах: {len(rights)}")
 
     enc_details = []
@@ -883,12 +1137,49 @@ def classify_egrn(resp: Dict[str, Any]) -> Dict[str, Any]:
         if start:
             line += f", дата начала: {start}"
         enc_details.append(line)
-    details.extend(enc_details)
 
-    if enc:
-        return risk_item(title, "Данные по объекту получены. Выявлены ограничения / обременения по ЕГРН.", url, [d for d in details if d and not d.endswith(':')], obj)
-    return ok_item(title, "Данные по объекту получены. По полученным данным явные ограничения или обременения не выявлены.", url, [d for d in details if d], obj)
+    if enc_details:
+        details.append("Ограничения/обременения из ЕГРН:")
+        details.extend(enc_details)
 
+    details.extend(profile.get("details") or [])
+
+    obj_with_profile = dict(obj)
+    obj_with_profile["_egrn_risk_profile"] = profile
+
+    has_soft_risk = bool(
+        enc
+        or profile.get("recent_right_level") in {"high", "medium", "low"}
+        or profile.get("frequent_transitions_level") in {"high", "medium", "low"}
+        or profile.get("basis_flags")
+        or profile.get("share_or_multiple_rights")
+    )
+
+    if has_soft_risk:
+        if profile.get("registration_ban"):
+            summary = (
+                "Данные по объекту получены. Есть признаки запрета/ареста/ограничения регистрационных действий. "
+                "Это серьезный риск, но не всегда означает невозможность сделки: нужно проверить основание и схему снятия до регистрации."
+            )
+        elif profile.get("manageable_encumbrance"):
+            summary = (
+                "Данные по объекту получены. Есть признаки ипотеки/залога или иного ограничения/обременения, которое не является автоматическим запретом сделки. "
+                "Сделка возможна при правильной схеме расчетов и контроле снятия записи."
+            )
+        else:
+            summary = (
+                "Данные по объекту получены. Критический запрет не подтвержден, но есть факторы для проверки: "
+                "история права, свежая регистрация, частые регистрационные события, доли или основание приобретения."
+            )
+        return risk_item(title, summary, url, [d for d in details if d and not d.endswith(':')], obj_with_profile)
+
+    return ok_item(
+        title,
+        "Данные по объекту получены. По полученным данным явные ограничения, обременения и дополнительные ЕГРН-факторы риска не выявлены.",
+        url,
+        [d for d in details if d],
+        obj_with_profile,
+    )
 
 def classify_all(responses: Dict[str, Dict[str, Any]], req: Optional[CheckRequest] = None) -> List[Dict[str, Any]]:
     return [
@@ -920,29 +1211,36 @@ def strip_markdown_noise(text: str) -> str:
 
 
 def build_hidden_risks(req: Optional[CheckRequest] = None) -> List[Dict[str, str]]:
-    """Risks that public registries/newDB may not fully confirm automatically."""
+    """Risks that public registries/newDB may not fully confirm automatically.
+
+    category values help the report separate always-check items from conditional and
+    critical scenario-specific checks.
+    """
     age = calculate_age(normalize_dob(req.dob)[0]) if req else None
     age_comment = "Проверить дееспособность и свободное волеизъявление продавца."
+    age_category = "при признаках риска"
     if age is not None and age >= 75:
         age_comment = "Возраст 75+: справка из ПНД и медицинское освидетельствование до сделки обязательны; дополнительно рекомендована видеофиксация волеизъявления продавца."
+        age_category = "критично"
     elif age is not None and age >= 70:
-        age_comment = "Возраст 70+: справка из ПНД и медицинское освидетельствование до сделки желательны, особенно при срочной продаже, занижении цены, единственном жилье или участии представителей/родственников."
+        age_comment = "Возраст 70+: справка из ПНД и медицинское освидетельствование желательны, особенно при срочной продаже, занижении цены, единственном жилье или участии представителей/родственников."
+        age_category = "обязательно проверить"
 
     return [
-        {"risk": "Супруг / согласие супруга", "why": "Если квартира приобреталась в браке, требуется проверить режим совместной собственности и согласие супруга.", "law": "ст. 34, 35 СК РФ; ст. 253 ГК РФ"},
-        {"risk": "Материнский капитал", "why": "Если использовался маткапитал, должны быть выделены доли детям и супругу; нарушение может привести к оспариванию.", "law": "ФЗ №256-ФЗ; ст. 10 ФЗ №256-ФЗ"},
-        {"risk": "Доли и преимущественное право", "why": "При продаже доли нужно проверить уведомления сособственников и соблюдение преимущественного права покупки.", "law": "ст. 250 ГК РФ"},
-        {"risk": "Наследство", "why": "Проверить срок после наследования, круг наследников, возможные споры и отказников.", "law": "гл. 61-65 ГК РФ"},
-        {"risk": "Приватизация", "why": "Проверить отказников от приватизации и лиц с возможным бессрочным правом пользования.", "law": "Закон РФ №1541-1; ст. 19 ФЗ №189-ФЗ"},
-        {"risk": "Несовершеннолетние / опека", "why": "Если собственник или пользователь — ребенок, может требоваться разрешение органов опеки.", "law": "ст. 37 ГК РФ; ст. 60 СК РФ"},
-        {"risk": "Зарегистрированные лица", "why": "Проверить, кто зарегистрирован в квартире, сроки снятия с учета и лиц, которых нельзя быстро выселить.", "law": "ЖК РФ; ГК РФ"},
-        {"risk": "Доверенность", "why": "Если сделка по доверенности, проверить срок, полномочия, отмену доверенности и личную волю собственника.", "law": "ст. 185-189 ГК РФ"},
-        {"risk": "Дееспособность / возраст", "why": age_comment, "law": "ст. 21, 29, 30, 177 ГК РФ"},
-        {"risk": "Банкротство и оспаривание", "why": "Проверить процедуру, публикации, конкурсную массу и сделки за подозрительный период.", "law": "ст. 61.2, 61.3 ФЗ №127-ФЗ"},
-        {"risk": "Исполнительные производства и запреты", "why": "Долги сами по себе не всегда блокируют сделку, но могут привести к запрету регистрации или оспариванию расчетов.", "law": "ФЗ №229-ФЗ"},
-        {"risk": "Обременения ЕГРН", "why": "Ипотека, арест, запрет регистрационных действий, аренда или сервитут требуют отдельной схемы сделки.", "law": "ФЗ №218-ФЗ"},
+        {"category": "обязательно проверить", "risk": "Супруг / согласие супруга", "why": "Если квартира приобреталась в браке, требуется проверить режим совместной собственности и согласие супруга. Даже когда собственник один, объект может быть совместно нажитым.", "law": "ст. 34, 35 СК РФ; ст. 253 ГК РФ"},
+        {"category": "обязательно проверить", "risk": "Зарегистрированные лица", "why": "Проверить, кто зарегистрирован в квартире, сроки снятия с учета и лиц, которых нельзя быстро выселить.", "law": "ЖК РФ; ГК РФ"},
+        {"category": "обязательно проверить", "risk": "Правоустанавливающие документы", "why": "Сверить основание приобретения, дату, цену, участников, семейный статус на дату покупки и отсутствие спорных условий.", "law": "ФЗ №218-ФЗ; ГК РФ"},
+        {"category": "при признаках риска", "risk": "Материнский капитал", "why": "Если использовался маткапитал, должны быть выделены доли детям и супругу; нарушение может привести к оспариванию.", "law": "ФЗ №256-ФЗ; ст. 10 ФЗ №256-ФЗ"},
+        {"category": "при признаках риска", "risk": "Доли и преимущественное право", "why": "При продаже доли нужно проверить уведомления сособственников и соблюдение преимущественного права покупки.", "law": "ст. 250 ГК РФ"},
+        {"category": "при признаках риска", "risk": "Наследство", "why": "Проверить срок после наследования, круг наследников, возможные споры, отказников и судебные дела по наследству.", "law": "гл. 61-65 ГК РФ"},
+        {"category": "при признаках риска", "risk": "Приватизация", "why": "Проверить отказников от приватизации и лиц с возможным бессрочным правом пользования.", "law": "Закон РФ №1541-1; ст. 19 ФЗ №189-ФЗ"},
+        {"category": "критично", "risk": "Несовершеннолетние / опека", "why": "Если собственник или пользователь — ребенок, может требоваться разрешение органов опеки; без него сделка может быть оспорена.", "law": "ст. 37 ГК РФ; ст. 60 СК РФ"},
+        {"category": "критично", "risk": "Доверенность", "why": "Если сделка по доверенности, проверить срок, полномочия, отмену доверенности и личную волю собственника. Желательно выйти на прямой контакт с собственником.", "law": "ст. 185-189 ГК РФ"},
+        {"category": age_category, "risk": "Дееспособность / возраст", "why": age_comment, "law": "ст. 21, 29, 30, 177 ГК РФ"},
+        {"category": "критично", "risk": "Банкротство и оспаривание", "why": "Проверить процедуру, публикации, конкурсную массу и сделки за подозрительный период. Завершенное банкротство не равно автоматическому запрету, но требует проверки связи объекта с делом.", "law": "ст. 61.2, 61.3 ФЗ №127-ФЗ"},
+        {"category": "обязательно проверить", "risk": "Исполнительные производства и запреты", "why": "Долги сами по себе не всегда блокируют сделку, но могут привести к запрету регистрации или оспариванию расчетов.", "law": "ФЗ №229-ФЗ"},
+        {"category": "обязательно проверить", "risk": "Ограничения и обременения ЕГРН", "why": "Ипотека, залог, арест, запрет регистрационных действий, аренда или сервитут требуют отдельной схемы сделки. Ограничение/обременение не является автоматической катастрофой, но деньги нельзя передавать без понятного порядка снятия или учета риска.", "law": "ФЗ №218-ФЗ"},
     ]
-
 
 def build_advance_decision(scoring: Dict[str, Any]) -> Dict[str, str]:
     score = int(scoring.get("score") or 0)
@@ -982,9 +1280,16 @@ def pick_first_field(data: Dict[str, Any], names: List[str]) -> str:
 
 
 def court_case_match_score(case: Dict[str, Any], req: CheckRequest, *, source: str) -> Dict[str, Any]:
-    """Heuristic matching to reduce false positives from namesakes. INN is internal only."""
+    """Heuristic matching to reduce false positives from namesakes.
+
+    Full FIO alone is not enough for a confirmed court risk. Exact/strong match is given
+    only when there is a hard identifier (DOB/INN) or a rich combination of full FIO +
+    role/subject/region. INN is used internally only and is not sent to GigaChat.
+    """
     score = 0
     reasons: List[str] = []
+    hard_identifier = False
+
     full_fio = fio(req).lower()
     last = req.last.strip().lower()
     first = req.first.strip().lower()
@@ -994,34 +1299,38 @@ def court_case_match_score(case: Dict[str, Any], req: CheckRequest, *, source: s
     region = str(normalize_region(req) or "")
     text = flatten_text(case).lower()
 
-    if full_fio and full_fio in text:
-        score += 45
+    full_fio_found = bool(full_fio and full_fio in text)
+    if full_fio_found:
+        score += 38
         reasons.append("полное ФИО найдено в карточке дела")
     else:
         if last and last in text:
-            score += 15
+            score += 12
             reasons.append("совпала фамилия")
         if first and first in text:
-            score += 12
+            score += 10
             reasons.append("совпало имя")
         if middle and middle in text:
-            score += 10
+            score += 8
             reasons.append("совпало отчество")
 
     if dob_ru and (dob_ru in text or dob_iso in text):
-        score += 35
+        score += 42
+        hard_identifier = True
         reasons.append("совпала дата рождения")
 
     if inn and inn in text:
-        score += 45
+        score += 50
+        hard_identifier = True
         reasons.append("совпал ИНН во внутренних данных")
 
     if region and re.search(rf"\b{re.escape(region)}\b", text):
-        score += 5
+        score += 6
         reasons.append("есть совпадение по региональному признаку")
 
     role_text = pick_first_field(case, ["role_text", "role", "role_code", "party_role", "participant_role"]).lower()
-    if any(w in role_text for w in ["ответчик", "должник", "заинтересован", "подсудим", "обвиняем"]):
+    risky_role = any(w in role_text for w in ["ответчик", "должник", "заинтересован", "подсудим", "обвиняем"])
+    if risky_role:
         score += 10
         reasons.append("роль потенциально значима для риска сделки")
     elif any(w in role_text for w in ["истец", "заявитель"]):
@@ -1029,20 +1338,24 @@ def court_case_match_score(case: Dict[str, Any], req: CheckRequest, *, source: s
         reasons.append("роль менее критична, но требует анализа предмета дела")
 
     subject = pick_first_field(case, ["category", "case_category", "subject", "claim", "description", "essence", "type", "dispute_subject"]).lower()
-    if any(w in subject for w in ["взыск", "долг", "банкрот", "имуще", "недвиж", "залог", "ипотек", "оспар", "недейств"]):
+    risky_subject = any(w in subject for w in ["взыск", "долг", "банкрот", "имуще", "недвиж", "залог", "ипотек", "оспар", "недейств"])
+    if risky_subject:
         score += 10
         reasons.append("предмет дела может быть связан с имущественными рисками")
 
     score = max(0, min(100, score))
-    if score >= 80:
+
+    # Conservative levels: FIO-only hits remain probable/weak, not exact.
+    if hard_identifier and score >= 80:
         level = "точное совпадение"
-    elif score >= 45:
+    elif full_fio_found and score >= 58 and (risky_role or risky_subject):
+        level = "вероятное совпадение"
+    elif score >= 42:
         level = "вероятное совпадение"
     else:
         level = "слабое совпадение"
 
     return {"court_match_score": score, "match_level": level, "match_reasons": reasons, "source": source}
-
 
 def normalize_court_case(case: Dict[str, Any], req: CheckRequest, *, source: str) -> Dict[str, Any]:
     match = court_case_match_score(case, req, source=source)
@@ -1122,63 +1435,103 @@ def court_details_for_screen(cases: List[Dict[str, Any]], limit: int = 7) -> Lis
 # ---------- scoring/report ----------
 
 def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> Dict[str, Any]:
-    """Balanced legal scoring.
+    """Balanced legal scoring for a real-estate deal.
 
-    Important rule: the score must reflect confirmed or strongly supported risk,
-    not merely the amount of text returned by registries. Completed bankruptcy and
-    probable court matches are caution factors, not automatic stop-factors.
+    The score reflects confirmed or strongly supported risk. Restrictions/encumbrances
+    in EGRN, completed bankruptcy and noisy court matches are caution factors, not an
+    automatic catastrophe. Red zone appears mainly when several hard risks combine or
+    when there is an active bankruptcy/invalid passport/very high unmanaged debt.
     """
     score = 0
     factors: List[str] = []
+    factor_rows: List[Dict[str, Any]] = []
+
+    def add_factor(source: str, points: int, text: str, severity: str = "attention") -> None:
+        nonlocal score
+        points = int(max(0, points))
+        score += points
+        factors.append(f"{source}: {text} (+{points})")
+        factor_rows.append({"source": source, "points": points, "severity": severity, "text": text})
 
     if age is not None:
         if age >= 85:
-            score += 25
-            factors.append("Возраст продавца 85+ — критически важна проверка воли и дееспособности (+25)")
+            add_factor("Возраст", 25, "продавец 85+ — критически важна проверка воли и дееспособности", "critical")
         elif age >= 75:
-            score += 18
-            factors.append("Возраст продавца 75+ — ПНД и медицинское освидетельствование обязательны (+18)")
+            add_factor("Возраст", 18, "продавец 75+ — ПНД и медицинское освидетельствование обязательны", "high")
         elif age >= 70:
-            score += 10
-            factors.append("Возраст продавца 70+ — ПНД и медицинское освидетельствование желательны (+10)")
+            add_factor("Возраст", 10, "продавец 70+ — ПНД и медицинское освидетельствование желательны", "medium")
 
     for item in checklist:
         title = item.get("title", "Источник")
         status = item.get("status")
 
         if status == "manual_check":
-            pts = 4 if ("ГАС" in title or "суд" in title.lower()) else 6
-            score += pts
-            factors.append(f"{title}: требуется ручная проверка (+{pts})")
+            # Noisy courts should not punish the score like confirmed risks.
+            pts = 2 if ("Арбитраж" in title or "ГАС" in title or "суд" in title.lower()) else 5
+            add_factor(title, pts, "источник требует ручной проверки; отсутствие результата не равно отсутствию риска", "manual")
             continue
 
         if status != "risk":
             continue
 
         if "ЕГРН" in title:
-            details_text = " ".join(item.get("details") or []).lower()
-            if "запрещение регистрации" in details_text or "запрет" in details_text:
-                pts = 85
-                factors.append("ЕГРН: выявлен запрет/ограничение регистрационных действий (+85)")
+            egrn_data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            profile = egrn_data.get("_egrn_risk_profile") if isinstance(egrn_data, dict) else {}
+            if not isinstance(profile, dict):
+                profile = {}
+
+            pts = int(profile.get("points_hint") or 0)
+            if pts <= 0:
+                details_text = " ".join(item.get("details") or []).lower()
+                if "запрещение регистрации" in details_text or "запрет" in details_text or "арест" in details_text:
+                    pts = 32
+                elif "ипотек" in details_text or "залог" in details_text:
+                    pts = 14
+                else:
+                    pts = 12
+
+            # Restriction/encumbrance is serious, but not automatic catastrophe.
+            if profile.get("registration_ban"):
+                pts = min(45, pts)
+            elif profile.get("manageable_encumbrance") or profile.get("other_encumbrance"):
+                pts = min(24, pts)
             else:
-                pts = 60
-                factors.append("ЕГРН: выявлены ограничения/обременения без признака регистрационного запрета (+60)")
-            score += pts
+                pts = min(28, pts)
+
+            parts = []
+            severity = "medium"
+            if profile.get("registration_ban"):
+                parts.append("запрет/арест/ограничение регистрации — нужно понять основание и порядок снятия")
+                severity = "high"
+            elif profile.get("manageable_encumbrance"):
+                parts.append("ипотека/залог или управляемое обременение — нужна правильная схема расчетов")
+            elif profile.get("other_encumbrance"):
+                parts.append("иное ограничение/обременение — проверить условия и влияние на сделку")
+
+            if profile.get("recent_right_level") in {"high", "medium", "low"}:
+                parts.append(f"свежая регистрационная запись: {profile.get('recent_right_date') or 'дата не определена'}")
+            if profile.get("frequent_transitions_level") in {"high", "medium", "low"}:
+                parts.append("частые регистрационные события/переходы")
+            if profile.get("basis_flags"):
+                parts.append("особое основание: " + ", ".join(profile.get("basis_flags") or []))
+            if profile.get("share_or_multiple_rights"):
+                parts.append("доли/несколько прав")
+
+            add_factor("ЕГРН", pts, ", ".join(parts) if parts else "объект требует дополнительной проверки", severity)
 
         elif "ФССП" in title:
             actual = ((item.get("data") or {}).get("actual_debt") or 0) if isinstance(item.get("data"), dict) else 0
             if actual > 1_000_000:
-                pts = 40
+                pts, sev = 38, "high"
             elif actual > 300_000:
-                pts = 30
+                pts, sev = 28, "high"
             elif actual > 50_000:
-                pts = 20
+                pts, sev = 18, "medium"
             elif actual > 0:
-                pts = 12
+                pts, sev = 10, "medium"
             else:
-                pts = 6
-            score += pts
-            factors.append(f"ФССП: активные/неоднозначные ИП, актуальная сумма {rub(actual)} (+{pts})")
+                pts, sev = 5, "attention"
+            add_factor("ФССП", pts, f"активные/неоднозначные ИП, актуальная сумма {rub(actual)}", sev)
 
         elif "Банкрот" in title:
             bdata = item.get("data") or {}
@@ -1187,24 +1540,17 @@ def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> 
             property_words = bool(bdata.get("property_related_words")) if isinstance(bdata, dict) else False
 
             if bstatus == "active":
-                pts = 75
-                factors.append("Банкротство: есть признаки действующей/незавершенной процедуры (+75)")
+                add_factor("Банкротство", 75, "есть признаки действующей/незавершенной процедуры", "critical")
             elif months is not None and months < 12:
-                pts = 42
-                factors.append("Банкротство: после значимой публикации прошло менее 1 года (+42)")
+                add_factor("Банкротство", 38, "после значимой публикации прошло менее 1 года", "high")
             elif months is not None and months < 36:
-                pts = 32
-                factors.append("Банкротство: после значимой публикации прошло менее 3 лет (+32)")
+                add_factor("Банкротство", 28, "после значимой публикации прошло менее 3 лет", "high")
             elif property_words:
-                pts = 28
-                factors.append("Банкротство: процедура выглядит завершенной, но есть имущественные формулировки в публикациях (+28)")
+                add_factor("Банкротство", 24, "есть имущественные формулировки в публикациях", "medium")
             elif bstatus == "completed":
-                pts = 20
-                factors.append("Банкротство: процедура выглядит завершенной, нужен ручной контроль документов (+20)")
+                add_factor("Банкротство", 16, "процедура выглядит завершенной, нужен контроль документов", "medium")
             else:
-                pts = 24
-                factors.append("Банкротство: сведения найдены, статус требует ручной проверки (+24)")
-            score += pts
+                add_factor("Банкротство", 22, "сведения найдены, статус требует ручной проверки", "medium")
 
         elif "Арбитраж" in title or "ГАС" in title:
             cases = item.get("data") if isinstance(item.get("data"), list) else []
@@ -1213,86 +1559,94 @@ def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> 
             weak = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "слабое совпадение"])
 
             if strong:
-                pts = 25 + min(20, strong * 7 + probable * 2)
-            elif probable:
-                pts = 10 + min(12, probable * 2)
+                pts = 18 + min(18, strong * 6 + probable * 1)
+                sev = "medium"
             else:
-                pts = 4
-
-            score += pts
+                # Should rarely happen now because probable/weak are manual_check.
+                pts = 3
+                sev = "manual"
             source_name = "Арбитражные суды" if "Арбитраж" in title else "ГАС Правосудие"
-            factors.append(f"{source_name}: точных {strong}, вероятных {probable}, слабых {weak} (+{pts})")
+            add_factor(source_name, pts, f"точных {strong}, вероятных {probable}, слабых {weak}; учитываются только надежно идентифицированные совпадения", sev)
 
         elif "Паспорт" in title:
-            score += 40
-            factors.append("Паспорт МВД: выявлен риск по действительности документа (+40)")
+            add_factor("Паспорт МВД", 40, "выявлен риск по действительности документа", "critical")
         else:
-            score += 18
-            factors.append(f"{title}: выявлен риск (+18)")
+            add_factor(title, 16, "выявлен риск", "medium")
 
-    fssp_flag = any("ФССП" in x.get("title", "") and x.get("status") == "risk" for x in checklist)
-    bankrupt_flag = any("Банкрот" in x.get("title", "") and x.get("status") == "risk" for x in checklist)
-    egrn_flag = any("ЕГРН" in x.get("title", "") and x.get("status") == "risk" for x in checklist)
+    fssp_item = next((x for x in checklist if "ФССП" in x.get("title", "")), None)
+    egrn_item = next((x for x in checklist if "ЕГРН" in x.get("title", "")), None)
+    bankruptcy_item = next((x for x in checklist if "Банкрот" in x.get("title", "")), None)
+
+    fssp_flag = bool(fssp_item and fssp_item.get("status") == "risk")
+    bankrupt_flag = bool(bankruptcy_item and bankruptcy_item.get("status") == "risk")
+    egrn_flag = bool(egrn_item and egrn_item.get("status") == "risk")
+
+    egrn_profile = {}
+    if egrn_item and isinstance(egrn_item.get("data"), dict):
+        egrn_profile = egrn_item.get("data", {}).get("_egrn_risk_profile") or {}
+        if not isinstance(egrn_profile, dict):
+            egrn_profile = {}
+
+    actual_debt = 0
+    if fssp_item and isinstance(fssp_item.get("data"), dict):
+        actual_debt = float(fssp_item.get("data", {}).get("actual_debt") or 0)
+
+    bankruptcy_status = None
+    if bankruptcy_item and isinstance(bankruptcy_item.get("data"), dict):
+        bankruptcy_status = bankruptcy_item.get("data", {}).get("bankruptcy_status")
 
     if fssp_flag and bankrupt_flag:
-        score += 10
-        factors.append("Комбинация рисков: ФССП + банкротство (+10)")
+        add_factor("Комбинация", 8, "ФССП + банкротство", "high")
     if fssp_flag and egrn_flag:
-        score += 15
-        factors.append("Комбинация рисков: ФССП + ограничения по объекту (+15)")
+        add_factor("Комбинация", 5, "ФССП + ЕГРН-факторы по объекту", "medium")
     if bankrupt_flag and egrn_flag:
-        score += 12
-        factors.append("Комбинация рисков: банкротство + ограничения ЕГРН (+12)")
+        add_factor("Комбинация", 5, "банкротство + ЕГРН-факторы по объекту", "medium")
 
-    # Critical trigger should be rare. It is not used for completed bankruptcy
-    # or probable court matches.
     critical = False
-    for item in checklist:
-        title = item.get("title", "")
-        details_text = " ".join(item.get("details") or []).lower()
-
-        if "ЕГРН" in title and item.get("status") == "risk":
-            if "запрещение регистрации" in details_text or "запрет" in details_text:
-                critical = True
-
-        if "Банкрот" in title:
-            data = item.get("data") or {}
-            if isinstance(data, dict) and data.get("bankruptcy_status") == "active":
-                critical = True
-
-        if "ФССП" in title:
-            actual = ((item.get("data") or {}).get("actual_debt") or 0) if isinstance(item.get("data"), dict) else 0
-            # Large debt is critical only together with object restrictions.
-            if actual > 500_000 and egrn_flag:
-                critical = True
-
+    if bankruptcy_status == "active":
+        critical = True
+    if any("Паспорт" in x.get("title", "") and x.get("status") == "risk" for x in checklist):
+        critical = True
     if age is not None and age >= 85:
+        critical = True
+    # ЕГРН restriction becomes critical only with very heavy unmanaged seller risk.
+    if egrn_profile.get("registration_ban") and (bankruptcy_status == "active" or actual_debt > 1_000_000):
         critical = True
 
     if critical:
         score = max(score, 85)
-        factors.append("Обнаружен подтвержденный критический триггер — аванс (задаток) только после устранения риска")
+        factors.append("Критический триггер: подтвержденный жесткий риск — аванс только после устранения/документального контроля")
+        factor_rows.append({"source": "Критический триггер", "points": 0, "severity": "critical", "text": "аванс только после устранения/документального контроля"})
 
     score = max(0, min(100, int(score)))
     if score >= 85:
-        level = "ОПАСНО"
-        label = "ОПАСНО при самостоятельной сделке"
+        level = "опасная"
+        label = "Опасно при самостоятельной сделке"
         conclusion = "Аванс (задаток) и сделку нельзя проводить без ручной юридической проверки, устранения ключевых рисков и безопасной схемы расчетов."
     elif score >= 60:
-        level = "РИСКОВАННО"
-        label = "РИСКОВАННО без контроля условий сделки"
+        level = "высокорискованная"
+        label = "Высокий риск при самостоятельной сделке"
         conclusion = "Сделку можно рассматривать только после уточнения рисков, проверки документов и жестких защитных условий в авансе (задатке)/ПДКП."
     elif score >= 35:
-        level = "РИСКОВАННО"
-        label = "РИСКОВАННО, требуется дополнительная проверка"
+        level = "условно рискованная"
+        label = "Условно рискованно при самостоятельной сделке"
         conclusion = "Критический стоп-фактор по автоматическим данным не подтвержден, но до аванса (задатка) нужно закрыть ручные проверки и внести защитные условия в документы."
     else:
-        level = "ДОПУСТИМО"
-        label = "ДОПУСТИМО к дальнейшему рассмотрению"
+        level = "допустимая"
+        label = "Допустимо к дальнейшему рассмотрению"
         conclusion = "По автоматическим источникам критичных рисков не выявлено, но отчет не заменяет ручную юридическую проверку документов."
 
-    return {"score": score, "max_score": 100, "level": level, "label": label, "conclusion": conclusion, "factors": factors}
-
+    factor_rows_sorted = sorted(factor_rows, key=lambda x: int(x.get("points") or 0), reverse=True)
+    return {
+        "score": score,
+        "max_score": 100,
+        "level": level,
+        "label": label,
+        "conclusion": conclusion,
+        "factors": factors,
+        "factor_rows": factor_rows_sorted,
+        "top_factors": factor_rows_sorted[:7],
+    }
 
 def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRequest] = None) -> List[Dict[str, str]]:
     recs: List[Dict[str, str]] = []
@@ -1311,8 +1665,26 @@ def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRe
     pravosud = by_title.get("Суды общей юрисдикции / ГАС Правосудие")
 
     if egrn and egrn.get("status") == "risk":
-        recs.append({"priority": "critical", "title": "Требовать снятие ограничения до основной сделки", "text": "По ЕГРН выявлены ограничения/обременения. До аванса (задатка) нужно получить основание ограничения и прописать обязанность продавца снять его в конкретный срок."})
-        recs.append({"priority": "critical", "title": "Не передавать деньги напрямую продавцу", "text": "При запрете регистрации использовать нотариальный депозит или аккредитив с раскрытием денег только после снятия ограничения и регистрации перехода права."})
+        egrn_data = egrn.get("data") if isinstance(egrn.get("data"), dict) else {}
+        profile = egrn_data.get("_egrn_risk_profile") if isinstance(egrn_data, dict) else {}
+        if not isinstance(profile, dict):
+            profile = {}
+
+        if profile.get("registration_ban"):
+            recs.append({"priority": "critical", "title": "Разобрать основание запрета/ареста по ЕГРН", "text": "По ЕГРН есть признаки запрета/ареста/ограничения регистрационных действий. До аванса нужно получить основание ограничения, срок и порядок снятия. Деньги передавать только по схеме, где раскрытие происходит после снятия ограничения и регистрации перехода права."})
+        elif profile.get("manageable_encumbrance"):
+            recs.append({"priority": "high", "title": "Выстроить схему снятия ипотеки/залога", "text": "Ипотека или залог не всегда мешают сделке, но требуют правильной схемы: банк, аккредитив, депозит, погашение с контролем снятия записи и регистрация перехода права только после выполнения условий."})
+        elif profile.get("other_encumbrance"):
+            recs.append({"priority": "high", "title": "Проверить условия обременения", "text": "По ЕГРН есть обременение без явного запрета регистрации. Нужно понять его основание, срок действия, порядок прекращения и влияние на возможность продажи."})
+
+        if profile.get("recent_right_level") in {"high", "medium", "low"}:
+            recs.append({"priority": "high", "title": "Проверить свежую регистрацию права", "text": "Право или значимая регистрационная запись появились недавно. До аванса нужно проверить основание приобретения, документы-основания, причину быстрой продажи и связь с возможными долгами/банкротством/судами."})
+        if profile.get("frequent_transitions_level") in {"high", "medium", "low"}:
+            recs.append({"priority": "high", "title": "Проверить цепочку переходов права", "text": "Есть признаки частых регистрационных событий или переходов. Нужно запросить историю переходов права, проверить предыдущие основания и исключить оспоримые сделки в цепочке."})
+        if profile.get("basis_flags"):
+            recs.append({"priority": "medium", "title": "Разобрать основание приобретения", "text": "В ЕГРН/ответе найдены признаки особого основания: " + ", ".join(profile.get("basis_flags") or []) + ". Для каждого основания нужен отдельный комплект документов и проверка риска оспаривания."})
+        if profile.get("share_or_multiple_rights"):
+            recs.append({"priority": "medium", "title": "Проверить доли, сособственников и согласия", "text": "Есть признаки долей, нескольких прав или совместной собственности. Нужно проверить всех правообладателей, согласия, преимущественное право покупки, брачный режим и возможные детские доли."})
     if fssp and fssp.get("status") == "risk":
         actual = ((fssp.get("data") or {}).get("actual_debt") or 0) if isinstance(fssp.get("data"), dict) else 0
         recs.append({"priority": "high", "title": "Закрыть активные ИП до сделки или через контролируемые расчеты", "text": f"Актуальная сумма по активным/неоднозначным ИП: {rub(actual)}. В ПДКП прописать порядок погашения и последствия неснятия ограничений."})
@@ -1379,50 +1751,76 @@ def build_screen_report(req: CheckRequest, checklist: List[Dict[str, Any]], scor
     }
 
 
+
 def build_local_legal_report(req: CheckRequest, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], recs: List[Dict[str, str]]) -> str:
+    """Deterministic legal conclusion. It is intentionally structured without numbered headings
+    so the PDF never gets an empty “6.” section from model output.
+    """
     risks = [x for x in checklist if x.get("status") == "risk"]
     oks = [x for x in checklist if x.get("status") == "ok"]
     manual = [x for x in checklist if x.get("status") == "manual_check"]
-    seller = fio(req)
-    dob_ru = normalize_dob(req.dob)[0]
-    prop = normalize_property(req)["query"]
-    lines = []
-    lines.append("1. Краткий вывод")
-    lines.append(f"Оценка при самостоятельной сделке без сопровождения: {scoring.get('label')} ({scoring.get('score')}/100). {scoring.get('conclusion')}")
-    lines.append("")
-    lines.append("2. Что проверено")
-    lines.append(f"Продавец: {seller}. Дата рождения: {dob_ru}. ИНН: {'передан' if normalize_inn(req) else 'не передан'}. Объект: {prop}.")
-    lines.append(f"Проверено без явных рисков: {len(oks)}. Рисков: {len(risks)}. Требуют ручной проверки: {len(manual)}.")
-    lines.append("")
-    lines.append("3. Скрытые риски, которые нужно проверить по документам")
-    for h in build_hidden_risks(req):
-        lines.append(f"- {h.get('risk')}: {h.get('why')} ({h.get('law')})")
-    lines.append("")
-    lines.append("4. Основные риски")
-    if risks:
-        for r in risks:
-            lines.append(f"- {r.get('title')}: {r.get('summary')}")
-    else:
-        lines.append("- По автоматическим источникам явные риски не выявлены.")
-    lines.append("")
-    lines.append("5. Что говорит в пользу сделки")
-    if oks:
-        for o in oks:
-            lines.append(f"- {o.get('title')}: {o.get('summary')}")
-    else:
-        lines.append("- Нет блоков, которые можно считать полностью подтвержденными без замечаний.")
-    lines.append("")
-    lines.append("6. Что обязательно сделать до аванса (задатка)")
-    for rec in recs:
-        lines.append(f"- {rec.get('title')}: {rec.get('text')}")
-    lines.append("")
-    lines.append("7. Безопасная схема расчетов")
-    lines.append("При выявленных долгах, запретах или неполных данных не передавать деньги напрямую продавцу. Использовать нотариальный депозит, аккредитив или иную условную схему с раскрытием денег только после выполнения условий.")
-    lines.append("")
-    lines.append("8. Итоговое заключение")
-    lines.append("Отчет не обещает 100% безопасность сделки. При выявленных ограничениях, активных ИП или судебных делах сделка должна проходить только после ручного юридического анализа документов и условий расчетов.")
-    return strip_markdown_noise("\n".join(lines))
+    score = int(scoring.get("score") or 0)
+    label = scoring.get("label") or "оценка не определена"
+    advance = build_advance_decision(scoring)
 
+    def names(items: List[Dict[str, Any]]) -> str:
+        return ", ".join([str(x.get("title") or "источник") for x in items]) or "нет"
+
+    lines: List[str] = []
+
+    lines.append("Краткий вывод")
+    lines.append(f"Итоговая оценка риска: {label} ({score}/100). {scoring.get('conclusion') or ''}")
+    lines.append(f"Решение по авансу: {advance.get('decision')}. {advance.get('comment')}")
+    lines.append("")
+
+    lines.append("Что подтверждено автоматическими источниками")
+    if oks:
+        for item in oks:
+            lines.append(f"• {item.get('title')}: {item.get('summary')}")
+    else:
+        lines.append("• По автоматическим источникам нет полностью подтвержденных блоков; требуется ручная проверка.")
+    lines.append("")
+
+    lines.append("Что не подтверждено и требует ручной проверки")
+    if manual:
+        for item in manual:
+            lines.append(f"• {item.get('title')}: {item.get('summary')}")
+    else:
+        lines.append("• Источников со статусом ручной проверки нет.")
+    lines.append("")
+
+    lines.append("Ключевые риски")
+    if risks:
+        for item in risks:
+            lines.append(f"• {item.get('title')}: {item.get('summary')}")
+    else:
+        lines.append("• Явные риски по автоматическим источникам не выявлены. Это не отменяет проверки документов по объекту и истории переходов права.")
+    lines.append("")
+
+    lines.append("Что проверить до аванса")
+    for rec in recs[:8]:
+        lines.append(f"• {rec.get('title')}: {rec.get('text')}")
+    lines.append("")
+
+    lines.append("Как передавать аванс")
+    lines.append("Аванс или задаток передавать только после сверки документов и ручной проверки всех источников со статусом «ручная проверка» или «требует внимания». В соглашении нужно прямо прописать раскрытие продавцом долгов, банкротства, судебных споров, ограничений, зарегистрированных лиц и оснований возврата денег, если сведения не подтвердятся.")
+    lines.append("")
+
+    lines.append("Итоговое заключение")
+    if score >= 85:
+        lines.append("Передавать аванс и выходить на сделку без устранения выявленных рисков нельзя. Сначала нужно вручную подтвердить судебные и имущественные обстоятельства, закрыть вопросы по банкротству/долгам/ограничениям и только после этого обсуждать безопасную схему расчетов.")
+    elif score >= 60:
+        lines.append("Сделку можно рассматривать только как условно допустимую: до аванса необходимо закрыть ручные проверки, закрепить защитные условия в соглашении и не передавать деньги без понятной схемы выхода из сделки.")
+    elif score >= 35:
+        lines.append("Критический стоп-фактор автоматически не подтвержден, но до передачи денег нужно закрыть открытые вопросы и получить документы, которые подтверждают юридическую чистоту продавца и объекта.")
+    else:
+        lines.append("По автоматическим источникам критичные признаки не выявлены, но отчет не заменяет анализ правоустанавливающих документов, истории объекта, семейного статуса продавца и зарегистрированных лиц.")
+    lines.append("")
+
+    lines.append("Важно")
+    lines.append("Отчет носит информационно-аналитический характер, не является гарантией полной юридической безопасности сделки и не заменяет ручную юридическую проверку документов специалистом.")
+
+    return strip_markdown_noise("\n".join(lines))
 
 def build_gigachat_safe_payload(req: CheckRequest, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], recs: List[Dict[str, str]]) -> Dict[str, Any]:
     """Send the model facts, not a full personal profile.
@@ -1547,43 +1945,64 @@ def redact_sensitive_from_ai_text(text: str) -> str:
 
 
 
+
 def normalize_legal_report_format(text: str) -> str:
-    """Normalize LLM output into readable legal sections before PDF rendering."""
+    """Normalize LLM/local output into readable legal sections before PDF rendering.
+    Protects the PDF from empty numbered headings like “6.” and duplicate title blocks.
+    """
     if not text:
         return ""
     s = strip_markdown_noise(text)
 
-    # Remove literal template arrows if the model echoed instructions instead of using them naturally.
-    s = s.replace("Факт → Юридическое значение → Риск для покупателя → Что сделать до аванса", "")
-    s = s.replace("Факт -> Юридическое значение -> Риск для покупателя -> Что сделать до аванса", "")
+    # Remove duplicated outer PDF title if the model echoed it.
+    s = re.sub(r"(?im)^\s*(юридическое заключение|экспертное заключение по сделке)\s*$", "", s)
 
-    # Ensure major sections start on separate lines even if GigaChat returned a continuous paragraph.
-    section_titles = [
-        "Краткий вывод",
-        "Надежность полученных данных",
-        "Риски продавца",
-        "Риски объекта",
-        "Скрытые риски, которые нужно проверить документами",
-        "Можно ли передавать аванс (задаток)",
-        "Что проверить до аванса (задатка)",
-        "Что прописать в авансовом соглашении / соглашении о задатке / ПДКП",
-        "Безопасная схема расчетов",
-        "Итоговое заключение",
-        "Важно",
-    ]
-    for title in section_titles:
-        # If a title appears in the middle of a sentence-like line, make it a new paragraph.
-        s = re.sub(rf"(?<!^)(?<!\n)(\s*)({re.escape(title)})(\s*)", rf"\n\n\2\n", s)
+    # Remove empty numbered headings: "6.", "10.", etc.
+    s = re.sub(r"(?m)^\s*\d{1,2}\.\s*$", "", s)
 
-    # Number unnumbered headings for PDF parser consistency.
-    for i, title in enumerate(section_titles, start=1):
-        s = re.sub(rf"(?m)^\s*(?:{i}\.\s*)?{re.escape(title)}\s*$", f"{i}. {title}", s)
+    # Normalize a common typo from the old prompt.
+    s = s.replace("ЧТО В ВЫГЛЯДИТ НОРМАЛЬНО", "ЧТО ВЫГЛЯДИТ НОРМАЛЬНО")
+
+    # Heading canonicalization. Keep headings unnumbered; the PDF already has outer numbering.
+    aliases = {
+        "краткий вывод": "Краткий вывод",
+        "что выглядит нормально": "Что выглядит нормально",
+        "что подтверждено": "Что подтверждено автоматическими источниками",
+        "что подтверждено автоматическими источниками": "Что подтверждено автоматическими источниками",
+        "что не подтверждено": "Что не подтверждено и требует ручной проверки",
+        "что не подтверждено и требует ручной проверки": "Что не подтверждено и требует ручной проверки",
+        "на что обратить внимание": "Ключевые риски",
+        "ключевые риски": "Ключевые риски",
+        "что нужно проверить до аванса (задатка)": "Что проверить до аванса",
+        "что проверить до аванса": "Что проверить до аванса",
+        "как правильно передавать аванс (задаток)": "Как передавать аванс",
+        "как передавать аванс": "Как передавать аванс",
+        "итоговое заключение": "Итоговое заключение",
+        "итог": "Итоговое заключение",
+        "важно": "Важно",
+    }
+
+    out_lines: List[str] = []
+    for raw in s.splitlines():
+        line = raw.strip()
+        if not line:
+            out_lines.append("")
+            continue
+
+        # "1. Краткий вывод" -> "Краткий вывод"
+        line_no = re.sub(r"^\d{1,2}\.\s*", "", line).strip()
+        key = line_no.lower().rstrip(":")
+        if key in aliases:
+            out_lines.append(aliases[key])
+        else:
+            out_lines.append(line)
+
+    s = "\n".join(out_lines)
 
     # Normalize list markers.
     s = re.sub(r"(?m)^\s*[-–—]\s+", "• ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
-
 
 def enforce_ai_report_text(text: str, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], req: CheckRequest) -> str:
     """Post-process LLM text so it cannot override backend facts."""
@@ -1605,6 +2024,8 @@ def enforce_ai_report_text(text: str, checklist: List[Dict[str, Any]], scoring: 
         "предположительно затрагивающих интересы последнего": "требующих ручной проверки роли и предмета",
         "конфликтах имущественного характера": "судебных материалах, требующих ручной идентификации",
         "сделка крайне опасна": "сделка требует усиленной ручной проверки",
+        "обременение делает сделку невозможной": "обременение требует правильной схемы сделки и контроля снятия/учета",
+        "ограничение делает сделку невозможной": "ограничение требует проверки основания и порядка снятия/учета",
         "категорически недопустима": "недопустима без предварительной ручной проверки и защитных условий",
         "убедиться, что жилье приобреталось с использованием средств материнского капитала": "проверить, не приобреталось ли жилье с использованием средств материнского капитала",
         "использовалось с использованием материнского капитала": "не использовалось ли с применением материнского капитала",
@@ -1664,83 +2085,35 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
 
     payload = build_gigachat_safe_payload(req, checklist, scoring, recs)
     prompt = (
-    "Ты практикующий юрист по недвижимости в Санкт-Петербурге с опытом более 20 лет. "
-    "Ты готовишь платное юридическое заключение для покупателя квартиры.\n\n"
-
-    "ВАЖНО:\n"
-    "- Не придумывай факты\n"
-    "- Не усиливай риски без оснований\n"
-    "- Не противоречь входным данным\n"
-    "- Не делай предположений без пометки, что это проверка\n\n"
-
-    "КЛЮЧЕВОЕ ПРАВИЛО:\n"
-    "Ты не оцениваешь риск — риск уже посчитан системой.\n"
-    "Ты только объясняешь его.\n\n"
-
-    "СТРОГО ЗАПРЕЩЕНО:\n"
-    "- писать 'сделка запрещена', если score < 85\n"
-    "- писать 'категорически нельзя', если нет ЕГРН запрета или активного банкротства\n"
-    "- называть судебные совпадения установленными фактами\n"
-    "- писать обременения, если ЕГРН = ok\n"
-    "- усиливать риск сверх указанного score\n\n"
-
-    "ИНТЕРПРЕТАЦИЯ SCORE:\n"
-    "0–34 → допустимо\n"
-    "35–59 → осторожно\n"
-    "60–84 → допустимо только при условиях\n"
-    "85–100 → высокий риск, возможен отказ от сделки\n\n"
-
-    "ОСОБО ВАЖНО:\n"
-    "- завершенное банкротство не является запретом сделки\n"
-    "- судебные совпадения без идентификации — это не факт\n"
-    "- отсутствие долгов ФССП снижает общий риск\n"
-    "- чистый ЕГРН означает отсутствие обременений\n\n"
-
-    "СТИЛЬ:\n"
-    "Пиши как юрист, который объясняет клиенту:\n"
-    "- уверенно\n"
-    "- спокойно\n"
-    "- без воды\n"
-    "- без шаблонных фраз\n\n"
-
-    "НЕ ПИШИ СУХО:\n"
-    "Не используй формат 'Факт → Риск → Действие'\n"
-    "Пиши живыми абзацами, но структурированно\n\n"
-
-    "СТРУКТУРА ОТЧЕТА:\n\n"
-
-    "1. КРАТКИЙ ВЫВОД\n"
-    "Коротко объясни ситуацию: можно ли рассматривать сделку и на каких условиях.\n\n"
-
-    "2. ЧТО В ВЫГЛЯДИТ НОРМАЛЬНО\n"
-    "Кратко перечисли, что снижает риск.\n\n"
-
-    "3. НА ЧТО ОБРАТИТЬ ВНИМАНИЕ\n"
-    "Только реальные риски, без нагнетания.\n\n"
-
-    "4. ЧТО НУЖНО ПРОВЕРИТЬ ДО АВАНСА (ЗАДАТКА)\n"
-    "Конкретные действия.\n\n"
-
-    "5. КАК ПРАВИЛЬНО ПЕРЕДАВАТЬ АВАНС (ЗАДАТОК)\n"
-    "Безопасная логика.\n\n"
-
-    "6. ИТОГОВОЕ ЗАКЛЮЧЕНИЕ\n"
-    "Финальный вывод без противоречий.\n\n"
-
-    "ЮРИДИЧЕСКИЕ ССЫЛКИ:\n"
-    "Добавляй статьи закона только там, где это реально усиливает вывод:\n"
-    "- ст. 166–181 ГК РФ\n"
-    "- ст. 35 СК РФ\n"
-    "- ст. 250 ГК РФ\n"
-    "- ст. 37 ГК РФ\n"
-    "- ст. 61.2–61.3 ФЗ-127\n\n"
-
-    "ДАННЫЕ ДЛЯ АНАЛИЗА:\n"
-    f"Score: {scoring.get('score')}/100\n"
-    f"Уровень: {scoring.get('label')}\n"
-    f"Вывод системы: {scoring.get('conclusion')}\n\n"
-    + json.dumps(payload, ensure_ascii=False)
-)
+        "Ты юрист по недвижимости в Санкт-Петербурге. Подготовь экспертное заключение для покупателя квартиры.\n\n"
+        "ЖЕСТКИЕ ПРАВИЛА:\n"
+        "1) Не придумывай факты и не противоречь данным.\n"
+        "2) Не используй нумерацию разделов. Пиши только заголовки без цифр.\n"
+        "3) Не пиши пустые разделы.\n"
+        "4) Не повторяй заголовок 'Юридическое заключение'.\n"
+        "5) Если источник имеет статус manual_check — пиши, что данные НЕ подтверждены и нужна ручная проверка.\n"
+        "6) Если ФССП не дал результат — запрещено писать, что долгов нет.\n"
+        "7) Если ЕГРН = ok — запрещено писать, что есть обременения или ограничения.\n"
+        "7.1) Если ЕГРН выявил ограничение/обременение — не называй это автоматической катастрофой. Пиши: риск требует проверки основания, суммы, держателя и схемы снятия/учета до регистрации.\n"
+        "8) Судебные совпадения без точной идентификации называй совпадениями, а не установленными делами продавца. Вероятные и слабые совпадения — это ручная проверка, не доказанный риск.\n"
+        "9) Завершенное банкротство не является автоматическим запретом сделки, но требует проверки дела и связи объекта с процедурой.\n"
+        "10) ИНН, паспорт и дату рождения в тексте не раскрывай.\n\n"
+        "СТРУКТУРА, строго в таком порядке, без цифр:\n"
+        "Краткий вывод\n"
+        "Что подтверждено автоматическими источниками\n"
+        "Что не подтверждено и требует ручной проверки\n"
+        "Ключевые риски\n"
+        "Что проверить до аванса\n"
+        "Как передавать аванс\n"
+        "Итоговое заключение\n"
+        "Важно\n\n"
+        "Стиль: дорогое юридическое заключение, понятно для клиента, без воды, без markdown-таблиц.\n\n"
+        f"Score: {scoring.get('score')}/100\n"
+        f"Уровень: {scoring.get('label')}\n"
+        f"Вывод системы: {scoring.get('conclusion')}\n\n"
+        "ДАННЫЕ:\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
 
     try:
         def _call() -> str:
@@ -1750,36 +2123,31 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
 
         text = redact_sensitive_from_ai_text(await asyncio.to_thread(_call))
         text = enforce_ai_report_text(text, checklist, scoring, req)
+        text = normalize_legal_report_format(text)
         if not text or is_gigachat_refusal(text):
+            return fallback
+        # If model produced a suspiciously short or structurally broken answer, use deterministic fallback.
+        required = ["Краткий вывод", "Итоговое заключение", "Важно"]
+        if not all(x in text for x in required):
             return fallback
         return text
     except Exception:
         return fallback
 
-
-
 def pdf_report_blocks(text: str) -> List[Tuple[str, str]]:
     """Return (kind, text) blocks for readable PDF rendering."""
     text = normalize_legal_report_format(text or "")
-    text = re.sub(r"(?m)^\s*[-–—]\s+", "• ", text)
-
-    # Additional protection: if model still put heading and body on one line,
-    # split after known numbered headings.
-    section_titles = [
+    heading_set = {
         "Краткий вывод",
-        "Надежность полученных данных",
-        "Риски продавца",
-        "Риски объекта",
-        "Скрытые риски, которые нужно проверить документами",
-        "Можно ли передавать аванс (задаток)",
-        "Что проверить до аванса (задатка)",
-        "Что прописать в авансовом соглашении / соглашении о задатке / ПДКП",
-        "Безопасная схема расчетов",
+        "Что выглядит нормально",
+        "Что подтверждено автоматическими источниками",
+        "Что не подтверждено и требует ручной проверки",
+        "Ключевые риски",
+        "Что проверить до аванса",
+        "Как передавать аванс",
         "Итоговое заключение",
         "Важно",
-    ]
-    for i, title in enumerate(section_titles, start=1):
-        text = re.sub(rf"(?m)^({i}\.\s*{re.escape(title)})\s+(.+)$", rf"\1\n\2", text)
+    }
 
     lines = [ln.strip() for ln in text.splitlines()]
     blocks: List[Tuple[str, str]] = []
@@ -1795,9 +2163,12 @@ def pdf_report_blocks(text: str) -> List[Tuple[str, str]]:
         if not ln:
             flush()
             continue
-        if re.match(r"^\d{1,2}\.\s+", ln):
+        clean = re.sub(r"^\d{1,2}\.\s*", "", ln).strip().rstrip(":")
+        if not clean:
+            continue
+        if clean in heading_set:
             flush()
-            blocks.append(("h", ln))
+            blocks.append(("h", clean))
         elif ln.startswith("•"):
             flush()
             blocks.append(("bullet", ln[1:].strip()))
@@ -1805,8 +2176,6 @@ def pdf_report_blocks(text: str) -> List[Tuple[str, str]]:
             buf.append(ln)
     flush()
     return blocks
-
-# ---------- PDF ----------
 
 def register_pdf_font() -> str:
     if not REPORTLAB_AVAILABLE:
@@ -1833,53 +2202,65 @@ def p(text: Any) -> str:
 
 
 
-def build_score_bar(score: int, level: str = "", font_name: str = "Helvetica") -> Any:
-    """Premium PDF scoring scale with pointer and score inside the scale."""
-    score = max(0, min(100, int(score or 0)))
-    width = 180 * mm
-    height = 25 * mm
-    left = 8 * mm
-    bar_y = 9 * mm
-    bar_w = 164 * mm
-    bar_h = 8 * mm
-    x = left + (score / 100) * bar_w
+class RiskScoreBar(Flowable):
+    """Small premium score bar: green → yellow → red with a marker and score inside."""
+    def __init__(self, score: int, width: float = 180*mm, height: float = 18*mm):
+        Flowable.__init__(self)
+        self.score = max(0, min(100, int(score or 0)))
+        self.width = width
+        self.height = height
 
-    d = Drawing(width, height)
+    def draw(self):
+        c = self.canv
+        w = self.width
+        h = self.height
+        x0 = 0
+        y0 = 5*mm
+        bar_h = 6*mm
 
-    # Soft background / border
-    d.add(Rect(0, 0, width, height, fillColor=colors.HexColor("#FFFFFF"), strokeColor=colors.HexColor("#D8DEE5"), strokeWidth=0.4))
+        # Rounded background
+        c.setFillColor(colors.HexColor("#F5F3EF"))
+        c.roundRect(x0, y0, w, bar_h, 3*mm, fill=1, stroke=0)
 
-    # Risk zones
-    d.add(Rect(left, bar_y, bar_w * 0.35, bar_h, fillColor=colors.HexColor("#2E7D59"), strokeWidth=0))
-    d.add(Rect(left + bar_w * 0.35, bar_y, bar_w * 0.25, bar_h, fillColor=colors.HexColor("#D4A373"), strokeWidth=0))
-    d.add(Rect(left + bar_w * 0.60, bar_y, bar_w * 0.40, bar_h, fillColor=colors.HexColor("#8B1E1E"), strokeWidth=0))
+        # Segmented gradient-like bar
+        segments = 60
+        for i in range(segments):
+            ratio = i / max(1, segments - 1)
+            if ratio < 0.35:
+                col = colors.HexColor("#2EAD63")
+            elif ratio < 0.70:
+                col = colors.HexColor("#E7B742")
+            else:
+                col = colors.HexColor("#C0392B")
+            c.setFillColor(col)
+            c.rect(x0 + w * i / segments, y0, w / segments + 0.5, bar_h, fill=1, stroke=0)
 
-    # Outer line
-    d.add(Rect(left, bar_y, bar_w, bar_h, fillColor=None, strokeColor=colors.HexColor("#0F3D56"), strokeWidth=0.45))
+        # Labels
+        c.setFillColor(colors.HexColor("#6E7F8D"))
+        c.setFont("AppFont" if "AppFont" in pdfmetrics.getRegisteredFontNames() else "Helvetica", 7)
+        c.drawString(x0, y0 - 3.2*mm, "Низкий риск")
+        c.drawCentredString(x0 + w/2, y0 - 3.2*mm, "Средний")
+        c.drawRightString(x0 + w, y0 - 3.2*mm, "Высокий")
 
-    # Pointer inside the scale
-    d.add(Line(x, bar_y - 1.5 * mm, x, bar_y + bar_h + 2.5 * mm, strokeColor=colors.HexColor("#111827"), strokeWidth=1.15))
-    d.add(Polygon(
-        [x, bar_y + bar_h + 3.4 * mm, x - 2.4 * mm, bar_y + bar_h + 7.2 * mm, x + 2.4 * mm, bar_y + bar_h + 7.2 * mm],
-        fillColor=colors.HexColor("#111827"),
-        strokeColor=colors.HexColor("#111827"),
-        strokeWidth=0,
-    ))
+        # Marker
+        mx = x0 + (self.score / 100) * w
+        c.setFillColor(colors.HexColor("#111827"))
+        path = c.beginPath()
+        path.moveTo(mx, y0 + bar_h + 4.2*mm)
+        path.lineTo(mx - 2.4*mm, y0 + bar_h + 0.8*mm)
+        path.lineTo(mx + 2.4*mm, y0 + bar_h + 0.8*mm)
+        path.close()
+        c.drawPath(path, fill=1, stroke=0)
 
-    # Score number inside the bar
-    marker_w = 14 * mm
-    marker_x = min(max(x - marker_w / 2, left), left + bar_w - marker_w)
-    d.add(Rect(marker_x, bar_y + 0.8 * mm, marker_w, bar_h - 1.6 * mm, fillColor=colors.HexColor("#FFFFFF"), strokeColor=colors.HexColor("#111827"), strokeWidth=0.45))
-    d.add(String(marker_x + 4.5 * mm, bar_y + 2.35 * mm, str(score), fontName=font_name, fontSize=8.5, fillColor=colors.HexColor("#111827")))
-
-    # Labels
-    d.add(String(left, 3 * mm, "0", fontName=font_name, fontSize=6.8, fillColor=colors.HexColor("#6E7F8D")))
-    d.add(String(left + bar_w - 6 * mm, 3 * mm, "100", fontName=font_name, fontSize=6.8, fillColor=colors.HexColor("#6E7F8D")))
-    if level:
-        d.add(String(left, 20.2 * mm, str(level).upper(), fontName=font_name, fontSize=9.2, fillColor=colors.HexColor("#0F3D56")))
-
-    return d
-
+        # Score bubble
+        bubble_w = 18*mm
+        bx = min(max(mx - bubble_w/2, x0), x0 + w - bubble_w)
+        by = y0 + bar_h + 5.0*mm
+        c.setFillColor(colors.HexColor("#111827"))
+        c.roundRect(bx, by, bubble_w, 6.2*mm, 2.2*mm, fill=1, stroke=0)
+        c.setFillColor(colors.white)
+        c.setFont("AppFont" if "AppFont" in pdfmetrics.getRegisteredFontNames() else "Helvetica", 8)
+        c.drawCentredString(bx + bubble_w/2, by + 1.8*mm, f"{self.score}/100")
 
 
 def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
@@ -1891,23 +2272,26 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     doc = SimpleDocTemplate(
         buf,
         pagesize=A4,
-        leftMargin=15*mm,
-        rightMargin=15*mm,
-        topMargin=14*mm,
-        bottomMargin=14*mm,
+        leftMargin=14*mm,
+        rightMargin=14*mm,
+        topMargin=12*mm,
+        bottomMargin=13*mm,
     )
 
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="TitleRu", fontName=font, fontSize=21, leading=26, alignment=TA_CENTER, spaceAfter=6, textColor=colors.HexColor("#0F3D56")))
-    styles.add(ParagraphStyle(name="SubtitleRu", fontName=font, fontSize=9.5, leading=13, alignment=TA_CENTER, textColor=colors.HexColor("#3C4853")))
-    styles.add(ParagraphStyle(name="H1Ru", fontName=font, fontSize=14.2, leading=18, spaceBefore=10, spaceAfter=5, textColor=colors.HexColor("#0F3D56")))
-    styles.add(ParagraphStyle(name="H2Ru", fontName=font, fontSize=11.5, leading=15, spaceBefore=5, spaceAfter=3, textColor=colors.HexColor("#0F3D56")))
-    styles.add(ParagraphStyle(name="TextRu", fontName=font, fontSize=9.7, leading=14.2, spaceAfter=4.5, textColor=colors.HexColor("#111827")))
-    styles.add(ParagraphStyle(name="SmallRu", fontName=font, fontSize=8.4, leading=11.5, textColor=colors.HexColor("#3C4853")))
-    styles.add(ParagraphStyle(name="TableHeadRu", fontName=font, fontSize=8.8, leading=11.5, textColor=colors.HexColor("#0F3D56")))
-    styles.add(ParagraphStyle(name="BulletRu", fontName=font, fontSize=9.2, leading=13.2, leftIndent=4*mm, firstLineIndent=-2*mm, textColor=colors.HexColor("#111827")))
-    styles.add(ParagraphStyle(name="BadgeRu", fontName=font, fontSize=13, leading=16, alignment=TA_CENTER, textColor=colors.white))
-    styles.add(ParagraphStyle(name="BoxTitleRu", fontName=font, fontSize=10.2, leading=13, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="TitleRu", fontName=font, fontSize=20.5, leading=25, alignment=TA_LEFT, spaceAfter=4, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="SubtitleRu", fontName=font, fontSize=9.3, leading=12.5, alignment=TA_LEFT, textColor=colors.HexColor("#3C4853")))
+    styles.add(ParagraphStyle(name="H1Ru", fontName=font, fontSize=13.4, leading=17, spaceBefore=9, spaceAfter=5, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="H2Ru", fontName=font, fontSize=10.8, leading=14, spaceBefore=6, spaceAfter=3, textColor=colors.HexColor("#0F3D56")))
+    styles.add(ParagraphStyle(name="TextRu", fontName=font, fontSize=9.2, leading=13.4, spaceAfter=4, textColor=colors.HexColor("#111827")))
+    styles.add(ParagraphStyle(name="SmallRu", fontName=font, fontSize=8.25, leading=11.2, textColor=colors.HexColor("#3C4853")))
+    styles.add(ParagraphStyle(name="TableHeadRu", fontName=font, fontSize=8.35, leading=10.8, textColor=colors.white))
+    styles.add(ParagraphStyle(name="TableCellRu", fontName=font, fontSize=8.05, leading=10.8, textColor=colors.HexColor("#111827")))
+    styles.add(ParagraphStyle(name="MutedRu", fontName=font, fontSize=7.7, leading=10.2, textColor=colors.HexColor("#6E7F8D")))
+    styles.add(ParagraphStyle(name="BulletRu", fontName=font, fontSize=8.8, leading=12.4, leftIndent=4*mm, firstLineIndent=-2*mm, textColor=colors.HexColor("#111827")))
+    styles.add(ParagraphStyle(name="BadgeRu", fontName=font, fontSize=11.2, leading=14, alignment=TA_CENTER, textColor=colors.white))
+    styles.add(ParagraphStyle(name="BigScoreRu", fontName=font, fontSize=22, leading=25, alignment=TA_CENTER, textColor=colors.HexColor("#111827")))
+    styles.add(ParagraphStyle(name="BoxTitleRu", fontName=font, fontSize=9.8, leading=12.7, textColor=colors.HexColor("#0F3D56")))
 
     story: List[Any] = []
     scoring = report.get("risk_scoring") or {}
@@ -1916,20 +2300,29 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     norm = report.get("normalized_input") or {}
     advance = report.get("advance_decision") or build_advance_decision(scoring)
     hidden_risks = report.get("hidden_risks") or []
+    score = int(scoring.get("score") or 0)
+    label = str(scoring.get("label") or scoring.get("level") or "Оценка риска")
+    risk_color = "#8B1E1E" if score >= 85 else ("#B7791F" if score >= 60 else ("#D4A373" if score >= 35 else "#1F7A4D"))
 
-    def add_card(title: str, body: Any, *, bg: str = "#FFFFFF", border: str = "#D8DEE5") -> None:
+    def add_card(title: str, body: Any, *, bg: str = "#FFFFFF", border: str = "#D8DEE5", title_color: str = "#0F3D56") -> None:
         content: List[Any] = []
         if title:
-            content.append(Paragraph(p(title), styles["BoxTitleRu"]))
+            local_title = ParagraphStyle(
+                name=f"BoxTitleRu_{abs(hash(title))}",
+                parent=styles["BoxTitleRu"],
+                textColor=colors.HexColor(title_color),
+            )
+            content.append(Paragraph(p(title), local_title))
+            content.append(Spacer(1, 1.5))
         if isinstance(body, list):
             for x in body:
                 content.append(Paragraph(p(x), styles["SmallRu"]))
         else:
             content.append(Paragraph(p(body), styles["SmallRu"]))
-        tbl = Table([[content]], colWidths=[180*mm])
+        tbl = Table([[content]], colWidths=[182*mm])
         tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(bg)),
-            ("BOX", (0, 0), (-1, -1), 0.45, colors.HexColor(border)),
+            ("BOX", (0, 0), (-1, -1), 0.55, colors.HexColor(border)),
             ("LEFTPADDING", (0, 0), (-1, -1), 7),
             ("RIGHTPADDING", (0, 0), (-1, -1), 7),
             ("TOPPADDING", (0, 0), (-1, -1), 6),
@@ -1939,29 +2332,43 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         story.append(tbl)
         story.append(Spacer(1, 5))
 
-    # Cover / header
-    story.append(Paragraph("Комплексный юридический отчет по продавцу и объекту недвижимости", styles["TitleRu"]))
-    story.append(Paragraph("проверка продавца, объекта, судебных и имущественных рисков", styles["SubtitleRu"]))
-    story.append(Paragraph(f"Дата формирования: {p(report.get('created_at'))}", styles["SubtitleRu"]))
-    story.append(Spacer(1, 8))
+    def status_label(status: str) -> str:
+        return {"ok": "ПРОВЕРЕНО", "risk": "РИСК", "manual_check": "РУЧНАЯ ПРОВЕРКА"}.get(status, status or "")
 
-    score = int(scoring.get("score") or 0)
-    level = (scoring.get("level") or "ОЦЕНКА РИСКА").upper()
-    label = scoring.get("label") or level
-    badge_color = "#8B1E1E" if score >= 85 else ("#B7791F" if score >= 35 else "#1F7A4D")
+    def status_bg(status: str) -> str:
+        return {"ok": "#EDF7F1", "risk": "#FFF1F0", "manual_check": "#FFF8EA"}.get(status, "#F5F3EF")
 
-    story.append(build_score_bar(score, level, font))
-    story.append(Spacer(1, 5))
+    def status_fg(status: str) -> str:
+        return {"ok": "#1F7A4D", "risk": "#8B1E1E", "manual_check": "#9A6B12"}.get(status, "#3C4853")
 
-    badge = Table([[Paragraph(f"{p(level)}<br/>{score}/100", styles["BadgeRu"])]], colWidths=[180*mm])
-    badge.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(badge_color)),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor(badge_color)),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    # Header
+    header_left = [
+        Paragraph("Комплексный юридический отчет по продавцу и объекту недвижимости", styles["TitleRu"]),
+        Paragraph("Проверка продавца, объекта, судебных и имущественных рисков", styles["SubtitleRu"]),
+        Paragraph(f"Дата формирования: {p(report.get('created_at'))}", styles["SubtitleRu"]),
+    ]
+    header_right = Table(
+        [[Paragraph(p(label).upper(), styles["BadgeRu"])], [Paragraph(f"{score}/100", styles["BigScoreRu"])]],
+        colWidths=[44*mm],
+    )
+    header_right.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(risk_color)),
+        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#F5F3EF")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#D8DEE5")),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
     ]))
-    story.append(badge)
-    story.append(Spacer(1, 7))
+    header = Table([[header_left, header_right]], colWidths=[134*mm, 48*mm])
+    header.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(header)
+    story.append(Spacer(1, 4))
+    story.append(RiskScoreBar(score, width=182*mm, height=19*mm))
+    story.append(Spacer(1, 5))
 
     add_card(
         "Главный вывод",
@@ -1974,6 +2381,7 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         f"{advance.get('decision')}. {advance.get('comment')}",
         bg="#FFF8EA" if score >= 35 else "#EDF7F1",
         border="#E8C98A" if score >= 35 else "#B8D9C1",
+        title_color=risk_color,
     )
 
     # Input data
@@ -1982,12 +2390,12 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     prop = norm.get("property") or {}
     seller_fio = " ".join([seller.get("last", ""), seller.get("first", ""), seller.get("middle", "")]).strip()
     info_rows = [
-        [Paragraph("Продавец", styles["TableHeadRu"]), Paragraph(p(seller_fio), styles["TextRu"])],
-        [Paragraph("Дата рождения", styles["TableHeadRu"]), Paragraph(p(seller.get("dob")), styles["TextRu"])],
-        [Paragraph("ИНН", styles["TableHeadRu"]), Paragraph(p(seller.get("inn") or ("передан" if seller.get("inn_provided") else "не передан")), styles["TextRu"])],
-        [Paragraph("Объект", styles["TableHeadRu"]), Paragraph(p(prop.get("query")), styles["TextRu"])],
+        [Paragraph("Продавец", styles["TableCellRu"]), Paragraph(p(seller_fio), styles["TableCellRu"])],
+        [Paragraph("Дата рождения", styles["TableCellRu"]), Paragraph(p(seller.get("dob")), styles["TableCellRu"])],
+        [Paragraph("ИНН", styles["TableCellRu"]), Paragraph(p(seller.get("inn") or ("передан" if seller.get("inn_provided") else "не передан")), styles["TableCellRu"])],
+        [Paragraph("Объект", styles["TableCellRu"]), Paragraph(p(prop.get("query")), styles["TableCellRu"])],
     ]
-    info_table = Table(info_rows, colWidths=[42*mm, 138*mm])
+    info_table = Table(info_rows, colWidths=[42*mm, 140*mm])
     info_table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F5F3EF")),
@@ -2000,55 +2408,98 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
     story.append(info_table)
     story.append(Spacer(1, 5))
 
-    # Checklist as premium matrix
+    # Risk factor breakdown
+    top_factors = scoring.get("top_factors") or scoring.get("factor_rows") or []
+    if top_factors:
+        story.append(Paragraph("Почему получился такой скоринг", styles["H2Ru"]))
+        factor_rows = [[Paragraph("Источник", styles["TableHeadRu"]), Paragraph("Балл", styles["TableHeadRu"]), Paragraph("Причина", styles["TableHeadRu"])] ]
+        for f in top_factors[:7]:
+            factor_rows.append([
+                Paragraph(p(f.get("source")), styles["TableCellRu"]),
+                Paragraph(p(f.get("points")), styles["TableCellRu"]),
+                Paragraph(p(f.get("text")), styles["TableCellRu"]),
+            ])
+        factor_table = Table(factor_rows, colWidths=[45*mm, 18*mm, 119*mm], repeatRows=1)
+        factor_table.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(factor_table)
+        story.append(Spacer(1, 5))
+
+    # Checklist
     story.append(Paragraph("2. Карта автоматических проверок", styles["H1Ru"]))
     rows = [[Paragraph("Источник", styles["TableHeadRu"]), Paragraph("Статус", styles["TableHeadRu"]), Paragraph("Вывод", styles["TableHeadRu"])]]
     for item in checklist:
-        status = {"ok": "Проверено", "risk": "Требует внимания", "manual_check": "Ручная проверка"}.get(item.get("status"), item.get("status"))
+        st = item.get("status")
+        status_style = ParagraphStyle(
+            name=f"status_{st}_{len(rows)}",
+            parent=styles["TableCellRu"],
+            textColor=colors.HexColor(status_fg(st)),
+            alignment=TA_CENTER,
+        )
         rows.append([
-            Paragraph(p(item.get("title")), styles["SmallRu"]),
-            Paragraph(p(status), styles["SmallRu"]),
-            Paragraph(p(item.get("summary")), styles["SmallRu"]),
+            Paragraph(p(item.get("title")), styles["TableCellRu"]),
+            Paragraph(p(status_label(st)), status_style),
+            Paragraph(p(item.get("summary")), styles["TableCellRu"]),
         ])
-    tbl = Table(rows, colWidths=[43*mm, 34*mm, 103*mm], repeatRows=1)
-    tbl.setStyle(TableStyle([
+    tbl = Table(rows, colWidths=[44*mm, 35*mm, 103*mm], repeatRows=1)
+    table_style = [
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F0F5F8")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 5),
         ("RIGHTPADDING", (0, 0), (-1, -1), 5),
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]))
+    ]
+    for idx, item in enumerate(checklist, start=1):
+        table_style.append(("BACKGROUND", (1, idx), (1, idx), colors.HexColor(status_bg(item.get("status")))))
+    tbl.setStyle(TableStyle(table_style))
     story.append(tbl)
 
+    # Data gaps
+    manual = [x for x in checklist if x.get("status") == "manual_check"]
+    if manual:
+        story.append(Paragraph("3. Неполные данные и ручные проверки", styles["H1Ru"]))
+        for item in manual:
+            add_card(item.get("title") or "Ручная проверка", item.get("summary") or "Источник не дал достаточный результат.", bg="#FFF8EA", border="#E8C98A", title_color="#9A6B12")
+        next_num = 4
+    else:
+        next_num = 3
+
     # Key risks
-    story.append(Paragraph("3. Ключевые юридические риски", styles["H1Ru"]))
+    story.append(Paragraph(f"{next_num}. Ключевые юридические риски", styles["H1Ru"]))
     risks = [x for x in checklist if x.get("status") == "risk"]
     if risks:
         for item in risks:
             lines = [item.get("summary") or ""]
-            for d in (item.get("details") or [])[:5]:
+            for d in (item.get("details") or [])[:6]:
                 lines.append(f"• {d}")
-            add_card(item.get("title") or "Риск", lines, bg="#FFFDF8", border="#E6D3A4")
+            add_card(item.get("title") or "Риск", lines, bg="#FFFDF8", border="#E6D3A4", title_color="#8B1E1E")
     else:
         add_card("Риски по автоматическим источникам", "Явные риски по автоматическим источникам не выявлены.", bg="#EDF7F1", border="#B8D9C1")
+    next_num += 1
 
     # Recommendations
-    story.append(Paragraph("4. Что сделать до аванса (задатка)", styles["H1Ru"]))
+    story.append(Paragraph(f"{next_num}. Что сделать до аванса (задатка)", styles["H1Ru"]))
     rec_rows = [[Paragraph("Приоритет", styles["TableHeadRu"]), Paragraph("Действие", styles["TableHeadRu"]), Paragraph("Зачем это нужно", styles["TableHeadRu"])]]
     for rec in recs[:8]:
         priority = {"critical": "Критично", "high": "Важно", "medium": "Проверить"}.get(rec.get("priority"), rec.get("priority") or "Проверить")
         rec_rows.append([
-            Paragraph(p(priority), styles["SmallRu"]),
-            Paragraph(p(rec.get("title")), styles["SmallRu"]),
-            Paragraph(p(rec.get("text")), styles["SmallRu"]),
+            Paragraph(p(priority), styles["TableCellRu"]),
+            Paragraph(p(rec.get("title")), styles["TableCellRu"]),
+            Paragraph(p(rec.get("text")), styles["TableCellRu"]),
         ])
-    rec_table = Table(rec_rows, colWidths=[25*mm, 55*mm, 100*mm], repeatRows=1)
+    rec_table = Table(rec_rows, colWidths=[25*mm, 55*mm, 102*mm], repeatRows=1)
     rec_table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F0F5F8")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 5),
         ("RIGHTPADDING", (0, 0), (-1, -1), 5),
@@ -2056,21 +2507,23 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
     story.append(rec_table)
+    next_num += 1
 
     # Hidden risk matrix
     if hidden_risks:
-        story.append(Paragraph("5. Скрытые риски, которые не всегда видны в реестрах", styles["H1Ru"]))
-        hidden_rows = [[Paragraph("Риск", styles["TableHeadRu"]), Paragraph("Что проверить", styles["TableHeadRu"]), Paragraph("Правовая опора", styles["TableHeadRu"])]]
-        for h in hidden_risks[:10]:
+        story.append(Paragraph(f"{next_num}. Скрытые риски, которые не всегда видны в реестрах", styles["H1Ru"]))
+        hidden_rows = [[Paragraph("Уровень", styles["TableHeadRu"]), Paragraph("Риск", styles["TableHeadRu"]), Paragraph("Что проверить", styles["TableHeadRu"]), Paragraph("Правовая опора", styles["TableHeadRu"])]]
+        for h in hidden_risks[:12]:
             hidden_rows.append([
-                Paragraph(p(h.get("risk")), styles["SmallRu"]),
-                Paragraph(p(h.get("why")), styles["SmallRu"]),
-                Paragraph(p(h.get("law")), styles["SmallRu"]),
+                Paragraph(p(h.get("category") or "проверить"), styles["TableCellRu"]),
+                Paragraph(p(h.get("risk")), styles["TableCellRu"]),
+                Paragraph(p(h.get("why")), styles["TableCellRu"]),
+                Paragraph(p(h.get("law")), styles["TableCellRu"]),
             ])
-        hidden_table = Table(hidden_rows, colWidths=[38*mm, 95*mm, 47*mm], repeatRows=1)
+        hidden_table = Table(hidden_rows, colWidths=[29*mm, 39*mm, 76*mm, 38*mm], repeatRows=1)
         hidden_table.setStyle(TableStyle([
             ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE5")),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F3EF")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F3D56")),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("LEFTPADDING", (0, 0), (-1, -1), 5),
             ("RIGHTPADDING", (0, 0), (-1, -1), 5),
@@ -2078,17 +2531,32 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ]))
         story.append(hidden_table)
+        next_num += 1
 
-    # Legal conclusion from GigaChat/local fallback
-    story.append(Paragraph("6. Юридическое заключение", styles["H1Ru"]))
+    # Legal conclusion
+    story.append(Paragraph(f"{next_num}. Экспертное заключение по сделке", styles["H1Ru"]))
     legal_report = normalize_legal_report_format(str(report.get("legal_report") or ""))
+    rendered_any = False
     for kind, text in pdf_report_blocks(legal_report):
+        if not text.strip():
+            continue
+        rendered_any = True
         if kind == "h":
             story.append(Paragraph(p(text), styles["H2Ru"]))
         elif kind == "bullet":
             story.append(Paragraph(f"• {p(text)}", styles["BulletRu"]))
         else:
             story.append(Paragraph(p(text), styles["TextRu"]))
+
+    if not rendered_any:
+        fallback_text = build_local_legal_report(CheckRequest(), checklist, scoring, recs)
+        for kind, text in pdf_report_blocks(fallback_text):
+            if kind == "h":
+                story.append(Paragraph(p(text), styles["H2Ru"]))
+            elif kind == "bullet":
+                story.append(Paragraph(f"• {p(text)}", styles["BulletRu"]))
+            else:
+                story.append(Paragraph(p(text), styles["TextRu"]))
 
     if "Важно" not in legal_report:
         add_card(
@@ -2100,7 +2568,6 @@ def build_pdf_bytes(report: Dict[str, Any]) -> bytes:
 
     doc.build(story)
     return buf.getvalue()
-
 
 # ---------- pipeline ----------
 
