@@ -44,7 +44,7 @@ except Exception:
     GIGACHAT_AVAILABLE = False
 
 
-APP_VERSION = "1.2.0-final-premium-court-age-hidden-risks"
+APP_VERSION = "1.4.0-final-50k-balanced-github"
 NEWDB_URL = "https://api.newdb.net/v2"
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
@@ -806,7 +806,7 @@ def classify_arbitr(resp: Dict[str, Any], req: Optional[CheckRequest] = None) ->
         details.insert(0, f"Всего найдено записей: {len(normalized_cases)}")
         details.insert(1, f"Точные совпадения: {len(strong)}; вероятные: {len(probable)}; слабые/однофамильцы: {len(weak)}")
         if strong or probable:
-            summary = f"Найдены арбитражные дела: {len(normalized_cases)}. Надежность совпадений: точных {len(strong)}, вероятных {len(probable)}, слабых {len(weak)}. Требуется анализ предмета спора и роли продавца."
+            summary = f"Найдены арбитражные совпадения: {len(normalized_cases)}. Точных совпадений: {len(strong)}, вероятных: {len(probable)}, слабых: {len(weak)}. Без точной идентификации это не считается установленными делами продавца."
             return risk_item(title, summary, url, details, normalized_cases[:30])
         return manual_item(title, "Найдены слабые судебные совпадения по арбитражу. Это не считается установленным фактом по продавцу без ручной проверки.", url, details)
 
@@ -834,7 +834,7 @@ def classify_pravosud(resp: Dict[str, Any], req: Optional[CheckRequest] = None) 
         details.insert(0, f"Всего найдено записей: {len(normalized_cases)}")
         details.insert(1, f"Точные совпадения: {len(strong)}; вероятные: {len(probable)}; слабые/однофамильцы: {len(weak)}")
         if strong or probable:
-            summary = f"Найдены записи в судах общей юрисдикции: {len(normalized_cases)}. Надежность совпадений: точных {len(strong)}, вероятных {len(probable)}, слабых {len(weak)}. Требуется анализ роли, предмета дела и имущественных последствий."
+            summary = f"Найдены судебные совпадения по ФИО: {len(normalized_cases)}. Точных совпадений: {len(strong)}, вероятных: {len(probable)}, слабых: {len(weak)}. Без точной идентификации это не считается установленными делами продавца."
             return risk_item(title, summary, url, details, normalized_cases[:30])
         return manual_item(title, "Найдены слабые совпадения в судах общей юрисдикции. Это не считается установленным фактом по продавцу без ручной проверки.", url, details)
 
@@ -1121,118 +1121,148 @@ def court_details_for_screen(cases: List[Dict[str, Any]], limit: int = 7) -> Lis
 # ---------- scoring/report ----------
 
 def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> Dict[str, Any]:
+    """Balanced legal scoring.
+
+    Important rule: the score must reflect confirmed or strongly supported risk,
+    not merely the amount of text returned by registries. Completed bankruptcy and
+    probable court matches are caution factors, not automatic stop-factors.
+    """
     score = 0
     factors: List[str] = []
 
     if age is not None:
-        if age >= 80:
+        if age >= 85:
             score += 25
-            factors.append("Возраст продавца 80+ — высокий риск оспаривания по воле/дееспособности (+25)")
+            factors.append("Возраст продавца 85+ — критически важна проверка воли и дееспособности (+25)")
         elif age >= 75:
-            score += 20
-            factors.append("Возраст продавца 75+ — требуется усиленная проверка дееспособности (+20)")
+            score += 18
+            factors.append("Возраст продавца 75+ — ПНД и медицинское освидетельствование обязательны (+18)")
         elif age >= 70:
-            score += 15
-            factors.append("Возраст продавца 70+ — повышенный риск, желательны ПНД/НД (+15)")
+            score += 10
+            factors.append("Возраст продавца 70+ — ПНД и медицинское освидетельствование желательны (+10)")
 
     for item in checklist:
         title = item.get("title", "Источник")
         status = item.get("status")
+
         if status == "manual_check":
-            pts = 6 if "ГАС" in title else 8
+            pts = 4 if ("ГАС" in title or "суд" in title.lower()) else 6
             score += pts
             factors.append(f"{title}: требуется ручная проверка (+{pts})")
-        elif status == "risk":
-            if "ЕГРН" in title:
-                details_text = " ".join(item.get("details") or []).lower()
-                pts = 80 if "запрещение регистрации" in details_text or "запрет" in details_text else 60
-                score += pts
-                factors.append(f"ЕГРН: выявлены ограничения/обременения (+{pts})")
-            elif "ФССП" in title:
-                actual = ((item.get("data") or {}).get("actual_debt") or 0) if isinstance(item.get("data"), dict) else 0
-                if actual > 1_000_000:
-                    pts = 45
-                elif actual > 300_000:
-                    pts = 35
-                elif actual > 50_000:
-                    pts = 25
-                elif actual > 0:
-                    pts = 15
-                else:
-                    pts = 10
-                score += pts
-                factors.append(f"ФССП: активные/неоднозначные ИП, сумма {rub(actual)} (+{pts})")
-            elif "Банкрот" in title:
-                bdata = item.get("data") or {}
-                bstatus = bdata.get("bankruptcy_status") if isinstance(bdata, dict) else None
-                months = bdata.get("months_after_latest") if isinstance(bdata, dict) else None
-                property_words = bool(bdata.get("property_related_words")) if isinstance(bdata, dict) else False
-                if bstatus == "active":
-                    pts = 70
-                    factors.append("Банкротство: есть признаки незавершенной процедуры (+70)")
-                elif months is not None and months < 12:
-                    pts = 45
-                    factors.append("Банкротство: завершенная/значимая процедура, прошло менее 1 года (+45)")
-                elif months is not None and months < 36:
-                    pts = 35
-                    factors.append("Банкротство: после завершения/значимой публикации прошло менее 3 лет (+35)")
-                elif property_words:
-                    pts = 40
-                    factors.append("Банкротство: есть публикации, связанные с имуществом/торгами/конкурсной массой (+40)")
-                else:
-                    pts = 25
-                    factors.append("Банкротство: сведения найдены, требуется ручная проверка (+25)")
-                score += pts
-            elif "Арбитраж" in title:
-                cases = item.get("data") if isinstance(item.get("data"), list) else []
-                strong = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "точное совпадение"])
-                probable = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "вероятное совпадение"])
-                weak = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "слабое совпадение"])
-                pts = 35 + min(15, strong * 5 + probable * 3)
-                score += pts
-                factors.append(f"Арбитражные суды: найденные дела, точных {strong}, вероятных {probable}, слабых {weak} (+{pts})")
-            elif "ГАС" in title:
-                cases = item.get("data") if isinstance(item.get("data"), list) else []
-                strong = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "точное совпадение"])
-                probable = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "вероятное совпадение"])
-                weak = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "слабое совпадение"])
-                pts = 25 + min(15, strong * 5 + probable * 3)
-                score += pts
-                factors.append(f"ГАС Правосудие: найденные дела, точных {strong}, вероятных {probable}, слабых {weak} (+{pts})")
-            elif "Паспорт" in title:
-                score += 40
-                factors.append("Паспорт МВД: выявлен риск (+40)")
+            continue
+
+        if status != "risk":
+            continue
+
+        if "ЕГРН" in title:
+            details_text = " ".join(item.get("details") or []).lower()
+            if "запрещение регистрации" in details_text or "запрет" in details_text:
+                pts = 85
+                factors.append("ЕГРН: выявлен запрет/ограничение регистрационных действий (+85)")
             else:
-                score += 25
-                factors.append(f"{title}: выявлен риск (+25)")
+                pts = 60
+                factors.append("ЕГРН: выявлены ограничения/обременения без признака регистрационного запрета (+60)")
+            score += pts
+
+        elif "ФССП" in title:
+            actual = ((item.get("data") or {}).get("actual_debt") or 0) if isinstance(item.get("data"), dict) else 0
+            if actual > 1_000_000:
+                pts = 40
+            elif actual > 300_000:
+                pts = 30
+            elif actual > 50_000:
+                pts = 20
+            elif actual > 0:
+                pts = 12
+            else:
+                pts = 6
+            score += pts
+            factors.append(f"ФССП: активные/неоднозначные ИП, актуальная сумма {rub(actual)} (+{pts})")
+
+        elif "Банкрот" in title:
+            bdata = item.get("data") or {}
+            bstatus = bdata.get("bankruptcy_status") if isinstance(bdata, dict) else None
+            months = bdata.get("months_after_latest") if isinstance(bdata, dict) else None
+            property_words = bool(bdata.get("property_related_words")) if isinstance(bdata, dict) else False
+
+            if bstatus == "active":
+                pts = 75
+                factors.append("Банкротство: есть признаки действующей/незавершенной процедуры (+75)")
+            elif months is not None and months < 12:
+                pts = 42
+                factors.append("Банкротство: после значимой публикации прошло менее 1 года (+42)")
+            elif months is not None and months < 36:
+                pts = 32
+                factors.append("Банкротство: после значимой публикации прошло менее 3 лет (+32)")
+            elif property_words:
+                pts = 28
+                factors.append("Банкротство: процедура выглядит завершенной, но есть имущественные формулировки в публикациях (+28)")
+            elif bstatus == "completed":
+                pts = 20
+                factors.append("Банкротство: процедура выглядит завершенной, нужен ручной контроль документов (+20)")
+            else:
+                pts = 24
+                factors.append("Банкротство: сведения найдены, статус требует ручной проверки (+24)")
+            score += pts
+
+        elif "Арбитраж" in title or "ГАС" in title:
+            cases = item.get("data") if isinstance(item.get("data"), list) else []
+            strong = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "точное совпадение"])
+            probable = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "вероятное совпадение"])
+            weak = len([c for c in cases if isinstance(c, dict) and c.get("match_level") == "слабое совпадение"])
+
+            if strong:
+                pts = 25 + min(20, strong * 7 + probable * 2)
+            elif probable:
+                pts = 10 + min(12, probable * 2)
+            else:
+                pts = 4
+
+            score += pts
+            source_name = "Арбитражные суды" if "Арбитраж" in title else "ГАС Правосудие"
+            factors.append(f"{source_name}: точных {strong}, вероятных {probable}, слабых {weak} (+{pts})")
+
+        elif "Паспорт" in title:
+            score += 40
+            factors.append("Паспорт МВД: выявлен риск по действительности документа (+40)")
+        else:
+            score += 18
+            factors.append(f"{title}: выявлен риск (+18)")
 
     fssp_flag = any("ФССП" in x.get("title", "") and x.get("status") == "risk" for x in checklist)
     bankrupt_flag = any("Банкрот" in x.get("title", "") and x.get("status") == "risk" for x in checklist)
     egrn_flag = any("ЕГРН" in x.get("title", "") and x.get("status") == "risk" for x in checklist)
 
     if fssp_flag and bankrupt_flag:
-        score += 20
-        factors.append("Комбинация рисков: долги/ФССП + банкротство (+20)")
+        score += 10
+        factors.append("Комбинация рисков: ФССП + банкротство (+10)")
     if fssp_flag and egrn_flag:
         score += 15
-        factors.append("Комбинация рисков: долги/ФССП + ограничения по объекту (+15)")
+        factors.append("Комбинация рисков: ФССП + ограничения по объекту (+15)")
     if bankrupt_flag and egrn_flag:
-        score += 20
-        factors.append("Комбинация рисков: банкротство + ограничения ЕГРН (+20)")
+        score += 12
+        factors.append("Комбинация рисков: банкротство + ограничения ЕГРН (+12)")
 
+    # Critical trigger should be rare. It is not used for completed bankruptcy
+    # or probable court matches.
     critical = False
     for item in checklist:
         title = item.get("title", "")
         details_text = " ".join(item.get("details") or []).lower()
-        if "ЕГРН" in title and ("запрещение регистрации" in details_text or "запрет" in details_text):
-            critical = True
+
+        if "ЕГРН" in title and item.get("status") == "risk":
+            if "запрещение регистрации" in details_text or "запрет" in details_text:
+                critical = True
+
         if "Банкрот" in title:
             data = item.get("data") or {}
             if isinstance(data, dict) and data.get("bankruptcy_status") == "active":
                 critical = True
+
         if "ФССП" in title:
             actual = ((item.get("data") or {}).get("actual_debt") or 0) if isinstance(item.get("data"), dict) else 0
-            if actual > 500_000:
+            # Large debt is critical only together with object restrictions.
+            if actual > 500_000 and egrn_flag:
                 critical = True
 
     if age is not None and age >= 85:
@@ -1240,26 +1270,28 @@ def risk_scoring(checklist: List[Dict[str, Any]], age: Optional[int] = None) -> 
 
     if critical:
         score = max(score, 85)
-        factors.append("Обнаружен критический триггер — аванс и сделка только после ручной юридической проверки")
+        factors.append("Обнаружен подтвержденный критический триггер — аванс (задаток) только после устранения риска")
 
     score = max(0, min(100, int(score)))
     if score >= 85:
         level = "опасная"
         label = "Опасная при самостоятельной сделке"
-        conclusion = "Аванс и сделку нельзя проводить без ручной юридической проверки, устранения ключевых рисков и безопасной схемы расчетов."
+        conclusion = "Аванс (задаток) и сделку нельзя проводить без ручной юридической проверки, устранения ключевых рисков и безопасной схемы расчетов."
     elif score >= 60:
         level = "высокорискованная"
         label = "Высокий риск при самостоятельной сделке"
-        conclusion = "Сделку можно рассматривать только после уточнения рисков, проверки документов и жестких защитных условий в авансе/ПДКП."
+        conclusion = "Сделку можно рассматривать только после уточнения рисков, проверки документов и жестких защитных условий в авансе (задатке)/ПДКП."
     elif score >= 35:
         level = "условно рискованная"
         label = "Условно рискованная при самостоятельной сделке"
-        conclusion = "Сделку можно рассматривать только после закрытия ручных проверок и внесения защитных условий в документы."
+        conclusion = "Критический стоп-фактор по автоматическим данным не подтвержден, но до аванса (задатка) нужно закрыть ручные проверки и внести защитные условия в документы."
     else:
         level = "допустимая"
         label = "Допустимая к дальнейшему рассмотрению"
         conclusion = "По автоматическим источникам критичных рисков не выявлено, но отчет не заменяет ручную юридическую проверку документов."
+
     return {"score": score, "max_score": 100, "level": level, "label": label, "conclusion": conclusion, "factors": factors}
+
 
 def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRequest] = None) -> List[Dict[str, str]]:
     recs: List[Dict[str, str]] = []
@@ -1294,9 +1326,9 @@ def build_recommendations(checklist: List[Dict[str, Any]], req: Optional[CheckRe
         else:
             recs.append({"priority": "high", "title": "Разобрать банкротный риск", "text": "Нужно проверить даты процедуры, статус завершения, освобождение от обязательств, публикации Федресурса и риск оспаривания сделки."})
     if arbitr and arbitr.get("status") == "risk":
-        recs.append({"priority": "high", "title": "Разобрать арбитражные дела", "text": "Нужно понять предмет спора, связь с долгами/банкротством и возможное влияние на сделку."})
+        recs.append({"priority": "high", "title": "Разобрать арбитражные совпадения", "text": "Нужно вручную проверить предмет спора, роль лица и надежность совпадения. Вероятные совпадения не считать установленными делами продавца без идентификации."})
     if pravosud and pravosud.get("status") == "risk":
-        recs.append({"priority": "medium", "title": "Разобрать дела судов общей юрисдикции", "text": "Нужно проверить роль продавца в делах, предмет спора и возможные имущественные последствия."})
+        recs.append({"priority": "medium", "title": "Разобрать судебные совпадения", "text": "Нужно вручную идентифицировать совпадения по ФИО: сверить дату рождения, регион, стороны, предмет дела и результат. Без точной идентификации не считать записи установленными делами продавца."})
     if any(x.get("status") == "manual_check" for x in checklist):
         recs.append({"priority": "medium", "title": "Закрыть ручные проверки до аванса (задатка)", "text": "Все источники со статусом «требуется ручная проверка» нужно проверить вручную до передачи денег."})
     recs.append({"priority": "high", "title": "Авансовое соглашение / соглашение о задатке делать с защитными условиями", "text": "Включить обязанность продавца раскрыть долги, запреты, банкротство, судебные споры; предусмотреть возврат аванса (задатка) и ответственность при неподтверждении данных."})
@@ -1513,26 +1545,111 @@ def redact_sensitive_from_ai_text(text: str) -> str:
     return text.strip()
 
 
+def enforce_ai_report_text(text: str, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], req: CheckRequest) -> str:
+    """Post-process LLM text so it cannot override backend facts."""
+    if not text:
+        return ""
+
+    text = strip_markdown_noise(text)
+
+    egrn_ok = any("ЕГРН" in x.get("title", "") and x.get("status") == "ok" for x in checklist)
+    fssp_ok = any("ФССП" in x.get("title", "") and x.get("status") == "ok" for x in checklist)
+    passport_ok = any("Паспорт" in x.get("title", "") and x.get("status") == "ok" for x in checklist)
+    age = calculate_age(normalize_dob(req.dob)[0])
+
+    # Correct common overstatements from generative output.
+    replacements = {
+        "судебные дела продавца": "вероятные судебные совпадения по ФИО",
+        "продавец участвовал в судебных делах": "найдены вероятные судебные совпадения по ФИО",
+        "вероятности участия продавца": "вероятные совпадения по ФИО",
+        "конфликтах имущественного характера": "судебных материалах, требующих ручной идентификации",
+        "высокую степень риска данной сделки": "условный уровень риска данной сделки",
+        "высокая степень риска данной сделки": "условный уровень риска данной сделки",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    if egrn_ok:
+        # Do not remove the correct sentence "обременения не выявлены"; remove only overstatements.
+        bad_phrases = [
+            "имеются обременения",
+            "имеются ограничения",
+            "на объекте зарегистрированы ограничения",
+            "на объекте зарегистрированы обременения",
+            "наличие зарегистрированных ограничений",
+            "наличие зарегистрированных обременений",
+        ]
+        for phrase in bad_phrases:
+            text = re.sub(re.escape(phrase), "по данным ЕГРН ограничения и обременения не выявлены", text, flags=re.IGNORECASE)
+
+    if fssp_ok:
+        text = re.sub(r"активн\w+\s+исполнительн\w+\s+производств\w+", "активные исполнительные производства по данным проверки не выявлены", text, flags=re.IGNORECASE)
+        text = re.sub(r"активн\w+\s+долг\w+", "активные долги по данным ФССП не выявлены", text, flags=re.IGNORECASE)
+
+    if passport_ok:
+        text = text.replace("паспортные данные отсутствуют", "реквизиты паспорта не раскрываются в тексте заключения")
+        text = text.replace("паспортные данные не проверены", "паспорт проверен через МВД, реквизиты не раскрываются в тексте заключения")
+
+    if age is None or age < 70:
+        # Avoid applying age rules to a young seller.
+        text = re.sub(r"(?im)^.*ПНД.*$", "", text)
+        text = re.sub(r"(?im)^.*медицинск\w+\s+освидетельствован.*$", "", text)
+        text = re.sub(r"(?im)^.*видеофиксац.*$", "", text)
+
+    # Backend score is the single source of truth.
+    label = str(scoring.get("label") or "")
+    score = scoring.get("score")
+    if label and score is not None:
+        text = re.sub(r"(?i)сделка\s+представляет\s+высокий\s+риск", f"сделка имеет оценку: {label.lower()} ({score}/100)", text)
+        text = re.sub(r"(?i)относится\s+к\s+категории\s+высокорискованных", f"имеет оценку: {label.lower()} ({score}/100)", text)
+
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any]], scoring: Dict[str, Any], recs: List[Dict[str, str]]) -> str:
     fallback = build_local_legal_report(req, checklist, scoring, recs)
     if not (GIGACHAT_AVAILABLE and GIGACHAT_CREDENTIALS):
         return fallback
+
     payload = build_gigachat_safe_payload(req, checklist, scoring, recs)
     prompt = (
         "Ты практикующий юрист-эксперт по недвижимости в Санкт-Петербурге с 20-летним стажем сопровождения сделок. "
-        "Сформируй юридическое заключение для покупателя квартиры уровня дорогой платной экспертизы: сильное, экспертное, спокойное, без воды и без технического мусора. "
-        "Пиши как юрист, который отвечает за практическую безопасность сделки: объясняй не только что найдено, но и как это влияет на аванс (задаток), ПДКП, расчеты, регистрацию перехода права и риск оспаривания. "
-        "Где уместно, вставляй ссылки на нормы права: ст. 166, 167, 177, 181, 250, 253, 302, 450, 454, 549, 550, 551, 558 ГК РФ; ст. 34, 35, 60 СК РФ; ст. 37 ГК РФ; ФЗ №218-ФЗ о государственной регистрации недвижимости; ФЗ №127-ФЗ о банкротстве; ФЗ №229-ФЗ об исполнительном производстве; ФЗ №256-ФЗ о материнском капитале. "
-        "Главное правило: не придумывай факты и не противоречь чек-листу. Если ЕГРН имеет статус ok и encumbrances_count = 0, запрещено писать, что на объекте зарегистрированы ограничения или обременения. "
-        "Если ФССП имеет статус ok и active_count = 0, запрещено писать, что у продавца есть активные долги или активные исполнительные производства. "
-        "Если паспорт МВД имеет статус ok, запрещено писать, что паспортные данные отсутствуют или не проверены; можно писать, что реквизиты паспорта не раскрываются в тексте заключения. "
-        "Дата рождения, ИНН, серия и номер паспорта намеренно не передаются в текстовый анализ. Не делай из этого вывод о ненадежности данных. "
-        "Не указывай ИНН, серию/номер паспорта и полную дату рождения в заключении. Если ИНН был использован для проверки, пиши только: 'ИНН был использован только для автоматической проверки'. "
-        "По судебным делам без точного совпадения пиши только 'вероятные совпадения по ФИО' или 'слабые совпадения', не утверждай, что это точно дела продавца. "
-        "Скрытые риски описывай строго как риски, которые автоматическая проверка не подтверждает и не исключает; нельзя писать, что супруг, маткапитал, дети, отказники, доверенность или зарегистрированные лица реально есть, если этого нет в данных. "
-        "Возрастной блок включай только если seller.age >= 70. Если возраст меньше 70 или не указан, не пиши рекомендации про ПНД/НД как применимые к этому продавцу. Правило: старше 70 лет — справка из ПНД и медицинское освидетельствование до сделки желательны; старше 75 лет — обязательны, дополнительно рекомендована видеофиксация. "
-        "Не используй markdown-разметку: не ставь ###, **, --- и кодовые блоки. Не пиши английские технические ключи. Не делай текст простыней: короткие абзацы, четкие выводы, аккуратные списки. "
+        "Ты готовишь платное юридическое заключение для покупателя квартиры уровня дорогой экспертизы, но строго по фактам backend. "
+        "Backend уже определил уровень риска. Запрещено менять итоговый уровень риска, завышать его или занижать. "
+        "Единственный источник итоговой оценки: risk_scoring.label, risk_scoring.score и risk_scoring.conclusion из данных. "
+
+        "Главное правило: не придумывай факты, не додумывай связи, не противоречь чек-листу. "
+        "Каждый вывод формулируй как: факт → юридическое значение → риск для покупателя → что сделать до аванса (задатка). "
+
+        "Нормы права указывай там, где они действительно относятся к выводу: "
+        "банкротство и оспаривание — ст. 61.2, 61.3 ФЗ №127-ФЗ; "
+        "недействительность сделок — ст. 166–181 ГК РФ, особенно ст. 177 ГК РФ при вопросах воли/дееспособности; "
+        "супруг — ст. 34, 35 СК РФ и ст. 253 ГК РФ; "
+        "доли — ст. 250 ГК РФ; "
+        "несовершеннолетние и опека — ст. 37 ГК РФ, ст. 60 СК РФ; "
+        "доверенность — ст. 185–189 ГК РФ; "
+        "регистрация перехода права — ФЗ №218-ФЗ; "
+        "исполнительные производства — ФЗ №229-ФЗ; "
+        "материнский капитал — ФЗ №256-ФЗ. "
+
+        "Строгие запреты: "
+        "Если ЕГРН имеет status='ok' и encumbrances_count=0, запрещено писать, что на объекте есть ограничения, аресты, залоги или обременения. "
+        "Можно писать только: по полученным данным ЕГРН явные ограничения и обременения не выявлены, но история объекта требует проверки документами. "
+        "Если ФССП имеет status='ok' и active_count=0, запрещено писать, что у продавца есть активные долги или активные ИП. "
+        "Если паспорт МВД имеет status='ok', запрещено писать, что паспорт не проверен. "
+        "Дата рождения, ИНН, серия и номер паспорта намеренно не передаются в GigaChat; не делай из этого вывод о ненадежности данных. "
+        "Не указывай ИНН, серию и номер паспорта в заключении. "
+        "По судебным делам: если match_level не 'точное совпадение', пиши только 'вероятные совпадения по ФИО' или 'слабые совпадения'. "
+        "Запрещено писать, что это установленные дела продавца или что они связаны с квартирой/имуществом, если такая связь прямо не указана в данных. "
+        "Скрытые риски описывай только как то, что нужно проверить документами; нельзя писать, что супруг, маткапитал, дети, отказники, доверенность или зарегистрированные лица реально есть, если этого нет в данных. "
+        "Возрастной блок применяй только если seller.age >= 70. Если возраст меньше 70 или не указан, не пиши про ПНД, медицинское освидетельствование и видеофиксацию как применимые к этому продавцу. "
+        "Правило возраста: старше 70 лет — справка из ПНД и медицинское освидетельствование до сделки желательны; старше 75 лет — обязательны, дополнительно рекомендована видеофиксация. "
+
+        "Стиль: пиши как юрист, а не как рекламный текст. Без markdown-разметки, без ###, **, ---, без английских технических ключей. "
+        "Не делай простыню: короткие абзацы, аккуратные списки, конкретные выводы. "
         "Вместо слова 'Дисклеймер' используй только слово 'Важно'. "
+
         "Структура строго:\n"
         "1. Краткий вывод\n"
         "2. Надежность полученных данных\n"
@@ -1545,20 +1662,23 @@ async def maybe_gigachat_report(req: CheckRequest, checklist: List[Dict[str, Any
         "9. Безопасная схема расчетов\n"
         "10. Итоговое заключение\n"
         "11. Важно\n\n"
+        "Данные для заключения:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
+
     try:
         def _call() -> str:
             with GigaChat(credentials=GIGACHAT_CREDENTIALS, verify_ssl_certs=False) as giga:
                 resp = giga.chat(prompt)
                 return (resp.choices[0].message.content or "").strip()
-        text = strip_markdown_noise(redact_sensitive_from_ai_text(await asyncio.to_thread(_call)))
+
+        text = redact_sensitive_from_ai_text(await asyncio.to_thread(_call))
+        text = enforce_ai_report_text(text, checklist, scoring, req)
         if not text or is_gigachat_refusal(text):
             return fallback
         return text
     except Exception:
         return fallback
-
 
 
 def pdf_report_blocks(text: str) -> List[Tuple[str, str]]:
