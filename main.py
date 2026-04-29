@@ -1443,7 +1443,7 @@ async def run_one_person_checks(client, owner, base_req, label, representative=F
     inn_check_keys = ["fssp", "bankruptcy", "arbitr", "pravosud", "nalog_debt", "egrul_ip"]
     try:
         results = await asyncio.gather(
-            *[newdb_run(client, payloads_inn.get(key), timeout_sec=1200) for key in inn_check_keys],
+            *[newdb_run(client, payloads_inn.get(key), timeout_sec=240) for key in inn_check_keys],
             return_exceptions=True
         )
         for key, res in zip(inn_check_keys, results):
