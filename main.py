@@ -60,13 +60,18 @@ except Exception:
     logger.warning("ReportLab не доступен. PDF-генерация отключена.")
 
 # -------------------- Настройки --------------------
-APP_VERSION = "4.2.0-pro-deepseek-stable"
+APP_VERSION = "4.3.0-pro-deepseek-raw-debug"
 NEWDB_URL = "https://api.newdb.net/v2"
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 USE_DEEPSEEK_REPORT = os.getenv("USE_DEEPSEEK_REPORT", "0").strip().lower() in {"1", "true", "yes", "on"}
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro").strip()
+DEEPSEEK_MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "4096"))
+# Включать только на этапе разработки: покажет на фронте полный, но очищенный JSON реестров
+SHOW_RAW_REGISTRY_DATA = os.getenv("SHOW_RAW_REGISTRY_DATA", "0").strip().lower() in {"1", "true", "yes", "on"}
+# Дополнительная защита: сырые данные выводятся только если включён флаг выше. Поля ИНН/паспорт/токены всё равно вырезаются.
 
 # Безопасность
 ALLOWED_ORIGINS = ["https://ugolnikovspb.ru", "https://www.ugolnikovspb.ru"]
@@ -583,37 +588,118 @@ def classify_fssp(resp):
     return ok_item(title, "Только закрытые ИП.", url, [], stats)
 
 def bankruptcy_deep_flags(data):
+    """
+    Аккуратная оценка банкротства.
+    Важно: нельзя писать «завершено более 3 лет назад», если мы не нашли именно дату завершения процедуры.
+    Раньше код считал срок от любой последней даты в публикациях, из-за этого появлялись ложные выводы.
+    """
     text = flatten_text(data).lower()
-    active_words = ["введена процедура", "реструктуризация долгов", "конкурсное производство", "наблюдение", "процедура продолжа", "дело не заверш", "назначено судебное"]
-    completed_words = ["заверш", "освобожд", "прекратить производство", "завершить процедуру", "освободить гражданина", "процедура завершена"]
-    has_active = any(w in text for w in active_words)
+
+    active_words = [
+        "реструктуризация долгов", "реализация имущества гражданина введена",
+        "введена процедура реализации", "продлена процедура", "процедура реализации имущества",
+        "финансовый управляющий", "конкурсное производство", "наблюдение",
+        "дело не заверш", "процедура продолжа"
+    ]
+    completed_words = [
+        "завершить реализацию имущества", "завершена процедура реализации имущества",
+        "завершение реализации имущества", "завершить процедуру", "процедура завершена",
+        "освободить гражданина от обязательств", "освобождён от дальнейшего исполнения",
+        "освобожден от дальнейшего исполнения", "прекратить производство по делу"
+    ]
+
     has_completed = any(w in text for w in completed_words)
-    status = "active" if has_active else ("completed" if has_completed else "unknown")
-    dates = []
-    def walk(x):
+    has_active = any(w in text for w in active_words)
+
+    all_dates = []
+    completion_dates = []
+
+    def add_date(v, target):
+        dt = parse_date_any(v)
+        if dt and 1990 <= dt.year <= 2030:
+            target.append(dt)
+
+    def scan_value_for_completion_dates(v):
+        raw = str(v or "")
+        low = raw.lower()
+        if not any(w in low for w in completed_words):
+            return
+        # даты рядом с формулировками завершения
+        for m in re.finditer(r"\b(\d{2}[.\-/]\d{2}[.\-/]\d{4}|\d{4}[.\-/]\d{2}[.\-/]\d{2})\b", raw):
+            add_date(m.group(1), completion_dates)
+
+    def walk(x, parent_has_completion=False):
         if isinstance(x, dict):
+            local_text = flatten_text(x).lower()[:5000]
+            local_completion = parent_has_completion or any(w in local_text for w in completed_words)
             for k, v in x.items():
                 key = str(k).lower()
-                if any(b in key for b in ["birth", "dob", "рожд", "birthday"]): continue
+                if any(b in key for b in ["birth", "dob", "рожд", "birthday"]):
+                    continue
+                if isinstance(v, str):
+                    scan_value_for_completion_dates(v)
                 if any(w in key for w in ["date", "дата", "published", "publication", "create", "update", "заверш", "прекращ", "решен", "судебн"]):
                     dt = parse_date_any(v)
-                    if dt and 1990 <= dt.year <= 2030: dates.append(dt)
-                if isinstance(v, (dict, list)): walk(v)
+                    if dt and 1990 <= dt.year <= 2030:
+                        all_dates.append(dt)
+                        if local_completion or any(w in key for w in ["заверш", "прекращ", "end", "finish", "complete"]):
+                            completion_dates.append(dt)
+                if isinstance(v, (dict, list)):
+                    walk(v, local_completion)
         elif isinstance(x, list):
-            for row in x: walk(row)
+            for row in x:
+                walk(row, parent_has_completion)
+        elif isinstance(x, str):
+            scan_value_for_completion_dates(x)
+
     walk(data)
-    valid_dates = sorted(set(dates))
-    latest_date = valid_dates[-1] if valid_dates else None
+
+    all_dates = sorted(set(all_dates))
+    completion_dates = sorted(set(completion_dates))
+    latest_date = all_dates[-1] if all_dates else None
+    completion_date = completion_dates[-1] if completion_dates else None
+    months_after_completion = months_between_dates(completion_date) if completion_date else None
     months_after_latest = months_between_dates(latest_date) if latest_date else None
-    property_words = ["оспаривание сделки", "недействительность сделки", "имущество должника", "конкурсная масса", "торги", "реализация имущества", "положение о продаже"]
+
+    property_words = [
+        "оспаривание сделки", "недействительность сделки", "имущество должника",
+        "конкурсная масса", "торги", "реализация имущества", "положение о продаже"
+    ]
     has_property = any(w in text for w in property_words)
+
+    if has_completed and completion_date:
+        status = "completed"
+    elif has_completed and not completion_date:
+        status = "completed_unknown_date"
+    elif has_active:
+        status = "active"
+    else:
+        status = "unknown"
+
     details = []
-    if latest_date: details.append(f"Последняя значимая дата: {latest_date.strftime('%d.%m.%Y')}")
-    if months_after_latest is not None:
-        if months_after_latest < 12: details.append(f"После последней публикации прошло менее 1 года ({months_after_latest} мес.)")
-        elif months_after_latest < 36: details.append(f"После последней публикации прошло менее 3 лет ({months_after_latest} мес.)")
-        else: details.append(f"После последней публикации прошло более 3 лет ({months_after_latest} мес.)")
-    return {"status": status, "latest_date": latest_date.strftime("%d.%m.%Y") if latest_date else "", "months_after_latest": months_after_latest, "property_related_words": has_property, "details": details}
+    if completion_date:
+        details.append(f"Дата завершения процедуры: {completion_date.strftime('%d.%m.%Y')}")
+    elif has_completed:
+        details.append("Есть признаки завершения процедуры, но дата завершения автоматически не определена.")
+    if latest_date:
+        details.append(f"Последняя найденная дата в материалах: {latest_date.strftime('%d.%m.%Y')}")
+    if months_after_completion is not None:
+        if months_after_completion < 12:
+            details.append(f"После завершения прошло менее 1 года ({months_after_completion} мес.)")
+        elif months_after_completion < 36:
+            details.append(f"После завершения прошло менее 3 лет ({months_after_completion} мес.)")
+        else:
+            details.append(f"После завершения прошло более 3 лет ({months_after_completion} мес.)")
+
+    return {
+        "status": status,
+        "latest_date": latest_date.strftime("%d.%m.%Y") if latest_date else "",
+        "completion_date": completion_date.strftime("%d.%m.%Y") if completion_date else "",
+        "months_after_latest": months_after_latest,
+        "months_after_completion": months_after_completion,
+        "property_related_words": has_property,
+        "details": details
+    }
 
 def classify_bankruptcy(resp):
     title, url = "Банкротство / Федресурс", "https://bankrot.fedresurs.ru"
@@ -628,8 +714,8 @@ def classify_bankruptcy(resp):
                     if isinstance(row.get(key), list) and len(row.get(key)) > 0: has_records = True; break
     if not has_records: return ok_item(title, "Сведения о банкротстве не найдены.", url, [], data)
     flags = bankruptcy_deep_flags(data)
-    status = flags["status"]; months = flags.get("months_after_latest"); has_property = flags.get("property_related_words"); details = flags.get("details", [])
-    risk_data = {"raw": data, "bankruptcy_status": status, "latest_publication_date": flags.get("latest_date"), "months_after_latest": months, "property_related_words": has_property}
+    status = flags["status"]; months = flags.get("months_after_completion"); has_property = flags.get("property_related_words"); details = flags.get("details", [])
+    risk_data = {"raw": data, "bankruptcy_status": status, "latest_publication_date": flags.get("latest_date"), "completion_date": flags.get("completion_date"), "months_after_latest": flags.get("months_after_latest"), "months_after_completion": flags.get("months_after_completion"), "property_related_words": has_property}
     if status == "active":
         details.append("Признаки действующей или незавершённой процедуры банкротства.")
         return risk_item(title, "Выявлены признаки действующего банкротства.", url, details, risk_data)
@@ -640,9 +726,12 @@ def classify_bankruptcy(resp):
         elif months is not None and months < 36:
             details.append("Процедура завершена менее 3 лет назад — требуется проверка.")
             return risk_item(title, "Завершённое банкротство (менее 3 лет).", url, details, risk_data)
-        else:
+        elif months is not None:
             details.append("Процедура завершена более 3 лет назад.")
             return ok_item(title, "Банкротство завершено более 3 лет назад.", url, details, risk_data)
+        return manual_item(title, "Банкротство найдено, срок после завершения не определён.", url, details)
+    if status == "completed_unknown_date":
+        return manual_item(title, "Банкротство найдено, дата завершения не определена.", url, details)
     if has_property:
         details.append("В публикациях есть слова, связанные с имуществом/торгами.")
         return risk_item(title, "Сведения о банкротстве с имущественными признаками.", url, details, risk_data)
@@ -878,7 +967,10 @@ def risk_scoring(checklist, age=None):
     for item in checklist:
         title = str(item.get("title", "")); status = item.get("status")
         if status == "manual_check":
-            add(title, 2 if any(w in title.lower() for w in ["арбитраж", "суд"]) else 5, "Требуется ручная проверка", "manual"); continue
+            summary_text = (str(item.get("summary", "")) + " " + " ".join(item.get("details") or [])).lower()
+            if "не запуск" in summary_text or "не выполня" in summary_text:
+                continue
+            add(title, 2 if any(w in title.lower() for w in ["арбитраж", "суд"]) else 4, "Требуется ручная проверка", "manual"); continue
         if status != "risk": continue
         data = item.get("data") if isinstance(item.get("data"), dict) else {}
         if "ЕГРН" in title:
@@ -908,7 +1000,7 @@ def risk_scoring(checklist, age=None):
             else: add("ФССП", 5, "ИП найдены", "attention")
         elif "Банкрот" in title:
             bdata = data if isinstance(data, dict) else {}
-            bstatus = bdata.get("bankruptcy_status"); months = bdata.get("months_after_latest"); has_property = bdata.get("property_related_words")
+            bstatus = bdata.get("bankruptcy_status"); months = bdata.get("months_after_completion"); has_property = bdata.get("property_related_words")
             if bstatus == "active": add("Банкротство", 75, "Признаки действующей процедуры", "critical")
             elif bstatus == "completed":
                 if months is not None and months < 12: add("Банкротство", 38, f"Завершено < 1 года назад ({months} мес.)", "high")
@@ -980,7 +1072,29 @@ def build_deepseek_user_prompt(req, checklist, scoring, recs):
     return f"Продавец: {fio(req)}, возраст {age}\nОбъект: {prop['query']}\nРезультаты:\n{json.dumps(safe, ensure_ascii=False, indent=2)}\nСкоринг: {scoring.get('score')}/100 — {scoring.get('label')}\nВывод системы: {scoring.get('conclusion')}\nРекомендации:\n{json.dumps(recs, ensure_ascii=False, indent=2)}"
 
 def is_ai_refusal(text):
-    return any(w in (text or "").lower() for w in ["не могу", "извините", "ограничен"])
+    """Жёсткий отказ модели. Не считаем отказом фразу «не могу подтвердить без ручной проверки»."""
+    t = (text or "").lower()
+    hard_refusals = [
+        "я не могу выполнить этот запрос",
+        "я не могу помочь с этим",
+        "не могу предоставить юридическую консультацию",
+        "не могу обработать персональные данные",
+    ]
+    return any(x in t for x in hard_refusals)
+
+def is_valid_deepseek_report(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip().lower()
+    if is_ai_refusal(t):
+        return False
+    markers = [
+        "краткий вывод", "ключевые риски", "что проверить до аванса",
+        "логика сделки", "итоговое заключение"
+    ]
+    has_structure = sum(1 for m in markers if m in t) >= 2
+    enough_length = len(t) >= 900
+    return has_structure and enough_length
 
 def redact_sensitive_from_ai_text(text):
     if not text: return ""
@@ -993,6 +1107,7 @@ def normalize_legal_report_format(text):
     s = str(text)
     s = re.sub(r"(?m)^\s*#{1,6}\s*", "", s)
     s = re.sub(r"\*\*(.*?)\*\*", r"\1", s)
+    s = re.sub(r"(?im)^\s*\d+[.)]\s+", "", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
@@ -1002,16 +1117,20 @@ def build_local_legal_report(req, checklist, scoring, recs):
     oks = [x for x in checklist if x.get("status") == "ok"]
     manual = [x for x in checklist if x.get("status") == "manual_check"]
     lines = ["Краткий вывод", f"Оценка: {scoring.get('label')} ({score}/100). {scoring.get('conclusion')}", "",
-             "Что подтверждено"] + [f"• {x['title']}: {x['summary']}" for x in oks] + [""] + \
-             ["Что не подтверждено"] + [f"• {x['title']}: требуется ручная проверка" for x in manual] + [""] + \
-             ["Ключевые риски"] + [f"• {x['title']}: {x['summary']}" for x in risks] + [""] + \
-             ["Что проверить до аванса"] + [f"• {r['title']}: {r['text']}" for r in recs[:5]] + [""] + \
-             ["Итоговое заключение"]
-    if score >= 85: lines.append("Сначала документы, потом аванс в защищённой схеме.")
-    elif score >= 60: lines.append("Сделка требует управляемого сценария с документальным подтверждением.")
-    elif score >= 35: lines.append("Умеренный риск. Закрыть вопросы до аванса.")
-    else: lines.append("Можно переходить к стандартной проверке документов.")
-    lines += ["", "Важно", "Отчёт — аналитический ориентир. Не заменяет ручную юридическую проверку."]
+             "Что подтверждено автоматическими источниками"] + [f"• {x['title']}: {x['summary']}" for x in oks] + [""] + \
+            ["Что не подтверждено и требует ручной проверки"] + [f"• {x['title']}: {x['summary']}" for x in manual] + [""] + \
+            ["Ключевые риски"] + ([f"• {x['title']}: {x['summary']}" for x in risks] or ["• Подтверждённых критических рисков автоматическими источниками не выявлено."]) + [""] + \
+            ["Что проверить до аванса"] + [f"• {r['title']}: {r['text']}" for r in recs[:5]] + ["", "Логика сделки",
+             "• Сначала получить документы-основания, выписку ЕГРН, справки по зарегистрированным лицам и подтверждения по всем ручным проверкам.",
+             "• Только после закрытия вопросов подписывать авансовое соглашение с условиями возврата денег.",
+             "", "Как передавать аванс",
+             "• Передавать аванс только по письменному соглашению, с привязкой возврата к непрохождению юридической проверки.",
+             "", "Итоговое заключение"]
+    if score >= 85: lines.append("Сначала устранить критические факторы. Аванс без документов не передавать.")
+    elif score >= 60: lines.append("Сделка возможна только в управляемом сценарии с документальным подтверждением каждого риска.")
+    elif score >= 35: lines.append("Умеренный риск. Основная задача — закрыть вопросы до аванса, а не после него.")
+    else: lines.append("Можно переходить к стандартной проверке документов, не пропуская ручные юридические пункты.")
+    lines += ["", "Важно", "Отчёт — аналитический ориентир. Не заменяет ручную юридическую проверку документов и обстоятельств сделки."]
     return normalize_legal_report_format("\n".join(lines))
 
 async def maybe_deepseek_report(req, checklist, scoring, recs):
@@ -1020,35 +1139,47 @@ async def maybe_deepseek_report(req, checklist, scoring, recs):
         logger.info("DeepSeek отключён. Использую локальный отчёт.")
         return fallback
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        payload = {
+            "model": DEEPSEEK_MODEL,
+            "messages": [
+                {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
+                {"role": "user", "content": build_deepseek_user_prompt(req, checklist, scoring, recs)},
+            ],
+            "temperature": 0.25,
+            "max_tokens": DEEPSEEK_MAX_TOKENS,
+        }
+        async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post(
                 f"{DEEPSEEK_BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
-                json={"model": "deepseek-v4-pro", "messages": [
-                    {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
-                    {"role": "user", "content": build_deepseek_user_prompt(req, checklist, scoring, recs)}],
-                    "thinking": {"type": "disabled"},
-                    "temperature": 0.3, "max_tokens": 4096})
+                json=payload,
+            )
+            logger.info(f"DeepSeek HTTP {resp.status_code}, model={DEEPSEEK_MODEL}")
             if resp.status_code != 200:
-                logger.error(f"DeepSeek вернул {resp.status_code}: {resp.text[:300]}")
+                logger.error(f"DeepSeek вернул {resp.status_code}: {resp.text[:1000]}")
                 return fallback
             data = resp.json()
             if not data.get("choices"):
-                logger.error(f"DeepSeek: нет choices в ответе. Ответ: {json.dumps(data, ensure_ascii=False)[:300]}")
+                logger.error(f"DeepSeek: нет choices в ответе. Ответ: {json.dumps(data, ensure_ascii=False)[:1000]}")
                 return fallback
-            text = data["choices"][0]["message"]["content"].strip()
+            text = (data["choices"][0].get("message") or {}).get("content") or ""
+            logger.info(f"DeepSeek raw preview: {text[:1000]}")
             text = redact_sensitive_from_ai_text(text)
             text = normalize_legal_report_format(text)
-            if not text or is_ai_refusal(text):
-                logger.warning("DeepSeek: отказ или пустой ответ")
+            if not is_valid_deepseek_report(text):
+                logger.warning(f"DeepSeek: ответ не прошёл проверку качества. length={len(text)} preview={text[:700]}")
                 return fallback
-            logger.info("DeepSeek отчёт успешно сгенерирован")
+            logger.info(f"DeepSeek отчёт успешно принят. length={len(text)}")
             return text
     except Exception as e:
         logger.exception(f"Ошибка DeepSeek: {e}")
         return fallback
 
-# -------------------- PDF --------------------
+def build_public_raw_registry_data(responses: Dict[str, Any]) -> Dict[str, Any]:
+    """Очищенный JSON реестров для разработки интерфейса. Не отдаёт паспорт, ИНН, requestId, balance и служебные поля."""
+    cleaned = strip_service_fields(responses)
+    return cleaned if isinstance(cleaned, dict) else {"data": cleaned}
+
 def pdf_report_blocks(text):
     """Разбивает текст отчёта на блоки для PDF."""
     if not text:
@@ -1262,7 +1393,8 @@ def build_pdf_bytes(report):
         if block_type == "h": story.append(Paragraph(p(text), styles["Z_CardTitle"]))
         elif block_type == "bullet": story.append(Paragraph(f"• {p(text)}", styles["Z_CardText"]))
         else: story.append(Paragraph(p(text), styles["Z_Body"]))
-    add_card("Важно", "Отчёт носит информационно-аналитический характер. Не заменяет ручную юридическую проверку.", bg=Palette.OFF_WHITE)
+    if "Важно" not in (legal_text or ""):
+        add_card("Важно", "Отчёт носит информационно-аналитический характер. Не заменяет ручную юридическую проверку.", bg=Palette.OFF_WHITE)
     
     doc.build(story)
     return buf.getvalue()
@@ -1311,7 +1443,7 @@ async def run_one_person_checks(client, owner, base_req, label, representative=F
     inn_check_keys = ["fssp", "bankruptcy", "arbitr", "pravosud", "nalog_debt", "egrul_ip"]
     try:
         results = await asyncio.gather(
-            *[newdb_run(client, payloads_inn.get(key), timeout_sec=120) for key in inn_check_keys],
+            *[newdb_run(client, payloads_inn.get(key), timeout_sec=1200) for key in inn_check_keys],
             return_exceptions=True
         )
         for key, res in zip(inn_check_keys, results):
@@ -1341,7 +1473,7 @@ async def run_checks(req):
             tasks.append(run_one_person_checks(client, owner, req, participant_label(idx, owner)))
         for idx, rep in enumerate(reps, 1):
             tasks.append(run_one_person_checks(client, rep, req, participant_label(idx, rep, representative=True), representative=True))
-        egrn_task = newdb_run(client, payloads["egrn"], timeout_sec=180)
+        egrn_task = newdb_run(client, payloads["egrn"], timeout_sec=1200)
         
         all_res = await asyncio.gather(*tasks, egrn_task, return_exceptions=True)
     
@@ -1373,7 +1505,7 @@ async def build_full_report(req, include_debug=False):
         scoring_breakdown["factors"].append({
             "source": f["source"], "points": f["points"], "severity": sev,
             "reason": f["text"],
-            "icon": {"critical": "🔴", "high": "🟠", "medium": "🟡", "attention": "🔵", "manual": "⚪"}.get(sev, "⚪"),
+            "icon": {"critical": "??", "high": "??", "medium": "??", "attention": "??", "manual": "⚪"}.get(sev, "⚪"),
             "impact": {"critical": "Критический стоп-фактор", "high": "Высокий риск", 
                       "medium": "Умеренный риск", "attention": "Низкий риск", "manual": "Ручная проверка"}.get(sev, "")
         })
@@ -1397,9 +1529,11 @@ async def build_full_report(req, include_debug=False):
         "hidden_risks": build_hidden_risks(req),
         "legal_report": legal, "normalized_input": normalized_input(req),
         "participants": public_participants_summary(responses.get("participants") or []),
-        "warnings": [], "notes": ["v4.2 – стабильная версия с улучшенной обработкой ошибок"]
+        "warnings": [], "notes": ["v4.3 – DeepSeek не отбрасывается по мягким юридическим формулировкам; добавлен dev-вывод данных реестров"]
     }
     
+    if SHOW_RAW_REGISTRY_DATA:
+        result["debug_raw_registry_data"] = build_public_raw_registry_data(responses)
     if include_debug:
         result["payloads"] = payloads
         result["responses"] = strip_service_fields(responses)
