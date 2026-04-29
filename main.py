@@ -1,6 +1,6 @@
 """
 Real Estate Seller & Property Check API — v4pro (DeepSeek)
-Copyright (c) 2024 Ugolnikov SPb. All rights reserved.
+Copyright (c) 2026 Ugolnikov SPb. All rights reserved.
 """
 
 import asyncio, io, json, os, re, time, uuid
@@ -41,7 +41,7 @@ USE_DEEPSEEK_REPORT = os.getenv("USE_DEEPSEEK_REPORT", "0").strip().lower() in {
 
 # Безопасность
 ALLOWED_ORIGINS = ["https://ugolnikovspb.ru", "https://www.ugolnikovspb.ru"]
-PUBLIC_WIDGET_API_KEY = os.getenv("PUBLIC_WIDGET_API_KEY", "change-me-in-production")
+PUBLIC_WIDGET_API_KEY = os.getenv("PUBLIC_WIDGET_API_KEY", "pwk_7Fh29LmQx8VdR3sKzYp4TnU6Bc1WeXa")
 ENABLE_DEBUG_NEWDB = os.getenv("ENABLE_DEBUG_NEWDB", "0").lower() in {"1", "true", "yes", "on"}
 DEBUG_API_KEY = os.getenv("DEBUG_API_KEY", "debug-key-change-me")
 REPORT_TTL_SECONDS = int(os.getenv("REPORT_TTL_SECONDS", "43200"))
@@ -1044,10 +1044,10 @@ async def run_one_person_checks(client, owner, base_req, label, representative=F
     meta = {"label": label, "role": owner.role, "share": owner.share, "is_minor": minor, "age": calculate_age(normalize_dob(owner.dob)[0]), "representative": representative}
     resp = {"label": label, "req": person_req, "meta": meta}
     if minor:
-        if owner.has_passport and base_req.run_passport: resp["passport"] = await newdb_run(client, build_payloads(person_req).get("passport"), timeout_sec=55)
+        if owner.has_passport and base_req.run_passport: resp["passport"] = await newdb_run(client, build_payloads(person_req).get("passport"), timeout_sec=120)
         resp["skipped_due_to_minor"] = True; return resp
     payloads = build_payloads(person_req)
-    first = await asyncio.gather(newdb_run(client, payloads.get("passport"), timeout_sec=55), newdb_run(client, payloads.get("passport_fns"), timeout_sec=55), return_exceptions=True)
+    first = await asyncio.gather(newdb_run(client, payloads.get("passport"), timeout_sec=120), newdb_run(client, payloads.get("passport_fns"), timeout_sec=120), return_exceptions=True)
     resp["passport"] = first[0] if not isinstance(first[0], Exception) else {"state":"failed","errors_info":[{"error":str(first[0])}]}
     resp["passport_fns"] = first[1] if not isinstance(first[1], Exception) else {"state":"failed","errors_info":[{"error":str(first[1])}]}
     inn_resolution = resolve_final_inn(manual_inn, resp.get("passport_fns") or {})
@@ -1055,7 +1055,7 @@ async def run_one_person_checks(client, owner, base_req, label, representative=F
     final_inn = inn_resolution.get("final_inn") or ""
     person_with_inn = with_final_inn(person_req, final_inn)
     payloads_inn = build_payloads(person_with_inn)
-    tasks = [newdb_run(client, payloads_inn.get(k), timeout_sec=t) for k,t in [("fssp",95),("bankruptcy",75),("arbitr",75),("pravosud",75),("nalog_debt",75),("egrul_ip",75)]]
+    tasks = [newdb_run(client, payloads_inn.get(k), timeout_sec=120) for k,t in [("fssp",120),("bankruptcy",120),("arbitr",120),("pravosud",120),("nalog_debt",120),("egrul_ip",120)]]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for (key,_), res in zip([("fssp",None),("bankruptcy",None),("arbitr",None),("pravosud",None),("nalog_debt",None),("egrul_ip",None)], results):
         resp[key] = {"state":"failed","errors_info":[{"error":str(res)}]} if isinstance(res, Exception) else res
@@ -1091,20 +1091,20 @@ async def build_full_report(req, include_debug=False):
         sev = f.get("severity","attention")
         scoring_breakdown["factors"].append({"source": f["source"], "points": f["points"], "severity": sev, "reason": f["text"], "icon": {"critical":"🔴","high":"🟠","medium":"🟡","attention":"🔵","manual":"⚪"}.get(sev,"⚪"), "impact": {"critical":"Критический стоп-фактор","high":"Высокий риск","medium":"Умеренный риск","attention":"Низкий риск","manual":"Ручная проверка"}.get(sev,"")})
     recs = build_recommendations(checklist, req)
-    registry = short_registry_data({})  # minimal
-    screen = {"headline": scoring["label"], "score": scoring["score"], "conclusion": scoring["conclusion"]}  # placeholder
     legal = await maybe_deepseek_report(req, checklist, scoring, recs)
     report_id = str(uuid.uuid4())
     result = {
         "success": True, "report_id": report_id, "pdf_available": True, "pdf_url": f"/download-pdf/{report_id}",
         "created_at": now_ru(),
         "executive_summary": {"label": scoring["label"], "level": scoring["level"], "score": scoring["score"], "max_score": 100, "conclusion": scoring["conclusion"]},
-        "screen_report": screen, "checklist": strip_service_fields(checklist),
+        "screen_report": {"headline": scoring["label"], "score": scoring["score"], "conclusion": scoring["conclusion"]},
+        "checklist": strip_service_fields(checklist),
         "risk_scoring": scoring, "scoring_breakdown": scoring_breakdown,
         "recommendations": recs, "advance_decision": build_advance_decision(scoring),
         "hidden_risks": build_hidden_risks(req),
-        "legal_report": legal, "normalized_input": normalized_input(req), "participants": public_participants_summary(responses.get("participants") or []),
-        "warnings": [], "notes": ["v4pro – DeepSeek, scoring breakdown, premium PDF"]
+        "legal_report": legal, "normalized_input": normalized_input(req),
+        "participants": public_participants_summary(responses.get("participants") or []),
+        "warnings": [], "notes": ["v4pro – DeepSeek V4 Pro, таймауты 120с, улучшенный PDF"]
     }
     if include_debug:
         result["payloads"] = payloads; result["responses"] = responses
@@ -1142,6 +1142,21 @@ async def check_report(req: CheckRequest, request: Request):
 @app.get("/download-pdf/{report_id}")
 def download_pdf(report_id: str):
     report = REPORTS.get(report_id)
-    if not report: return StreamingResponse(io.BytesIO(b"Report not found or expired."), media_type="text/plain")
-    pdf = build_pdf_bytes(report)
-    return StreamingResponse(io.BytesIO(pdf), media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename=real_estate_report_{report_id}.pdf"})
+    if not report:
+        return StreamingResponse(
+            io.BytesIO(b"Report not found or expired (12h TTL). Please run the check again."),
+            media_type="text/plain"
+        )
+    try:
+        pdf = build_pdf_bytes(report)
+        filename = f"real_estate_report_{report_id[:8]}.pdf"
+        return StreamingResponse(
+            io.BytesIO(pdf),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        return StreamingResponse(
+            io.BytesIO(f"PDF generation error: {str(e)}".encode()),
+            media_type="text/plain"
+        )
