@@ -1,9 +1,19 @@
 """
 Real Estate Seller & Property Check API — v4pro (DeepSeek)
 Copyright (c) 2026 Ugolnikov SPb. All rights reserved.
+
+Исправления v4.1:
+- Логирование ошибок
+- Проверка HTTP-статуса DeepSeek
+- Улучшенный судебный match score (жёстче критерии)
+- Детальный анализ банкротства (сроки, даты)
+- ЕГРН: давность права, частые переходы
+- Усиленное предупреждение для несовершеннолетних
+- Текстовые статусы в PDF вместо эмодзи
+- Логирование ошибок в /check-report
 """
 
-import asyncio, io, json, os, re, time, uuid
+import asyncio, io, json, logging, os, re, time, uuid
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,6 +23,10 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+# -------------------- Логирование --------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
 
 # -------------------- PDF --------------------
 try:
@@ -31,7 +45,7 @@ except Exception:
     REPORTLAB_AVAILABLE = False
 
 # -------------------- Настройки --------------------
-APP_VERSION = "4.0.0-pro-deepseek"
+APP_VERSION = "4.1.0-pro-deepseek"
 NEWDB_URL = "https://api.newdb.net/v2"
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
 
@@ -540,10 +554,36 @@ def classify_fssp(resp):
 
 def bankruptcy_deep_flags(data):
     text = flatten_text(data).lower()
-    if any(w in text for w in ["введена процедура", "реструктуризация", "конкурсное производство", "наблюдение", "процедура продолжа"]): status = "active"
-    elif any(w in text for w in ["заверш", "освобожд", "прекратить производство"]): status = "completed"
-    else: status = "unknown"
-    return {"status": status, "property_related_words": any(w in text for w in ["оспаривание сделки", "имущество должника", "конкурсная масса", "торги"])}
+    active_words = ["введена процедура", "реструктуризация долгов", "конкурсное производство", "наблюдение", "процедура продолжа", "дело не заверш", "назначено судебное"]
+    completed_words = ["заверш", "освобожд", "прекратить производство", "завершить процедуру", "освободить гражданина", "процедура завершена"]
+    has_active = any(w in text for w in active_words)
+    has_completed = any(w in text for w in completed_words)
+    status = "active" if has_active else ("completed" if has_completed else "unknown")
+    dates = []
+    def walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                key = str(k).lower()
+                if any(b in key for b in ["birth", "dob", "рожд", "birthday"]): continue
+                if any(w in key for w in ["date", "дата", "published", "publication", "create", "update", "заверш", "прекращ", "решен", "судебн"]):
+                    dt = parse_date_any(v)
+                    if dt and 1990 <= dt.year <= 2030: dates.append(dt)
+                if isinstance(v, (dict, list)): walk(v)
+        elif isinstance(x, list):
+            for row in x: walk(row)
+    walk(data)
+    valid_dates = sorted(set(dates))
+    latest_date = valid_dates[-1] if valid_dates else None
+    months_after_latest = months_between_dates(latest_date) if latest_date else None
+    property_words = ["оспаривание сделки", "недействительность сделки", "имущество должника", "конкурсная масса", "торги", "реализация имущества", "положение о продаже"]
+    has_property = any(w in text for w in property_words)
+    details = []
+    if latest_date: details.append(f"Последняя значимая дата: {latest_date.strftime('%d.%m.%Y')}")
+    if months_after_latest is not None:
+        if months_after_latest < 12: details.append(f"После последней публикации прошло менее 1 года ({months_after_latest} мес.)")
+        elif months_after_latest < 36: details.append(f"После последней публикации прошло менее 3 лет ({months_after_latest} мес.)")
+        else: details.append(f"После последней публикации прошло более 3 лет ({months_after_latest} мес.)")
+    return {"status": status, "latest_date": latest_date.strftime("%d.%m.%Y") if latest_date else "", "months_after_latest": months_after_latest, "property_related_words": has_property, "details": details}
 
 def classify_bankruptcy(resp):
     title, url = "Банкротство / Федресурс", "https://bankrot.fedresurs.ru"
@@ -558,45 +598,56 @@ def classify_bankruptcy(resp):
                     if isinstance(row.get(key), list) and len(row.get(key)) > 0: has_records = True; break
     if not has_records: return ok_item(title, "Сведения о банкротстве не найдены.", url, [], data)
     flags = bankruptcy_deep_flags(data)
-    risk_data = {"raw": data, "bankruptcy_status": flags["status"], "property_related_words": flags["property_related_words"]}
-    if flags["status"] == "active": return risk_item(title, "Признаки действующего банкротства.", url, ["Высокий риск."], risk_data)
-    return risk_item(title, "Сведения о банкротстве найдены.", url, ["Требуется ручная проверка."], risk_data)
+    status = flags["status"]; months = flags.get("months_after_latest"); has_property = flags.get("property_related_words"); details = flags.get("details", [])
+    risk_data = {"raw": data, "bankruptcy_status": status, "latest_publication_date": flags.get("latest_date"), "months_after_latest": months, "property_related_words": has_property}
+    if status == "active":
+        details.append("Признаки действующей или незавершённой процедуры банкротства.")
+        return risk_item(title, "Выявлены признаки действующего банкротства.", url, details, risk_data)
+    if status == "completed":
+        if months is not None and months < 12:
+            details.append("Процедура завершена менее 1 года назад — требуется повышенная осторожность.")
+            return risk_item(title, "Завершённое банкротство (менее 1 года).", url, details, risk_data)
+        elif months is not None and months < 36:
+            details.append("Процедура завершена менее 3 лет назад — требуется проверка.")
+            return risk_item(title, "Завершённое банкротство (менее 3 лет).", url, details, risk_data)
+        else:
+            details.append("Процедура завершена более 3 лет назад.")
+            return ok_item(title, "Банкротство завершено более 3 лет назад.", url, details, risk_data)
+    if has_property:
+        details.append("В публикациях есть слова, связанные с имуществом/торгами.")
+        return risk_item(title, "Сведения о банкротстве с имущественными признаками.", url, details, risk_data)
+    details.append("Статус процедуры автоматически не определён.")
+    return manual_item(title, "Сведения о банкротстве найдены. Требуется ручная проверка.", url, details)
 
 def court_case_match_score(case, req, source=""):
     score = 0; hard_identifier = False; reasons = []
     full_fio = fio(req).lower(); last = req.last.strip().lower(); first = req.first.strip().lower()
     dob_ru, dob_iso = normalize_dob(req.dob); inn = normalize_inn(req)
-    text = flatten_text(case).lower()
+    region = str(normalize_region(req) or ""); text = flatten_text(case).lower()
     if full_fio and full_fio in text: score += 38; reasons.append("полное ФИО")
-    elif last and last in text: score += 12; reasons.append("фамилия")
-    if first and first in text: score += 10; reasons.append("имя")
-    if dob_ru and (dob_ru in text or dob_iso in text): score += 42; hard_identifier = True; reasons.append("дата рождения")
-    if inn and inn in text: score += 50; hard_identifier = True; reasons.append("ИНН")
+    elif last and last in text: score += 8; reasons.append("фамилия")
+    if first and first in text: score += 4
+    if dob_ru and (dob_ru in text or dob_iso in text): score += 50; hard_identifier = True; reasons.append("дата рождения")
+    if inn and inn in text: score += 60; hard_identifier = True; reasons.append("ИНН")
+    if region and region != "0":
+        if any(re.search(pat, text) for pat in [rf"\b{re.escape(region)}\b", rf"регион.*{re.escape(region)}", rf"код.*{re.escape(region)}"]): score += 8; reasons.append("совпадение региона")
     role_text = flatten_text(case.get("role_text") or case.get("role") or "").lower()
-    if any(w in role_text for w in ["ответчик", "должник"]): score += 10; reasons.append("роль ответчика")
+    if any(w in role_text for w in ["ответчик", "должник", "заинтересован"]): score += 8; reasons.append("роль ответчика")
     score = max(0, min(100, score))
-    if hard_identifier and score >= 80: level = "точное совпадение"
-    elif score >= 42: level = "вероятное совпадение"
+    if hard_identifier and score >= 85: level = "точное совпадение"
+    elif full_fio in text and score >= 50: level = "вероятное совпадение"
+    elif score >= 55: level = "вероятное совпадение"
     else: level = "слабое совпадение"
     return {"court_match_score": score, "match_level": level, "match_reasons": reasons, "source": source}
 
 def normalize_court_case(case, req, source=""):
     match = court_case_match_score(case, req, source)
-    def pick(keys): 
+    def pick(keys):
         for k in keys:
             v = case.get(k)
             if v not in (None, "", [], {}): return clean_str(v) if isinstance(v, str) else flatten_text(v)
         return ""
-    return {
-        "case_number": pick(["case_number", "case_id", "number"]),
-        "court": pick(["court", "court_name"]),
-        "date": pick(["date", "case_date", "published"]),
-        "role": pick(["role_text", "role"]),
-        "category": pick(["category", "case_category", "type", "subject"]),
-        "status": pick(["status", "state", "result", "decision"]),
-        "amount": pick(["amount", "claim_amount", "sum"]),
-        ** match, "raw": case,
-    }
+    return {"case_number": pick(["case_number", "case_id", "number"]), "court": pick(["court", "court_name"]), "date": pick(["date", "case_date", "published"]), "role": pick(["role_text", "role"]), "category": pick(["category", "case_category", "type", "subject"]), "status": pick(["status", "state", "result", "decision"]), "amount": pick(["amount", "claim_amount", "sum"]), **match, "raw": case}
 
 def extract_arbitr_cases(data):
     cases = []
@@ -670,17 +721,54 @@ def classify_egrul_ip(resp):
     return ok_item(title, "Статус ИП не активен.", url, [], data)
 
 def egrn_deep_flags(obj):
-    base = {"registration_ban": False, "manageable_encumbrance": False, "other_encumbrance": False, "points_hint": 0, "details": []}
+    base = {"registration_ban": False, "manageable_encumbrance": False, "other_encumbrance": False, "recent_right_months": None, "recent_right_date": "", "ownership_over_3_years": False, "frequent_transitions": False, "points_hint": 0, "details": []}
     if not isinstance(obj, dict): return base
     enc = obj.get("encumbrances") if isinstance(obj.get("encumbrances"), list) else []
-    text = flatten_text(enc).lower()
-    base["registration_ban"] = any(w in text for w in ["запрещ", "арест", "ограничение регистрац"])
-    base["manageable_encumbrance"] = any(w in text for w in ["ипотек", "залог"])
+    enc_text = flatten_text(enc).lower()
+    base["registration_ban"] = any(w in enc_text for w in ["запрещ", "арест", "ограничение регистрац"])
+    base["manageable_encumbrance"] = any(w in enc_text for w in ["ипотек", "залог"])
     base["other_encumbrance"] = bool(enc) and not base["registration_ban"] and not base["manageable_encumbrance"]
     if base["registration_ban"]: base["points_hint"] = 32; base["details"].append("Запрет/арест регистрации.")
     elif base["manageable_encumbrance"]: base["points_hint"] = 14; base["details"].append("Ипотека/залог.")
     elif base["other_encumbrance"]: base["points_hint"] = 12; base["details"].append("Иное обременение.")
+    rights = obj.get("rights") if isinstance(obj.get("rights"), list) else []
+    right_dates = []
+    for r in rights:
+        if isinstance(r, dict):
+            for dk in ["registrationDate", "dateRegistration", "regDate", "startDate"]:
+                dt = parse_date_any(r.get(dk))
+                if dt and 1998 <= dt.year <= 2030: right_dates.append(dt); break
+    if not right_dates:
+        all_dates = collect_dates_recursive(obj)
+        right_dates = [d for d in all_dates if 1998 <= d.year <= 2030]
+    if right_dates:
+        latest = max(right_dates); months = months_between_dates(latest)
+        base["recent_right_months"] = months; base["recent_right_date"] = latest.strftime("%d.%m.%Y")
+        if months is not None:
+            if months < 3: base["details"].append(f"Право зарегистрировано недавно: {months} мес. назад"); base["points_hint"] += 20
+            elif months < 12: base["details"].append(f"Право зарегистрировано менее 1 года назад"); base["points_hint"] += 12
+            elif months < 36: base["details"].append(f"Право зарегистрировано менее 3 лет назад"); base["points_hint"] += 5
+            else: base["ownership_over_3_years"] = True; base["details"].append("Право зарегистрировано более 3 лет назад")
+        recent_12m = [d for d in right_dates if months_between_dates(d) is not None and months_between_dates(d) < 12]
+        if len(recent_12m) >= 2: base["frequent_transitions"] = True; base["details"].append(f"Частые регистрационные события: {len(recent_12m)} за 12 мес."); base["points_hint"] += 18
+    base["points_hint"] = min(base["points_hint"], 45)
     return base
+
+def collect_dates_recursive(value, skip_birth=True):
+    dates = []
+    def walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                key = str(k).lower()
+                if skip_birth and any(b in key for b in ["birth", "dob", "рожд"]): continue
+                if any(w in key for w in ["date", "дата", "reg", "registr"]):
+                    dt = parse_date_any(v)
+                    if dt: dates.append(dt)
+                if isinstance(v, (dict, list)): walk(v)
+        elif isinstance(x, list):
+            for row in x: walk(row)
+    walk(value)
+    return dates
 
 def classify_egrn(resp):
     title, url = "ЕГРН / Росреестр", "https://rosreestr.gov.ru"
@@ -719,7 +807,12 @@ def classify_all(responses, req=None):
         def add_prefix(item):
             item = dict(item); item["title"] = f"{label} — {item.get('title','Источник')}"; item["person"] = meta; return item
         if meta.get("is_minor"):
-            out.append(add_prefix(manual_item("Несовершеннолетний", "Проверки не выполнялись.", "", ["Нужны законные представители."])))
+            out.append(add_prefix(manual_item("Несовершеннолетний", "Проверки не выполнялись.", "", [
+                "Сделка с участием несовершеннолетнего требует обязательного разрешения органов опеки и попечительства.",
+                "Без этого разрешения сделка может быть оспорена и признана недействительной.",
+                "Необходимо проверить: постановление опеки, условия встречной покупки, зачисление денег на счёт ребёнка.",
+                "Рекомендуется нотариальное удостоверение сделки."
+            ])))
             continue
         out.append(add_prefix(classify_passport(p.get("passport") or {})))
         out.append(add_prefix(classify_passport_fns(p.get("passport_fns") or {}, p.get("inn_resolution"))))
@@ -761,9 +854,15 @@ def risk_scoring(checklist, age=None):
             elif actual > 0: add("ФССП", 10, f"Активные ИП: {rub(actual)}", "medium")
             else: add("ФССП", 5, "ИП найдены", "attention")
         elif "Банкрот" in title:
-            bstatus = data.get("bankruptcy_status")
+            bdata = data if isinstance(data, dict) else {}
+            bstatus = bdata.get("bankruptcy_status"); months = bdata.get("months_after_latest"); has_property = bdata.get("property_related_words")
             if bstatus == "active": add("Банкротство", 75, "Признаки действующей процедуры", "critical")
-            else: add("Банкротство", 22, "Сведения найдены", "medium")
+            elif bstatus == "completed":
+                if months is not None and months < 12: add("Банкротство", 38, f"Завершено < 1 года назад ({months} мес.)", "high")
+                elif months is not None and months < 36: add("Банкротство", 22, f"Завершено < 3 лет назад ({months} мес.)", "medium")
+                else: add("Банкротство", 8, "Завершено > 3 лет назад", "attention")
+            elif has_property: add("Банкротство", 22, "Имущественные признаки в публикациях", "medium")
+            else: add("Банкротство", 22, "Сведения найдены, статус неясен", "medium")
         elif "Арбитраж" in title or "Суды общей" in title:
             cases = item.get("data") if isinstance(item.get("data"), list) else []
             strong = sum(1 for c in cases if isinstance(c, dict) and c.get("match_level") == "точное совпадение")
@@ -864,7 +963,9 @@ def build_local_legal_report(req, checklist, scoring, recs):
 
 async def maybe_deepseek_report(req, checklist, scoring, recs):
     fallback = build_local_legal_report(req, checklist, scoring, recs)
-    if not (USE_DEEPSEEK_REPORT and DEEPSEEK_API_KEY): return fallback
+    if not (USE_DEEPSEEK_REPORT and DEEPSEEK_API_KEY):
+        logger.info("DeepSeek отключён. Использую локальный отчёт.")
+        return fallback
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
@@ -874,12 +975,24 @@ async def maybe_deepseek_report(req, checklist, scoring, recs):
                     {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
                     {"role": "user", "content": build_deepseek_user_prompt(req, checklist, scoring, recs)}],
                     "temperature": 0.3, "max_tokens": 4096})
-            text = resp.json()["choices"][0]["message"]["content"].strip()
+            if resp.status_code != 200:
+                logger.error(f"DeepSeek вернул {resp.status_code}: {resp.text[:300]}")
+                return fallback
+            data = resp.json()
+            if not data.get("choices"):
+                logger.error(f"DeepSeek: нет choices в ответе. Ответ: {json.dumps(data, ensure_ascii=False)[:300]}")
+                return fallback
+            text = data["choices"][0]["message"]["content"].strip()
             text = redact_sensitive_from_ai_text(text)
             text = normalize_legal_report_format(text)
-            if not text or is_ai_refusal(text): return fallback
+            if not text or is_ai_refusal(text):
+                logger.warning("DeepSeek: отказ или пустой ответ")
+                return fallback
+            logger.info("DeepSeek отчёт успешно сгенерирован")
             return text
-    except Exception: return fallback
+    except Exception as e:
+        logger.exception(f"Ошибка DeepSeek: {e}")
+        return fallback
 
 # -------------------- PDF --------------------
 class Palette:
@@ -935,7 +1048,6 @@ def build_pdf_bytes(report):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm, topMargin=13*mm, bottomMargin=14*mm)
     
-    # ВСЕ СТИЛИ С ПРЕФИКСОМ Z_ ЧТОБЫ НЕ КОНФЛИКТОВАТЬ СО СТАНДАРТНЫМИ
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle("Z_Title", fontName=font, fontSize=21, leading=26, textColor=Palette.DARK_BLUE))
     styles.add(ParagraphStyle("Z_Subtitle", fontName=font, fontSize=9, leading=12, textColor=Palette.MID_GRAY))
@@ -961,7 +1073,6 @@ def build_pdf_bytes(report):
     def badge_label(lbl):
         return {"Опасно при самостоятельной сделке": "ОПАСНО", "Высокий риск при самостоятельной сделке": "ВЫСОКИЙ РИСК", "Условно рискованно": "УСЛОВНЫЙ РИСК", "Допустимо к рассмотрению": "ДОПУСТИМО"}.get(lbl, lbl.upper())
     
-    # Header
     header_left = [
         Paragraph("Комплексная проверка<br/>продавца и объекта недвижимости", styles["Z_Title"]),
         Spacer(1, 2*mm),
@@ -1010,10 +1121,8 @@ def build_pdf_bytes(report):
         story.append(Spacer(1, 3.5*mm))
     
     add_card("Главный вывод", scoring.get("conclusion","—"), bg=Palette.OFF_WHITE, border="#D8D3C8")
-    add_card("Решение по авансу", f"{advance.get('decision','')}. {advance.get('comment','')}", 
-             bg=Palette.HIGH_BG if score>=35 else Palette.LOW_BG)
+    add_card("Решение по авансу", f"{advance.get('decision','')}. {advance.get('comment','')}", bg=Palette.HIGH_BG if score>=35 else Palette.LOW_BG)
     
-    # Скоринг breakdown
     story.append(Paragraph("1. Расшифровка рейтинга", styles["Z_H1"]))
     factors = breakdown.get("factors") or scoring.get("factor_rows") or []
     if factors:
@@ -1031,20 +1140,24 @@ def build_pdf_bytes(report):
             ft_style.append(("TEXTCOLOR",(1,idx),(1,idx),colors.HexColor(Palette.for_severity(sev))))
         ft.setStyle(TableStyle(ft_style)); story.append(ft); story.append(Spacer(1,4*mm))
     
-    # Чеклист
     story.append(Paragraph("2. Карта проверок", styles["Z_H1"]))
     ch = [Paragraph("Источник", styles["Z_TableHead"]), Paragraph("Статус", styles["Z_TableHead"]), Paragraph("Вывод", styles["Z_TableHead"])]
     cd = [ch]
     for item in checklist:
-        st = item.get("status",""); cd.append([Paragraph(item.get("title",""), styles["Z_TableCell"]), Paragraph({"ok":"✓","risk":"⚠","manual_check":"?"}.get(st,"?"), styles["Z_TableCell"]), Paragraph(item.get("summary",""), styles["Z_TableCell"])])
+        st = item.get("status","")
+        cd.append([
+            Paragraph(item.get("title",""), styles["Z_TableCell"]),
+            Paragraph({"ok":"ОК","risk":"РИСК","manual_check":"РУЧНАЯ"}.get(st,"?"), styles["Z_TableCell"]),
+            Paragraph(item.get("summary",""), styles["Z_TableCell"])
+        ])
     ct = Table(cd, colWidths=[50*mm,20*mm,104*mm], repeatRows=1)
     ct_style = [("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#E0DDD6")),("BACKGROUND",(0,0),(-1,0),colors.HexColor(Palette.DARK_BLUE)),
                 ("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]
     for idx, item in enumerate(checklist, start=1):
-        st = item.get("status",""); ct_style.append(("BACKGROUND",(0,idx),(2,idx),colors.HexColor({"ok":Palette.LOW_BG,"risk":Palette.HIGH_BG,"manual_check":Palette.MANUAL_BG}.get(st, Palette.OFF_WHITE))))
+        st = item.get("status","")
+        ct_style.append(("BACKGROUND",(0,idx),(2,idx),colors.HexColor({"ok":Palette.LOW_BG,"risk":Palette.HIGH_BG,"manual_check":Palette.MANUAL_BG}.get(st, Palette.OFF_WHITE))))
     ct.setStyle(TableStyle(ct_style)); story.append(ct); story.append(Spacer(1,4*mm))
     
-    # Юридическое заключение
     story.append(Paragraph("3. Экспертное заключение", styles["Z_H1"]))
     for block_type, text in pdf_report_blocks(legal_text):
         if not text.strip(): continue
@@ -1141,7 +1254,7 @@ async def build_full_report(req, include_debug=False):
         "hidden_risks": build_hidden_risks(req),
         "legal_report": legal, "normalized_input": normalized_input(req),
         "participants": public_participants_summary(responses.get("participants") or []),
-        "warnings": [], "notes": ["v4pro – DeepSeek V4 Pro, таймауты 120с, PDF исправлен"]
+        "warnings": [], "notes": ["v4.1 – улучшенный скоринг, логирование, DeepSeek с проверкой ошибок, ЕГРН с датами"]
     }
     if include_debug:
         result["payloads"] = payloads; result["responses"] = responses
@@ -1165,7 +1278,9 @@ def health():
 async def debug_newdb(req: CheckRequest, request: Request):
     verify_debug_key(request)
     try: return await build_full_report(req, include_debug=True)
-    except Exception as e: return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.exception(f"Ошибка debug-newdb: {e}")
+        return {"success": False, "error": str(e)}
 
 @app.post("/check-report")
 async def check_report(req: CheckRequest, request: Request):
@@ -1173,8 +1288,11 @@ async def check_report(req: CheckRequest, request: Request):
     ip = request.client.host if request.client else "unknown"
     check_rate_limit(ip)
     cleanup_expired_reports()
-    try: return await build_full_report(req, include_debug=False)
-    except Exception: return {"success": False, "message": "Ошибка формирования отчёта."}
+    try:
+        return await build_full_report(req, include_debug=False)
+    except Exception as e:
+        logger.exception(f"Ошибка формирования отчёта: {e}")
+        return {"success": False, "message": "Ошибка формирования отчёта."}
 
 @app.get("/download-pdf/{report_id}")
 def download_pdf(report_id: str):
@@ -1193,6 +1311,7 @@ def download_pdf(report_id: str):
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
     except Exception as e:
+        logger.exception(f"Ошибка генерации PDF: {e}")
         return StreamingResponse(
             io.BytesIO(f"PDF generation error: {str(e)}".encode()),
             media_type="text/plain"
