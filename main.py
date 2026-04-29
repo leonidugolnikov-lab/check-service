@@ -11,9 +11,23 @@ Copyright (c) 2026 Ugolnikov SPb. All rights reserved.
 - Усиленное предупреждение для несовершеннолетних
 - Текстовые статусы в PDF вместо эмодзи
 - Логирование ошибок в /check-report
+
+Исправления v4.2 (стабильная версия):
+- Исправлено расположение pdf_report_blocks
+- Добавлен лимит на количество собственников (макс. 50)
+- Периодическая очистка rate_limit_store
+- Улучшенная обработка ошибок в run_one_person_checks
+- Добавлен /health/deep endpoint
 """
 
-import asyncio, io, json, logging, os, re, time, uuid
+import asyncio
+import io
+import json
+import logging
+import os
+import re
+import time
+import uuid
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,14 +57,15 @@ try:
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
+    logger.warning("ReportLab не доступен. PDF-генерация отключена.")
 
 # -------------------- Настройки --------------------
-APP_VERSION = "4.1.0-pro-deepseek"
+APP_VERSION = "4.2.0-pro-deepseek-stable"
 NEWDB_URL = "https://api.newdb.net/v2"
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 USE_DEEPSEEK_REPORT = os.getenv("USE_DEEPSEEK_REPORT", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # Безопасность
@@ -61,6 +76,7 @@ DEBUG_API_KEY = os.getenv("DEBUG_API_KEY", "debug-key-change-me")
 REPORT_TTL_SECONDS = int(os.getenv("REPORT_TTL_SECONDS", "43200"))
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "5"))
 RATE_LIMIT_WINDOW = 3600
+MAX_OWNERS = int(os.getenv("MAX_OWNERS", "50"))
 
 REPORTS: Dict[str, Dict[str, Any]] = {}
 _REPORT_TIMESTAMPS: Dict[str, float] = {}
@@ -159,6 +175,18 @@ def cleanup_expired_reports() -> int:
         REPORTS.pop(rid, None)
         _REPORT_TIMESTAMPS.pop(rid, None)
     return len(expired)
+
+def cleanup_rate_limit_store() -> int:
+    """Очистка устаревших записей rate limit"""
+    now = time.time()
+    to_delete = []
+    for ip, timestamps in _rate_limit_store.items():
+        _rate_limit_store[ip] = [ts for ts in timestamps if now - ts < RATE_LIMIT_WINDOW]
+        if not _rate_limit_store[ip]:
+            to_delete.append(ip)
+    for ip in to_delete:
+        del _rate_limit_store[ip]
+    return len(to_delete)
 
 # -------------------- Утилиты --------------------
 def now_ru() -> str:
@@ -475,7 +503,9 @@ def resolve_final_inn(manual_inn, passport_fns_resp):
     return {"final_inn": "", "manual_inn_masked": "", "fns_inn_masked": "", "status": "missing", "summary": "ИНН не найден."}
 
 def with_final_inn(req, final_inn):
-    data = req.model_dump(); data["inn"] = final_inn; data["seller_inn"] = data["inn_fiz"] = data["innfiz"] = data["innfl"] = ""
+    data = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    data["inn"] = final_inn
+    data["seller_inn"] = data["inn_fiz"] = data["innfiz"] = data["innfl"] = ""
     return CheckRequest(**data)
 
 # -------------------- Классификаторы --------------------
@@ -635,7 +665,7 @@ def court_case_match_score(case, req, source=""):
     if any(w in role_text for w in ["ответчик", "должник", "заинтересован"]): score += 8; reasons.append("роль ответчика")
     score = max(0, min(100, score))
     if hard_identifier and score >= 85: level = "точное совпадение"
-    elif full_fio in text and score >= 50: level = "вероятное совпадение"
+    elif full_fio and full_fio in text and score >= 50: level = "вероятное совпадение"
     elif score >= 55: level = "вероятное совпадение"
     else: level = "слабое совпадение"
     return {"court_match_score": score, "match_level": level, "match_reasons": reasons, "source": source}
@@ -738,9 +768,6 @@ def egrn_deep_flags(obj):
             for dk in ["registrationDate", "dateRegistration", "regDate", "startDate"]:
                 dt = parse_date_any(r.get(dk))
                 if dt and 1998 <= dt.year <= 2030: right_dates.append(dt); break
-    if not right_dates:
-        all_dates = collect_dates_recursive(obj)
-        right_dates = [d for d in all_dates if 1998 <= d.year <= 2030]
     if right_dates:
         latest = max(right_dates); months = months_between_dates(latest)
         base["recent_right_months"] = months; base["recent_right_date"] = latest.strftime("%d.%m.%Y")
@@ -781,8 +808,22 @@ def classify_egrn(resp):
     details = [f"Кадастровый номер: {obj.get('cadNumber', '—')}", f"Тип: {obj.get('objType_text', '—')}", f"Площадь: {obj.get('area', '—')} кв.м"]
     details.extend(profile["details"])
     obj_with_profile = dict(obj); obj_with_profile["_egrn_risk_profile"] = profile
-    if profile["registration_ban"]: return risk_item(title, "Объект найден. Есть ограничение регистрации.", url, details, obj_with_profile)
-    if profile["manageable_encumbrance"] or profile["other_encumbrance"]: return risk_item(title, "Объект найден. Есть обременение.", url, details, obj_with_profile)
+    
+    # Ограничения/обременения
+    if profile["registration_ban"]:
+        return risk_item(title, "Объект найден. Есть ограничение регистрации.", url, details, obj_with_profile)
+    if profile["manageable_encumbrance"] or profile["other_encumbrance"]:
+        return risk_item(title, "Объект найден. Есть обременение.", url, details, obj_with_profile)
+    
+    # Частые переходы права
+    if profile.get("frequent_transitions"):
+        return risk_item(title, "Объект найден. Есть частые регистрационные события.", url, details, obj_with_profile)
+    
+    # Недавняя регистрация права
+    months = profile.get("recent_right_months")
+    if months is not None and months < 12:
+        return risk_item(title, "Объект найден. Право зарегистрировано недавно.", url, details, obj_with_profile)
+    
     return ok_item(title, "Объект найден. Ограничения не выявлены.", url, details, obj_with_profile)
 
 # -------------------- Сборка чеклиста --------------------
@@ -843,9 +884,21 @@ def risk_scoring(checklist, age=None):
         if "ЕГРН" in title:
             profile = data.get("_egrn_risk_profile", {})
             pts = int(profile.get("points_hint", 12))
-            if profile.get("registration_ban"): add("ЕГРН", min(pts,45), "Запрет/арест регистрации", "high")
-            elif profile.get("manageable_encumbrance"): add("ЕГРН", min(pts,24), "Ипотека/залог", "medium")
-            else: add("ЕГРН", min(pts,28), "Обременение", "medium")
+
+            if profile.get("registration_ban"):
+                add("ЕГРН", min(pts,45), "Запрет/арест регистрации", "high")
+
+            elif profile.get("manageable_encumbrance"):
+                add("ЕГРН", min(pts,24), "Ипотека/залог", "medium")
+
+            elif profile.get("frequent_transitions"):
+                add("ЕГРН", min(pts,28), "Частые регистрационные события", "medium")
+
+            elif profile.get("recent_right_months") is not None and profile.get("recent_right_months") < 12:
+                add("ЕГРН", min(pts,24), "Недавняя регистрация права", "medium")
+
+            else:
+                add("ЕГРН", min(pts,28), "Иной риск по объекту", "medium")
         elif "ФССП" in title:
             actual = data.get("actual_debt", 0)
             if actual > 1_000_000: add("ФССП", 38, f"Активные ИП: {rub(actual)}", "high")
@@ -974,6 +1027,7 @@ async def maybe_deepseek_report(req, checklist, scoring, recs):
                 json={"model": "deepseek-v4-pro", "messages": [
                     {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
                     {"role": "user", "content": build_deepseek_user_prompt(req, checklist, scoring, recs)}],
+                    "thinking": {"type": "disabled"},
                     "temperature": 0.3, "max_tokens": 4096})
             if resp.status_code != 200:
                 logger.error(f"DeepSeek вернул {resp.status_code}: {resp.text[:300]}")
@@ -995,6 +1049,48 @@ async def maybe_deepseek_report(req, checklist, scoring, recs):
         return fallback
 
 # -------------------- PDF --------------------
+def pdf_report_blocks(text):
+    """Разбивает текст отчёта на блоки для PDF."""
+    if not text:
+        return []
+    
+    headings = {
+        "Краткий вывод", "Что подтверждено автоматическими источниками",
+        "Что не подтверждено и требует ручной проверки", "Ключевые риски",
+        "Что проверить до аванса", "Логика сделки", "Как передавать аванс",
+        "Итоговое заключение", "Важно"
+    }
+    
+    blocks = []
+    current_paragraph = []
+    
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        
+        if not stripped:
+            if current_paragraph:
+                blocks.append(("p", " ".join(current_paragraph)))
+                current_paragraph = []
+            continue
+        
+        if stripped in headings:
+            if current_paragraph:
+                blocks.append(("p", " ".join(current_paragraph)))
+                current_paragraph = []
+            blocks.append(("h", stripped))
+        elif stripped.startswith("•") or stripped.startswith("-"):
+            if current_paragraph:
+                blocks.append(("p", " ".join(current_paragraph)))
+                current_paragraph = []
+            blocks.append(("bullet", stripped[1:].strip()))
+        else:
+            current_paragraph.append(stripped)
+    
+    if current_paragraph:
+        blocks.append(("p", " ".join(current_paragraph)))
+    
+    return blocks
+
 class Palette:
     DARK_BLUE = "#0A1F3F"; WHITE = "#FFFFFF"; OFF_WHITE = "#F8F7F4"; MID_GRAY = "#6E7F8D"; DARK_TEXT = "#1A1A1A"
     CRITICAL = "#C0392B"; HIGH = "#E67E22"; MEDIUM = "#D4A373"; LOW = "#2EAD63"; MANUAL = "#7F8C8D"
@@ -1043,7 +1139,9 @@ class ScoreGauge(Flowable):
 def p(text): return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
 
 def build_pdf_bytes(report):
-    if not REPORTLAB_AVAILABLE: return ("PDF недоступен.\n\n" + json.dumps(report, ensure_ascii=False, indent=2)).encode("utf-8")
+    if not REPORTLAB_AVAILABLE: 
+        return json.dumps({"error": "PDF generation not available"}, ensure_ascii=False).encode("utf-8")
+    
     font = register_pdf_font()
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm, topMargin=13*mm, bottomMargin=14*mm)
@@ -1169,84 +1267,129 @@ def build_pdf_bytes(report):
     doc.build(story)
     return buf.getvalue()
 
-def pdf_report_blocks(text):
-    headings = {"Краткий вывод","Что подтверждено автоматическими источниками","Что не подтверждено и требует ручной проверки","Ключевые риски","Что проверить до аванса","Логика сделки","Как передавать аванс","Итоговое заключение","Важно"}
-    blocks = []; buf = []
-    for line in (text or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            if buf: blocks.append(("p", " ".join(buf))); buf = []
-            continue
-        if stripped in headings:
-            if buf: blocks.append(("p", " ".join(buf))); buf = []
-            blocks.append(("h", stripped))
-        elif stripped.startswith("•"):
-            if buf: blocks.append(("p", " ".join(buf))); buf = []
-            blocks.append(("bullet", stripped[1:].strip()))
-        else: buf.append(stripped)
-    if buf: blocks.append(("p", " ".join(buf)))
-    return blocks
-
 # -------------------- Pipeline --------------------
 async def run_one_person_checks(client, owner, base_req, label, representative=False):
+    """Запуск проверок для одного человека с обработкой ошибок"""
     person_req = owner_to_check_request(owner, base_req)
     manual_inn = normalize_inn(person_req)
     minor = is_minor_owner(owner)
-    meta = {"label": label, "role": owner.role, "share": owner.share, "is_minor": minor, "age": calculate_age(normalize_dob(owner.dob)[0]), "representative": representative}
+    meta = {"label": label, "role": owner.role, "share": owner.share, "is_minor": minor, 
+            "age": calculate_age(normalize_dob(owner.dob)[0]), "representative": representative}
     resp = {"label": label, "req": person_req, "meta": meta}
+    
     if minor:
-        if owner.has_passport and base_req.run_passport: resp["passport"] = await newdb_run(client, build_payloads(person_req).get("passport"), timeout_sec=120)
-        resp["skipped_due_to_minor"] = True; return resp
+        if owner.has_passport and base_req.run_passport:
+            try:
+                resp["passport"] = await newdb_run(client, build_payloads(person_req).get("passport"), timeout_sec=120)
+            except Exception as e:
+                resp["passport"] = {"state": "failed", "errors_info": [{"error": str(e)}]}
+        resp["skipped_due_to_minor"] = True
+        return resp
+    
     payloads = build_payloads(person_req)
-    first = await asyncio.gather(newdb_run(client, payloads.get("passport"), timeout_sec=120), newdb_run(client, payloads.get("passport_fns"), timeout_sec=120), return_exceptions=True)
-    resp["passport"] = first[0] if not isinstance(first[0], Exception) else {"state":"failed","errors_info":[{"error":str(first[0])}]}
-    resp["passport_fns"] = first[1] if not isinstance(first[1], Exception) else {"state":"failed","errors_info":[{"error":str(first[1])}]}
+    
+    # Запускаем основные проверки с обработкой ошибок
+    try:
+        first = await asyncio.gather(
+            newdb_run(client, payloads.get("passport"), timeout_sec=120),
+            newdb_run(client, payloads.get("passport_fns"), timeout_sec=120),
+            return_exceptions=True
+        )
+        resp["passport"] = first[0] if not isinstance(first[0], Exception) else {"state": "failed", "errors_info": [{"error": str(first[0])}]}
+        resp["passport_fns"] = first[1] if not isinstance(first[1], Exception) else {"state": "failed", "errors_info": [{"error": str(first[1])}]}
+    except Exception as e:
+        resp["passport"] = {"state": "failed", "errors_info": [{"error": str(e)}]}
+        resp["passport_fns"] = {"state": "failed", "errors_info": [{"error": str(e)}]}
+    
     inn_resolution = resolve_final_inn(manual_inn, resp.get("passport_fns") or {})
     resp["inn_resolution"] = inn_resolution
     final_inn = inn_resolution.get("final_inn") or ""
     person_with_inn = with_final_inn(person_req, final_inn)
     payloads_inn = build_payloads(person_with_inn)
-    tasks = [newdb_run(client, payloads_inn.get(k), timeout_sec=120) for k,_ in [("fssp",None),("bankruptcy",None),("arbitr",None),("pravosud",None),("nalog_debt",None),("egrul_ip",None)]]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for (key,_), res in zip([("fssp",None),("bankruptcy",None),("arbitr",None),("pravosud",None),("nalog_debt",None),("egrul_ip",None)], results):
-        resp[key] = {"state":"failed","errors_info":[{"error":str(res)}]} if isinstance(res, Exception) else res
+    
+    # Запускаем проверки по ИНН
+    inn_check_keys = ["fssp", "bankruptcy", "arbitr", "pravosud", "nalog_debt", "egrul_ip"]
+    try:
+        results = await asyncio.gather(
+            *[newdb_run(client, payloads_inn.get(key), timeout_sec=120) for key in inn_check_keys],
+            return_exceptions=True
+        )
+        for key, res in zip(inn_check_keys, results):
+            resp[key] = res if not isinstance(res, Exception) else {"state": "failed", "errors_info": [{"error": str(res)}]}
+    except Exception as e:
+        for key in inn_check_keys:
+            resp[key] = {"state": "failed", "errors_info": [{"error": str(e)}]}
+    
     resp["final_inn_used"] = mask_inn(final_inn)
     return resp
 
 async def run_checks(req):
-    owners = owners_from_request(req); reps = unique_representatives(req, owners)
+    """Запуск всех проверок для запроса"""
+    owners = owners_from_request(req)
+    
+    # Проверка лимита собственников
+    if len(owners) > MAX_OWNERS:
+        raise HTTPException(status_code=400, detail=f"Слишком много собственников (макс. {MAX_OWNERS})")
+    
+    reps = unique_representatives(req, owners)
     payloads = {"participants": [], "egrn": build_payloads(req).get("egrn")}
     responses = {"participants": [], "egrn": None}
+    
     async with httpx.AsyncClient() as client:
         tasks = []
-        for idx, owner in enumerate(owners, 1): tasks.append(run_one_person_checks(client, owner, req, participant_label(idx, owner)))
-        for idx, rep in enumerate(reps, 1): tasks.append(run_one_person_checks(client, rep, req, participant_label(idx, rep, representative=True), representative=True))
+        for idx, owner in enumerate(owners, 1):
+            tasks.append(run_one_person_checks(client, owner, req, participant_label(idx, owner)))
+        for idx, rep in enumerate(reps, 1):
+            tasks.append(run_one_person_checks(client, rep, req, participant_label(idx, rep, representative=True), representative=True))
         egrn_task = newdb_run(client, payloads["egrn"], timeout_sec=180)
+        
         all_res = await asyncio.gather(*tasks, egrn_task, return_exceptions=True)
+    
     responses["participants"] = [r for r in all_res[:-1] if not isinstance(r, Exception)]
-    responses["egrn"] = all_res[-1] if not isinstance(all_res[-1], Exception) else {"state":"failed","errors_info":[{"error":str(all_res[-1])}]}
+    responses["egrn"] = all_res[-1] if not isinstance(all_res[-1], Exception) else {"state": "failed", "errors_info": [{"error": str(all_res[-1])}]}
+    
+    # Если только один участник, дублируем его данные на верхний уровень для обратной совместимости
     if len(responses["participants"]) == 1:
         p = responses["participants"][0]
-        for k in ["passport","passport_fns","fssp","bankruptcy","arbitr","pravosud","nalog_debt","egrul_ip","inn_resolution"]:
+        for k in ["passport", "passport_fns", "fssp", "bankruptcy", "arbitr", "pravosud", "nalog_debt", "egrul_ip", "inn_resolution"]:
             responses[k] = p.get(k)
+    
     return payloads, responses
 
 async def build_full_report(req, include_debug=False):
+    """Построение полного отчёта"""
     payloads, responses = await run_checks(req)
     checklist = classify_all(responses, req)
     age = max_relevant_age(req)
     scoring = risk_scoring(checklist, age=age)
-    scoring_breakdown = {"total_score": scoring["score"], "max_score": 100, "level": scoring["level"], "label": scoring["label"], "conclusion": scoring["conclusion"], "factors": []}
+    
+    scoring_breakdown = {
+        "total_score": scoring["score"], "max_score": 100, "level": scoring["level"],
+        "label": scoring["label"], "conclusion": scoring["conclusion"], "factors": []
+    }
+    
     for f in scoring.get("factor_rows", []):
-        sev = f.get("severity","attention")
-        scoring_breakdown["factors"].append({"source": f["source"], "points": f["points"], "severity": sev, "reason": f["text"], "icon": {"critical":"🔴","high":"🟠","medium":"🟡","attention":"🔵","manual":"⚪"}.get(sev,"⚪"), "impact": {"critical":"Критический стоп-фактор","high":"Высокий риск","medium":"Умеренный риск","attention":"Низкий риск","manual":"Ручная проверка"}.get(sev,"")})
+        sev = f.get("severity", "attention")
+        scoring_breakdown["factors"].append({
+            "source": f["source"], "points": f["points"], "severity": sev,
+            "reason": f["text"],
+            "icon": {"critical": "🔴", "high": "🟠", "medium": "🟡", "attention": "🔵", "manual": "⚪"}.get(sev, "⚪"),
+            "impact": {"critical": "Критический стоп-фактор", "high": "Высокий риск", 
+                      "medium": "Умеренный риск", "attention": "Низкий риск", "manual": "Ручная проверка"}.get(sev, "")
+        })
+    
     recs = build_recommendations(checklist, req)
     legal = await maybe_deepseek_report(req, checklist, scoring, recs)
     report_id = str(uuid.uuid4())
+    
     result = {
-        "success": True, "report_id": report_id, "pdf_available": True, "pdf_url": f"/download-pdf/{report_id}",
+        "success": True, "report_id": report_id, "pdf_available": REPORTLAB_AVAILABLE,
+        "pdf_url": f"/download-pdf/{report_id}" if REPORTLAB_AVAILABLE else None,
         "created_at": now_ru(),
-        "executive_summary": {"label": scoring["label"], "level": scoring["level"], "score": scoring["score"], "max_score": 100, "conclusion": scoring["conclusion"]},
+        "executive_summary": {
+            "label": scoring["label"], "level": scoring["level"],
+            "score": scoring["score"], "max_score": 100, "conclusion": scoring["conclusion"]
+        },
         "screen_report": {"headline": scoring["label"], "score": scoring["score"], "conclusion": scoring["conclusion"]},
         "checklist": strip_service_fields(checklist),
         "risk_scoring": scoring, "scoring_breakdown": scoring_breakdown,
@@ -1254,54 +1397,100 @@ async def build_full_report(req, include_debug=False):
         "hidden_risks": build_hidden_risks(req),
         "legal_report": legal, "normalized_input": normalized_input(req),
         "participants": public_participants_summary(responses.get("participants") or []),
-        "warnings": [], "notes": ["v4.1 – улучшенный скоринг, логирование, DeepSeek с проверкой ошибок, ЕГРН с датами"]
+        "warnings": [], "notes": ["v4.2 – стабильная версия с улучшенной обработкой ошибок"]
     }
+    
     if include_debug:
-        result["payloads"] = payloads; result["responses"] = responses
-    stored = dict(result); stored["normalized_input"] = normalized_input(req, expose_full_inn=False)
-    REPORTS[report_id] = stored; _REPORT_TIMESTAMPS[report_id] = time.time()
+        result["payloads"] = payloads
+        result["responses"] = strip_service_fields(responses)
+    
+    stored = dict(result)
+    stored["normalized_input"] = normalized_input(req, expose_full_inn=False)
+    REPORTS[report_id] = stored
+    _REPORT_TIMESTAMPS[report_id] = time.time()
+    
     return result
 
 # -------------------- Endpoints --------------------
 @app.on_event("startup")
 async def startup():
+    """Запуск фоновых задач очистки"""
     async def cleanup_loop():
         while True:
-            await asyncio.sleep(600); cleanup_expired_reports()
+            await asyncio.sleep(600)
+            expired = cleanup_expired_reports()
+            cleaned_rate = cleanup_rate_limit_store()
+            if expired > 0 or cleaned_rate > 0:
+                logger.info(f"Очистка: удалено отчётов: {expired}, записей rate limit: {cleaned_rate}")
+    
     asyncio.create_task(cleanup_loop())
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": APP_VERSION, "newdb_token": bool(NEWDB_TOKEN), "deepseek_key": bool(DEEPSEEK_API_KEY), "reportlab": REPORTLAB_AVAILABLE}
+    """Базовый healthcheck"""
+    return {
+        "ok": True, "version": APP_VERSION,
+        "newdb_token": bool(NEWDB_TOKEN), "deepseek_key": bool(DEEPSEEK_API_KEY),
+        "reportlab": REPORTLAB_AVAILABLE, "max_owners": MAX_OWNERS
+    }
+
+@app.get("/health/deep")
+def health_deep():
+    """Детальный healthcheck с информацией о загруженности"""
+    return {
+        "ok": True, "version": APP_VERSION,
+        "active_reports": len(REPORTS),
+        "rate_limit_store_size": sum(len(v) for v in _rate_limit_store.values()),
+        "ttl_seconds": REPORT_TTL_SECONDS,
+        "rate_limit_max": RATE_LIMIT_MAX,
+        "rate_limit_window": RATE_LIMIT_WINDOW,
+        "max_owners": MAX_OWNERS
+    }
 
 @app.post("/debug-newdb")
 async def debug_newdb(req: CheckRequest, request: Request):
+    """Debug endpoint для отладки NewDB (требует ключ)"""
     verify_debug_key(request)
-    try: return await build_full_report(req, include_debug=True)
+    try:
+        return await build_full_report(req, include_debug=True)
     except Exception as e:
         logger.exception(f"Ошибка debug-newdb: {e}")
         return {"success": False, "error": str(e)}
 
 @app.post("/check-report")
 async def check_report(req: CheckRequest, request: Request):
+    """Основной endpoint для проверки"""
     verify_widget_key(request)
     ip = request.client.host if request.client else "unknown"
     check_rate_limit(ip)
     cleanup_expired_reports()
+    
     try:
         return await build_full_report(req, include_debug=False)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Ошибка формирования отчёта: {e}")
-        return {"success": False, "message": "Ошибка формирования отчёта."}
+        return {"success": False, "message": "Ошибка формирования отчёта.", "error": str(e) if ENABLE_DEBUG_NEWDB else None}
 
 @app.get("/download-pdf/{report_id}")
 def download_pdf(report_id: str):
+    """Скачивание PDF-отчёта"""
     report = REPORTS.get(report_id)
     if not report:
         return StreamingResponse(
             io.BytesIO(b"Report not found or expired (12h TTL). Please run the check again."),
-            media_type="text/plain"
+            media_type="text/plain",
+            status_code=404
         )
+    
+    if not REPORTLAB_AVAILABLE:
+        return StreamingResponse(
+            io.BytesIO(json.dumps({"error": "PDF generation not available"}, ensure_ascii=False).encode()),
+            media_type="application/json",
+            status_code=503
+        )
+    
     try:
         pdf = build_pdf_bytes(report)
         filename = f"real_estate_report_{report_id[:8]}.pdf"
@@ -1314,5 +1503,11 @@ def download_pdf(report_id: str):
         logger.exception(f"Ошибка генерации PDF: {e}")
         return StreamingResponse(
             io.BytesIO(f"PDF generation error: {str(e)}".encode()),
-            media_type="text/plain"
+            media_type="text/plain",
+            status_code=500
         )
+
+# -------------------- Запуск --------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
