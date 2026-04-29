@@ -934,17 +934,20 @@ def build_pdf_bytes(report):
     font = register_pdf_font()
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm, topMargin=13*mm, bottomMargin=14*mm)
+    
+    # ВСЕ СТИЛИ С ПРЕФИКСОМ Z_ ЧТОБЫ НЕ КОНФЛИКТОВАТЬ СО СТАНДАРТНЫМИ
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle("Title", fontName=font, fontSize=21, leading=26, textColor=Palette.DARK_BLUE))
-    styles.add(ParagraphStyle("Subtitle", fontName=font, fontSize=9, leading=12, textColor=Palette.MID_GRAY))
-    styles.add(ParagraphStyle("H1", fontName=font, fontSize=14, leading=18, spaceBefore=8, spaceAfter=5, textColor=Palette.DARK_BLUE))
-    styles.add(ParagraphStyle("Body", fontName=font, fontSize=9.2, leading=13.5, textColor=Palette.DARK_TEXT, spaceAfter=3))
-    styles.add(ParagraphStyle("CardTitle", fontName=font, fontSize=10.5, leading=13.5, textColor=Palette.DARK_BLUE))
-    styles.add(ParagraphStyle("CardText", fontName=font, fontSize=8.8, leading=12.5, textColor=Palette.DARK_TEXT))
-    styles.add(ParagraphStyle("ScoreNum", fontName=font, fontSize=26, leading=30, alignment=TA_CENTER, textColor=Palette.DARK_BLUE))
-    styles.add(ParagraphStyle("ScoreLbl", fontName=font, fontSize=9, leading=12, alignment=TA_CENTER, textColor=Palette.WHITE))
-    styles.add(ParagraphStyle("TableHead", fontName=font, fontSize=8, leading=10.5, textColor=Palette.WHITE))
-    styles.add(ParagraphStyle("TableCell", fontName=font, fontSize=8.2, leading=11, textColor=Palette.DARK_TEXT))
+    styles.add(ParagraphStyle("Z_Title", fontName=font, fontSize=21, leading=26, textColor=Palette.DARK_BLUE))
+    styles.add(ParagraphStyle("Z_Subtitle", fontName=font, fontSize=9, leading=12, textColor=Palette.MID_GRAY))
+    styles.add(ParagraphStyle("Z_H1", fontName=font, fontSize=14, leading=18, spaceBefore=8, spaceAfter=5, textColor=Palette.DARK_BLUE))
+    styles.add(ParagraphStyle("Z_Body", fontName=font, fontSize=9.2, leading=13.5, textColor=Palette.DARK_TEXT, spaceAfter=3))
+    styles.add(ParagraphStyle("Z_CardTitle", fontName=font, fontSize=10.5, leading=13.5, textColor=Palette.DARK_BLUE))
+    styles.add(ParagraphStyle("Z_CardText", fontName=font, fontSize=8.8, leading=12.5, textColor=Palette.DARK_TEXT))
+    styles.add(ParagraphStyle("Z_ScoreNum", fontName=font, fontSize=26, leading=30, alignment=TA_CENTER, textColor=Palette.DARK_BLUE))
+    styles.add(ParagraphStyle("Z_ScoreLbl", fontName=font, fontSize=9, leading=12, alignment=TA_CENTER, textColor=Palette.WHITE))
+    styles.add(ParagraphStyle("Z_TableHead", fontName=font, fontSize=8, leading=10.5, textColor=Palette.WHITE))
+    styles.add(ParagraphStyle("Z_TableCell", fontName=font, fontSize=8.2, leading=11, textColor=Palette.DARK_TEXT))
+    
     story = []
     scoring = report.get("risk_scoring") or {}
     breakdown = report.get("scoring_breakdown") or {}
@@ -954,39 +957,71 @@ def build_pdf_bytes(report):
     legal_text = report.get("legal_report") or ""
     score = scoring.get("score", 0)
     risk_color = Palette.for_score(score)
+    
     def badge_label(lbl):
         return {"Опасно при самостоятельной сделке": "ОПАСНО", "Высокий риск при самостоятельной сделке": "ВЫСОКИЙ РИСК", "Условно рискованно": "УСЛОВНЫЙ РИСК", "Допустимо к рассмотрению": "ДОПУСТИМО"}.get(lbl, lbl.upper())
+    
     # Header
-    header_left = [Paragraph("Комплексная проверка<br/>продавца и объекта недвижимости", styles["Title"]),
-                   Spacer(1, 2*mm), Paragraph(f"Дата: {report.get('created_at','—')}  •  ID: {report.get('report_id','—')[:8]}", styles["Subtitle"])]
-    score_badge = Table([[Paragraph(badge_label(str(scoring.get('label',''))), styles["ScoreLbl"])],
-                         [Paragraph(str(score), styles["ScoreNum"])],
-                         [Paragraph("из 100", styles["Subtitle"])]], colWidths=[42*mm])
-    score_badge.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor(risk_color)),("BACKGROUND",(0,1),(-1,-1),colors.HexColor(Palette.OFF_WHITE)),
-                                     ("BOX",(0,0),(-1,-1),0.6,colors.HexColor("#E0DDD6")),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]))
-    story.append(Table([[header_left, score_badge]], colWidths=[130*mm,46*mm]))
-    story.append(Spacer(1,5*mm)); story.append(ScoreGauge(score, width=176*mm)); story.append(Spacer(1,5*mm))
+    header_left = [
+        Paragraph("Комплексная проверка<br/>продавца и объекта недвижимости", styles["Z_Title"]),
+        Spacer(1, 2*mm),
+        Paragraph(f"Дата: {report.get('created_at','—')}  •  ID: {report.get('report_id','—')[:8]}", styles["Z_Subtitle"])
+    ]
+    
+    score_badge = Table([
+        [Paragraph(badge_label(str(scoring.get('label',''))), styles["Z_ScoreLbl"])],
+        [Paragraph(str(score), styles["Z_ScoreNum"])],
+        [Paragraph("из 100", styles["Z_Subtitle"])]
+    ], colWidths=[42*mm])
+    
+    score_badge.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor(risk_color)),
+        ("BACKGROUND", (0,1), (-1,-1), colors.HexColor(Palette.OFF_WHITE)),
+        ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor("#E0DDD6")),
+        ("TOPPADDING", (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+    ]))
+    
+    story.append(Table([[header_left, score_badge]], colWidths=[130*mm, 46*mm]))
+    story.append(Spacer(1, 5*mm))
+    story.append(ScoreGauge(score, width=176*mm))
+    story.append(Spacer(1, 5*mm))
+    
     def add_card(title, body, bg=Palette.WHITE, border="#E0DDD6", title_color=Palette.DARK_BLUE):
         content = []
-        if title: content.append(Paragraph(p(title), styles["CardTitle"])); content.append(Spacer(1,2*mm))
+        if title:
+            content.append(Paragraph(p(title), styles["Z_CardTitle"]))
+            content.append(Spacer(1, 2*mm))
         if isinstance(body, list):
-            for line in body: content.append(Paragraph(p(line), styles["CardText"]))
-        else: content.append(Paragraph(p(body), styles["CardText"]))
+            for line in body:
+                content.append(Paragraph(p(line), styles["Z_CardText"]))
+        else:
+            content.append(Paragraph(p(body), styles["Z_CardText"]))
         tbl = Table([[content]], colWidths=[174*mm])
-        tbl.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),colors.HexColor(bg)),("BOX",(0,0),(-1,-1),0.6,colors.HexColor(border)),
-                                 ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8),("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)]))
-        story.append(tbl); story.append(Spacer(1,3.5*mm))
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), colors.HexColor(bg)),
+            ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(border)),
+            ("LEFTPADDING", (0,0), (-1,-1), 8),
+            ("RIGHTPADDING", (0,0), (-1,-1), 8),
+            ("TOPPADDING", (0,0), (-1,-1), 7),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 3.5*mm))
+    
     add_card("Главный вывод", scoring.get("conclusion","—"), bg=Palette.OFF_WHITE, border="#D8D3C8")
-    add_card("Решение по авансу", f"{advance.get('decision','')}. {advance.get('comment','')}", bg=Palette.HIGH_BG if score>=35 else Palette.LOW_BG)
+    add_card("Решение по авансу", f"{advance.get('decision','')}. {advance.get('comment','')}", 
+             bg=Palette.HIGH_BG if score>=35 else Palette.LOW_BG)
+    
     # Скоринг breakdown
-    story.append(Paragraph("1. Расшифровка рейтинга", styles["H1"]))
+    story.append(Paragraph("1. Расшифровка рейтинга", styles["Z_H1"]))
     factors = breakdown.get("factors") or scoring.get("factor_rows") or []
     if factors:
-        fh = [Paragraph("Источник", styles["TableHead"]), Paragraph("Баллы", styles["TableHead"]), Paragraph("Причина", styles["TableHead"])]
+        fh = [Paragraph("Источник", styles["Z_TableHead"]), Paragraph("Баллы", styles["Z_TableHead"]), Paragraph("Причина", styles["Z_TableHead"])]
         fd = [fh]
         for f in factors[:10]:
             sev = f.get("severity","attention")
-            fd.append([Paragraph(f.get("source",""), styles["TableCell"]), Paragraph(f"+{f.get('points',0)}", styles["TableCell"]), Paragraph(f.get("text", f.get("reason","")), styles["TableCell"])])
+            fd.append([Paragraph(f.get("source",""), styles["Z_TableCell"]), Paragraph(f"+{f.get('points',0)}", styles["Z_TableCell"]), Paragraph(f.get("text", f.get("reason","")), styles["Z_TableCell"])])
         ft = Table(fd, colWidths=[60*mm,24*mm,90*mm], repeatRows=1)
         ft_style = [("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#E0DDD6")),("BACKGROUND",(0,0),(-1,0),colors.HexColor(Palette.DARK_BLUE)),
                     ("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]
@@ -995,26 +1030,29 @@ def build_pdf_bytes(report):
             ft_style.append(("BACKGROUND",(0,idx),(2,idx),colors.HexColor(Palette.bg_for_severity(sev))))
             ft_style.append(("TEXTCOLOR",(1,idx),(1,idx),colors.HexColor(Palette.for_severity(sev))))
         ft.setStyle(TableStyle(ft_style)); story.append(ft); story.append(Spacer(1,4*mm))
+    
     # Чеклист
-    story.append(Paragraph("2. Карта проверок", styles["H1"]))
-    ch = [Paragraph("Источник", styles["TableHead"]), Paragraph("Статус", styles["TableHead"]), Paragraph("Вывод", styles["TableHead"])]
+    story.append(Paragraph("2. Карта проверок", styles["Z_H1"]))
+    ch = [Paragraph("Источник", styles["Z_TableHead"]), Paragraph("Статус", styles["Z_TableHead"]), Paragraph("Вывод", styles["Z_TableHead"])]
     cd = [ch]
     for item in checklist:
-        st = item.get("status",""); cd.append([Paragraph(item.get("title",""), styles["TableCell"]), Paragraph({"ok":"✓","risk":"⚠","manual_check":"?"}.get(st,"?"), styles["TableCell"]), Paragraph(item.get("summary",""), styles["TableCell"])])
+        st = item.get("status",""); cd.append([Paragraph(item.get("title",""), styles["Z_TableCell"]), Paragraph({"ok":"✓","risk":"⚠","manual_check":"?"}.get(st,"?"), styles["Z_TableCell"]), Paragraph(item.get("summary",""), styles["Z_TableCell"])])
     ct = Table(cd, colWidths=[50*mm,20*mm,104*mm], repeatRows=1)
     ct_style = [("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#E0DDD6")),("BACKGROUND",(0,0),(-1,0),colors.HexColor(Palette.DARK_BLUE)),
                 ("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]
     for idx, item in enumerate(checklist, start=1):
         st = item.get("status",""); ct_style.append(("BACKGROUND",(0,idx),(2,idx),colors.HexColor({"ok":Palette.LOW_BG,"risk":Palette.HIGH_BG,"manual_check":Palette.MANUAL_BG}.get(st, Palette.OFF_WHITE))))
     ct.setStyle(TableStyle(ct_style)); story.append(ct); story.append(Spacer(1,4*mm))
+    
     # Юридическое заключение
-    story.append(Paragraph("3. Экспертное заключение", styles["H1"]))
+    story.append(Paragraph("3. Экспертное заключение", styles["Z_H1"]))
     for block_type, text in pdf_report_blocks(legal_text):
         if not text.strip(): continue
-        if block_type == "h": story.append(Paragraph(p(text), styles["CardTitle"]))
-        elif block_type == "bullet": story.append(Paragraph(f"• {p(text)}", styles["CardText"]))
-        else: story.append(Paragraph(p(text), styles["Body"]))
+        if block_type == "h": story.append(Paragraph(p(text), styles["Z_CardTitle"]))
+        elif block_type == "bullet": story.append(Paragraph(f"• {p(text)}", styles["Z_CardText"]))
+        else: story.append(Paragraph(p(text), styles["Z_Body"]))
     add_card("Важно", "Отчёт носит информационно-аналитический характер. Не заменяет ручную юридическую проверку.", bg=Palette.OFF_WHITE)
+    
     doc.build(story)
     return buf.getvalue()
 
@@ -1055,7 +1093,7 @@ async def run_one_person_checks(client, owner, base_req, label, representative=F
     final_inn = inn_resolution.get("final_inn") or ""
     person_with_inn = with_final_inn(person_req, final_inn)
     payloads_inn = build_payloads(person_with_inn)
-    tasks = [newdb_run(client, payloads_inn.get(k), timeout_sec=120) for k,t in [("fssp",120),("bankruptcy",120),("arbitr",120),("pravosud",120),("nalog_debt",120),("egrul_ip",120)]]
+    tasks = [newdb_run(client, payloads_inn.get(k), timeout_sec=120) for k,_ in [("fssp",None),("bankruptcy",None),("arbitr",None),("pravosud",None),("nalog_debt",None),("egrul_ip",None)]]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for (key,_), res in zip([("fssp",None),("bankruptcy",None),("arbitr",None),("pravosud",None),("nalog_debt",None),("egrul_ip",None)], results):
         resp[key] = {"state":"failed","errors_info":[{"error":str(res)}]} if isinstance(res, Exception) else res
@@ -1085,7 +1123,6 @@ async def build_full_report(req, include_debug=False):
     checklist = classify_all(responses, req)
     age = max_relevant_age(req)
     scoring = risk_scoring(checklist, age=age)
-    # transparency block
     scoring_breakdown = {"total_score": scoring["score"], "max_score": 100, "level": scoring["level"], "label": scoring["label"], "conclusion": scoring["conclusion"], "factors": []}
     for f in scoring.get("factor_rows", []):
         sev = f.get("severity","attention")
@@ -1104,7 +1141,7 @@ async def build_full_report(req, include_debug=False):
         "hidden_risks": build_hidden_risks(req),
         "legal_report": legal, "normalized_input": normalized_input(req),
         "participants": public_participants_summary(responses.get("participants") or []),
-        "warnings": [], "notes": ["v4pro – DeepSeek V4 Pro, таймауты 120с, улучшенный PDF"]
+        "warnings": [], "notes": ["v4pro – DeepSeek V4 Pro, таймауты 120с, PDF исправлен"]
     }
     if include_debug:
         result["payloads"] = payloads; result["responses"] = responses
