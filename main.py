@@ -870,7 +870,7 @@ async def maybe_deepseek_report(req, checklist, scoring, recs):
             resp = await client.post(
                 f"{DEEPSEEK_BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
-                json={"model": "deepseek-chat", "messages": [
+                json={"model": "deepseek-v4-pro", "messages": [
                     {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
                     {"role": "user", "content": build_deepseek_user_prompt(req, checklist, scoring, recs)}],
                     "temperature": 0.3, "max_tokens": 4096})
