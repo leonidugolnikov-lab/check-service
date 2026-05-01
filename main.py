@@ -108,8 +108,10 @@ class OwnerRequest(BaseModel):
     passport_series: str = ""
     passport_number: str = ""
     seria: str = ""
+    seriapass: str = ""
     series: str = ""
     number: str = ""
+    numberpass: str = ""
     region: Optional[int] = 0
     regioncode: Optional[int] = 0
     share: str = ""
@@ -266,8 +268,8 @@ def normalize_passport(req: CheckRequest) -> Tuple[str, str]:
 
 
 def normalize_passport_owner(owner: OwnerRequest) -> Tuple[str, str]:
-    series = digits_only(owner.passport_series or owner.seria or owner.series)[:4]
-    number = digits_only(owner.passport_number or owner.number)[:6]
+    series = digits_only(owner.passport_series or owner.seriapass or owner.seria or owner.series)[:4]
+    number = digits_only(owner.passport_number or owner.numberpass or owner.number)[:6]
     return series, number
 
 
