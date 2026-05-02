@@ -73,14 +73,16 @@ RATE_LIMIT_WINDOW = 3600
 MAX_OWNERS = int(os.getenv("MAX_OWNERS", "50"))
 
 # Таймауты по методу (секунды)
+# Таймауты увеличены — NewDB обрабатывает complex_by_passport и pravo_search до 3-5 минут
+# По логам: pravo_search тайм-аутил на 120с (ещё шёл), complex_by_passport на ~180с (ещё шёл)
 METHOD_TIMEOUTS = {
-    "complex_by_passport": 180,
-    "pravo_search": 120,
-    "pravo_cases_details": 90,
+    "complex_by_passport": 360,   # до 6 минут — включает 5-10 субпроверок
+    "pravo_search": 300,          # до 5 минут — поиск по всем судам
+    "pravo_cases_details": 120,
     "rosreestr": 300,
-    "nspd_cadastr": 60,
+    "nspd_cadastr": 90,
 }
-DEFAULT_TIMEOUT = 120
+DEFAULT_TIMEOUT = 180
 POLL_INTERVAL_START = 5.0
 POLL_INTERVAL_MAX = 30.0
 POLL_INTERVAL_FACTOR = 1.5
@@ -140,6 +142,7 @@ class CheckRequest(BaseModel):
     cadastral: str = ""
     address: str = ""
     property_query: str = ""
+    skip_report: bool = False
 
 
 # -------------------- Security helpers --------------------
@@ -866,6 +869,24 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
         items.append(error_item("Комплексная проверка по паспорту", "", resp))
         return items
 
+    # Если таймаут — проверяем есть ли частичные данные в results
+    # Если results пустой, возвращаем timeout-ошибку для каждого субметода
+    is_timeout = resp.get("state") == "timeout"
+    has_any_results = bool((resp.get("results") or {}))
+
+    if is_timeout and not has_any_results:
+        for title, url in [
+            ("Паспорт МВД", "https://мвд.рф/сервисы-гувм"),
+            ("Паспорт / ИНН ФНС", "https://service.nalog.ru/inn.do"),
+            ("ФССП", "https://fssp.gov.ru/iss/ip"),
+            ("Залоги (ФНП)", "https://www.reestr-zalogov.ru"),
+            ("ЕГРИП / статус ИП", "https://egrul.nalog.ru"),
+        ]:
+            items.append(manual_item(title,
+                "Проверка не завершилась в срок — NewDB обрабатывает запрос дольше обычного.",
+                url, ["Рекомендуется повторить проверку или проверить вручную по ссылке."]))
+        return items
+
     # Используем extract_submethod_data для правильного извлечения из complex_by_passport
     # --- Паспорт МВД ---
     title_mvd = "Паспорт МВД"
@@ -1030,6 +1051,11 @@ def classify_pravo(
 
     if is_newdb_error(pravo_resp) or has_result_status_500(pravo_resp):
         return error_item(title, url, pravo_resp)
+
+    if pravo_resp.get("state") == "timeout":
+        return manual_item(title,
+            "Поиск по судебным делам не завершился в срок — NewDB обрабатывает запрос дольше обычного.",
+            url, ["Рекомендуется повторить проверку или проверить вручную на портале ГАС Правосудие."])
 
     data, _ = result_data(pravo_resp, "pravo_search")
     if data is None:
@@ -1300,6 +1326,26 @@ def risk_scoring_v5(checklist: List[dict], age: Optional[int] = None) -> dict:
         elif age >= 60:
             add("Возраст", 6, "60–69: ПНД желательно", "medium")
 
+    # Считаем сколько ключевых проверок провалилось или не выполнилось
+    KEY_CHECKS = ["ФССП", "Паспорт МВД", "Паспорт / ИНН", "Суды", "Залоги", "ЕГРН", "ЕГРИП"]
+    failed_key_checks = []
+    for item in checklist:
+        t = str(item.get("title", ""))
+        st = item.get("status", "")
+        sm = str(item.get("summary", "")).lower()
+        if st == "manual_check" and any(k in t for k in KEY_CHECKS):
+            # Нет данных = проверка не выполнилась
+            if any(w in sm for w in ["нет данных", "не получен", "не выполнял", "не запуск", "ошибка"]):
+                failed_key_checks.append(t)
+
+    # Штраф за непройденные ключевые проверки — нельзя говорить "всё ок" если половина не проверена
+    if len(failed_key_checks) >= 4:
+        add("Непройденные проверки", 35, f"Не выполнено {len(failed_key_checks)} ключевых проверок — результат неполный", "high")
+    elif len(failed_key_checks) >= 2:
+        add("Непройденные проверки", 20, f"Не выполнено {len(failed_key_checks)} проверки — результат неполный", "medium")
+    elif len(failed_key_checks) == 1:
+        add("Непройденные проверки", 10, f"Не выполнена проверка: {failed_key_checks[0]}", "attention")
+
     for item in checklist:
         title = str(item.get("title", ""))
         status = item.get("status")
@@ -1368,8 +1414,13 @@ def risk_scoring_v5(checklist: List[dict], age: Optional[int] = None) -> dict:
         level, label = "условно рискованная", "Условно рискованно"
         conclusion = "Критичный запрет не подтверждён, но есть вопросы."
     else:
-        level, label = "допустимая", "Допустимо к рассмотрению"
-        conclusion = "Автоматическая проверка не показала стоп-факторов."
+        # Если есть непройденные проверки — нельзя давать зелёный свет
+        if failed_key_checks:
+            level, label = "неполная проверка", "Результат неполный — есть непройденные проверки"
+            conclusion = f"Часть проверок не выполнилась ({', '.join(failed_key_checks[:2])} и др.). Оценка может не отражать реальных рисков. Рекомендуется повторить проверку или проверить вручную."
+        else:
+            level, label = "допустимая", "Стоп-факторов не выявлено"
+            conclusion = "Автоматическая проверка не показала препятствий для сделки. Ручная проверка документов обязательна."
 
     return {
         "score": score,
@@ -1432,17 +1483,21 @@ def build_hidden_risks() -> List[dict]:
 
 def build_advance_decision(scoring: dict) -> dict:
     score = scoring.get("score", 0)
+    level = scoring.get("level", "")
     if score >= 85:
-        return {"decision": "Аванс не передавать", "level": "stop",
+        return {"decision": "Задаток не передавать", "level": "stop",
                 "comment": "Сначала устранить ключевые риски."}
     if score >= 60:
-        return {"decision": "Аванс только в защищённой схеме", "level": "strict_conditions",
-                "comment": "Документы по каждому пункту."}
+        return {"decision": "Задаток только при защищённой схеме расчётов", "level": "strict_conditions",
+                "comment": "Необходимо закрыть все выявленные вопросы до передачи денег."}
     if score >= 35:
-        return {"decision": "Сначала документы, потом деньги", "level": "caution",
-                "comment": "Закрыть вопросы до аванса."}
-    return {"decision": "Можно переходить к документам", "level": "allowed",
-            "comment": "Стандартная проверка."}
+        return {"decision": "Сначала документы, потом задаток", "level": "caution",
+                "comment": "Закрыть выявленные вопросы до передачи задатка."}
+    if level == "неполная проверка":
+        return {"decision": "Задаток не передавать — проверка неполная", "level": "stop",
+                "comment": "Часть проверок не выполнилась. Необходимо проверить вручную или повторить."}
+    return {"decision": "Можно переходить к проверке документов", "level": "allowed",
+            "comment": "Стоп-факторов не выявлено. Ручная проверка документов обязательна."}
 
 
 # -------------------- DeepSeek отчёт --------------------
@@ -2003,7 +2058,7 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
 
         scoring = risk_scoring_v5(checklist, age=age)
         recs = build_recommendations_v5(checklist, age=age)
-        legal = await maybe_deepseek_report(owner, checklist, scoring, recs)
+        legal = "" if req.skip_report else await maybe_deepseek_report(owner, checklist, scoring, recs)
 
         all_checklists.append(checklist)
         all_scorings.append(scoring)
@@ -2033,11 +2088,11 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
 
     result = {
         "success": True,
+        "report_id": report_id,
         "pdf_available": REPORTLAB_AVAILABLE,
         "pdf_url": f"/download-pdf/{report_id}" if REPORTLAB_AVAILABLE else None,
         "created_at": now_ru(),
         "api_version": APP_VERSION,
-        "_report_id": report_id,
         "executive_summary": {
             "label": combined_scoring["label"],
             "level": combined_scoring["level"],
@@ -2053,6 +2108,7 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
         "legal_report": combined_legal,
         "participants": participants_out,
         "notes": [f"v{APP_VERSION} — complex_by_passport + pravo_search с scoring + rosreestr + nspd_cadastr"],
+        "report_skipped": req.skip_report,
     }
 
     if SHOW_RAW_REGISTRY_DATA and include_debug:
