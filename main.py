@@ -439,26 +439,41 @@ def result_data(resp: dict, method: str):
 
 def extract_submethod_data(complex_resp: dict, submethod: str):
     """Извлекает данные субметода из ответа complex_by_passport.
-    Структура: results.SUBMETHOD.result.data
-    Также пробует: results.SUBMETHOD.data и results.SUBMETHOD напрямую.
+    Поддерживает:
+    - Стандартный: results.SUBMETHOD.result.data
+    - Fallback (синтетический): results.SUBMETHOD напрямую из отдельного запроса
+    - Прямой: results.SUBMETHOD.data
     """
     try:
         results = complex_resp.get("results") or {}
         block = results.get(submethod)
         if not block:
             return None, None
+
         # Стандарт: block.result.data
         result = block.get("result")
         if isinstance(result, dict):
             data = result.get("data")
             if data is not None:
                 return data, result
-            # Иногда data — пустой список [], это валидный ответ
             if "data" in result:
                 return result["data"], result
+
         # Прямой: block.data
         if "data" in block:
             return block["data"], block
+
+        # Fallback: block сам является блоком results из отдельного запроса
+        # Структура: {"result": {"data": [...]}, "state": "complete"}
+        if isinstance(block, dict) and block.get("state") in {"complete", "done"}:
+            inner = block.get("result") or {}
+            if "data" in inner:
+                return inner["data"], inner
+
+        # block — список или строка напрямую
+        if isinstance(block, (list, str)):
+            return block, {}
+
         return None, None
     except Exception:
         return None, None
@@ -476,7 +491,7 @@ async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dic
 
     timeout_sec = METHOD_TIMEOUTS.get(method, DEFAULT_TIMEOUT)
     request_id = str(uuid.uuid4())
-    payload = {"params": params, "requestId": request_id}
+    payload = {**params, "requestId": request_id}
 
     # Первый запрос — создаём задачу
     resp = await newdb_post_json(client, payload)
@@ -1934,11 +1949,49 @@ def owner_person_key(owner: OwnerRequest) -> str:
     ])
 
 
+def build_fallback_payloads(owner: OwnerRequest) -> Dict[str, Optional[dict]]:
+    """Отдельные методы как fallback когда complex_by_passport недоступен."""
+    series, number = normalize_passport_owner(owner)
+    dob_ru, dob_iso = normalize_dob(owner.dob)
+    region = normalize_region_owner(owner)
+    base = {
+        "country": "ru",
+        "seria": series, "number": number,
+        "seriapass": series, "numberpass": number,
+        "firstname": owner.first.strip(),
+        "lastname": owner.last.strip(),
+        "secondname": owner.middle.strip(),
+        "dob": dob_iso,
+        "regioncode": region,
+    }
+    return {
+        "passport_mvd": {**base, "method": "passport_mvd"} if series and number else None,
+        "passport_fns": {**base, "method": "passport_fns"} if series and number else None,
+        "fssp_person":  {**base, "method": "fssp_person"} if dob_iso else None,
+        "pledge_person":{**base, "method": "pledge_person"} if series and number else None,
+        "egrul_ip":     {**base, "method": "egrul_ip"} if dob_iso else None,
+    }
+
+
+def build_synthetic_complex_response(fallback_results: Dict[str, dict]) -> dict:
+    """Собирает синтетический ответ complex_by_passport из отдельных методов."""
+    results = {}
+    for method, resp in fallback_results.items():
+        if resp and str(resp.get("state") or "").lower() in {"complete", "done"}:
+            results[method] = (resp.get("results") or {}).get(method) or {}
+    return {
+        "state": "complete",
+        "_fallback": True,
+        "results": results,
+    }
+
+
 async def run_person_checks(client: httpx.AsyncClient, owner: OwnerRequest) -> Dict[str, Any]:
     """
     Запускает проверки для одного продавца.
     Несовершеннолетние пропускаются полностью (is_minor=True).
-    Запрос 1: complex_by_passport (только если есть паспорт)
+    Запрос 1: complex_by_passport (основной — 1 запрос вместо 5)
+              При 500 — автоматический fallback на 5 отдельных методов
     Запрос 2: pravo_search (по ФИО)
     Запрос 3..N: pravo_cases_details для значимых дел (score >= 50), лимит 10
     """
@@ -1967,12 +2020,31 @@ async def run_person_checks(client: httpx.AsyncClient, owner: OwnerRequest) -> D
     ]
 
     raw = await asyncio.gather(*tasks, return_exceptions=True)
-    result["complex"] = raw[0] if not isinstance(raw[0], Exception) else {
+    complex_resp = raw[0] if not isinstance(raw[0], Exception) else {
         "state": "failed", "errors_info": [{"error": str(raw[0])}]
     }
     result["pravo_search"] = raw[1] if not isinstance(raw[1], Exception) else {
         "state": "failed", "errors_info": [{"error": str(raw[1])}]
     }
+
+    # Fallback: если complex_by_passport вернул 500 — запускаем отдельные методы
+    if has_result_status_500(complex_resp) and complex_payload:
+        logger.warning(f"[complex_by_passport] 500 → fallback на отдельные методы")
+        fallback_payloads = build_fallback_payloads(owner)
+        fallback_tasks = {
+            method: newdb_run(client, payload, method)
+            for method, payload in fallback_payloads.items()
+            if payload
+        }
+        fallback_done = await asyncio.gather(*fallback_tasks.values(), return_exceptions=True)
+        fallback_results = {
+            method: (res if not isinstance(res, Exception) else {"state": "failed"})
+            for method, res in zip(fallback_tasks.keys(), fallback_done)
+        }
+        logger.info(f"[fallback] Результаты: { {m: r.get('state') for m, r in fallback_results.items()} }")
+        result["complex"] = build_synthetic_complex_response(fallback_results)
+    else:
+        result["complex"] = complex_resp
 
     # Фильтруем и скорируем дела
     pravo_data, _ = result_data(result["pravo_search"], "pravo_search")
