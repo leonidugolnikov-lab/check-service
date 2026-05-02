@@ -4,8 +4,7 @@ import json
 import uuid
 import logging
 import asyncio
-from datetime import datetime
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -14,8 +13,8 @@ from pydantic import BaseModel
 
 # ---------- НАСТРОЙКИ ----------
 NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
-PUBLIC_WIDGET_KEY = os.getenv("PUBLIC_WIDGET_KEY", "my_secret_key")   # тот же, что в виджете
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")       # на время отладки можно "*"
+PUBLIC_WIDGET_KEY = os.getenv("PUBLIC_WIDGET_KEY", "my_secret_key")
+ALLOWED_ORIGINS = ["*"]  # для теста – разрешить всем
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -50,28 +49,24 @@ def digits(s: str) -> str:
     return re.sub(r"\D", "", str(s))
 
 def normalize_dob(value: str) -> Optional[str]:
-    """Приводит дату к ISO формату YYYY-MM-DD для NewDB"""
     raw = digits(value)
     if len(raw) == 8:
         return f"{raw[4:8]}-{raw[2:4]}-{raw[:2]}"
-    # если уже с разделителями
     parts = re.split(r"[.\-/]", value)
     if len(parts) == 3:
-        if len(parts[0]) == 4:  # год первый
+        if len(parts[0]) == 4:
             return f"{parts[0]}-{parts[1]}-{parts[2]}"
         else:
             return f"{parts[2]}-{parts[1]}-{parts[0]}"
     return None
 
 def get_passport(req: CheckRequest) -> Tuple[str, str]:
-    """Возвращает (серия, номер) паспорта из любых полей"""
     series = digits(req.passport_series or req.seria or req.seriapass)
     number = digits(req.passport_number or req.number or req.numberpass)
     return series[:4], number[:6]
 
-# ---------- ЗАПРОС К NEWDB (С POLLING) ----------
+# ---------- NEWDB (POLLING) ----------
 async def newdb_request(method: str, params: dict, timeout_sec: int = 180) -> dict:
-    """Отправляет один метод в NewDB, дожидается результата (polling)"""
     if not NEWDB_TOKEN:
         logger.error("NEWDB_TOKEN не задан")
         return {"state": "error", "error": "NEWDB_TOKEN missing"}
@@ -82,52 +77,57 @@ async def newdb_request(method: str, params: dict, timeout_sec: int = 180) -> di
     payload = {"params": params, "requestId": request_id}
 
     async with httpx.AsyncClient(timeout=40) as client:
-        # 1. Создаём задачу
-        resp = await client.post(url, json=payload, headers=headers)
-        data = resp.json()
+        try:
+            resp = await client.post(url, json=payload, headers=headers)
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Ошибка при создании задачи: {e}")
+            return {"state": "error", "error": str(e)}
+
         logger.info(f"[{method}] Создана задача {request_id}, state={data.get('state')}")
         if data.get("state") in ("complete", "done"):
             return data
         if data.get("state") in ("error", "failed"):
-            logger.warning(f"[{method}] Ошибка при создании: {data}")
             return data
 
-        # 2. Опрашиваем
         start = asyncio.get_event_loop().time()
         interval = 3.0
         while (asyncio.get_event_loop().time() - start) < timeout_sec:
             await asyncio.sleep(interval)
             interval = min(interval * 1.5, 20)
-            poll_resp = await client.post(url, json={"requestId": request_id}, headers=headers)
-            poll_data = poll_resp.json()
+            try:
+                poll_resp = await client.post(url, json={"requestId": request_id}, headers=headers)
+                poll_data = poll_resp.json()
+            except Exception as e:
+                logger.error(f"Ошибка при опросе: {e}")
+                continue
             state = poll_data.get("state")
             logger.info(f"[{method}] Опрос {request_id}, state={state}")
             if state in ("complete", "done"):
                 return poll_data
             if state in ("error", "failed"):
-                logger.warning(f"[{method}] Задача завершилась ошибкой: {poll_data}")
                 return poll_data
 
-        logger.error(f"[{method}] Таймаут {timeout_sec}с для {request_id}")
-        return {"state": "timeout", "error": f"Timeout {timeout_sec}s"}
+        logger.error(f"[{method}] Таймаут {timeout_sec}с")
+        return {"state": "timeout", "error": "Timeout"}
 
-# ---------- ПОСТРОЕНИЕ PAYLOAD ДЛЯ COMPLEX_BY_PASSPORT ----------
+# ---------- ПОСТРОЕНИЕ PAYLOAD ----------
 def build_complex_payload(req: CheckRequest) -> Optional[dict]:
     series, number = get_passport(req)
     if not series or not number:
-        logger.warning("Нет серии или номера паспорта")
+        logger.warning("Нет паспортных данных")
         return None
     dob_iso = normalize_dob(req.dob)
     if not dob_iso:
-        logger.warning("Некорректная дата рождения")
+        logger.warning("Нет даты рождения")
         return None
     return {
         "method": "complex_by_passport",
         "country": "ru",
         "seria": series,
         "number": number,
-        "seriapass": series,   # обязательно
-        "numberpass": number,  # обязательно
+        "seriapass": series,
+        "numberpass": number,
         "lastname": req.last.strip(),
         "firstname": req.first.strip(),
         "secondname": req.middle.strip(),
@@ -149,9 +149,8 @@ def build_pravo_payload(req: CheckRequest) -> Optional[dict]:
         "limit": 50,
     }
 
-# ---------- РАЗБОР ОТВЕТОВ ----------
+# ---------- ПАРСИНГ ОТВЕТОВ ----------
 def parse_complex_result(resp: dict) -> List[dict]:
-    """Извлекаем из complex_by_passport отдельные проверки"""
     if resp.get("state") != "complete":
         return [{"title": "Комплексная проверка", "status": "error", "summary": "Не удалось получить данные"}]
 
@@ -168,7 +167,7 @@ def parse_complex_result(resp: dict) -> List[dict]:
         else:
             checklist.append({"title": "Паспорт МВД", "status": "ok", "summary": "Паспорт действителен"})
     else:
-        checklist.append({"title": "Паспорт МВД", "status": "manual", "summary": "Данных нет, проверьте вручную"})
+        checklist.append({"title": "Паспорт МВД", "status": "manual", "summary": "Нет данных, проверьте вручную"})
 
     # ФССП
     fssp = results.get("fssp_person", {})
@@ -178,43 +177,41 @@ def parse_complex_result(resp: dict) -> List[dict]:
         if active:
             checklist.append({"title": "ФССП", "status": "risk", "summary": f"Активных производств: {len(active)}"})
         else:
-            checklist.append({"title": "ФССП", "status": "ok", "summary": "Исполнительных производств не найдено"})
+            checklist.append({"title": "ФССП", "status": "ok", "summary": "Исполнительных производств нет"})
     else:
         checklist.append({"title": "ФССП", "status": "manual", "summary": "Нет данных от ФССП"})
 
-    # Залоги (ФНП)
+    # Залоги
     pledge = results.get("pledge_person", {})
     pledge_data = pledge.get("result", {}).get("data")
     if pledge_data:
         cnt = len(pledge_data) if isinstance(pledge_data, list) else 1
-        checklist.append({"title": "Залоги (ФНП)", "status": "risk", "summary": f"Обнаружено {cnt} записей о залогах"})
+        checklist.append({"title": "Залоги (ФНП)", "status": "risk", "summary": f"Найдено {cnt} записей о залогах"})
     else:
         checklist.append({"title": "Залоги (ФНП)", "status": "ok", "summary": "Залоги не найдены"})
 
-    # ЕГРИП (ИП)
+    # ЕГРИП
     egrul = results.get("egrul_ip", {})
     egrul_data = egrul.get("result", {}).get("data")
     if egrul_data:
         text = json.dumps(egrul_data, ensure_ascii=False).lower()
-        if "действующ" in text or "действителен" in text:
-            checklist.append({"title": "ЕГРИП", "status": "risk", "summary": "Продавец зарегистрирован как ИП (дополнительные риски)"})
+        if "действующ" in text:
+            checklist.append({"title": "ЕГРИП", "status": "risk", "summary": "Продавец зарегистрирован как ИП"})
         else:
-            checklist.append({"title": "ЕГРИП", "status": "ok", "summary": "Статус ИП не активен"})
+            checklist.append({"title": "ЕГРИП", "status": "ok", "summary": "ИП не активен"})
     else:
-        checklist.append({"title": "ЕГРИП", "status": "manual", "summary": "Данных нет, проверьте вручную"})
+        checklist.append({"title": "ЕГРИП", "status": "manual", "summary": "Нет данных"})
 
     return checklist
 
 def parse_pravo_result(resp: dict) -> dict:
     if resp.get("state") != "complete":
-        return {"title": "Суды (ГАС Правосудие)", "status": "error", "summary": "Не удалось получить данные"}
+        return {"title": "Суды (ГАС)", "status": "error", "summary": "Не удалось получить данные"}
     data = resp.get("results", {}).get("pravo_search", {}).get("result", {}).get("data")
     if not isinstance(data, list) or len(data) == 0:
-        return {"title": "Суды (ГАС Правосудие)", "status": "ok", "summary": "Судебные дела по ФИО не найдены"}
-    # Если есть дела – показываем как ручную проверку, так как нужен анализ
-    return {"title": "Суды (ГАС Правосудие)", "status": "manual", "summary": f"Найдено {len(data)} дел. Требуется ручная сверка"}
+        return {"title": "Суды (ГАС)", "status": "ok", "summary": "Судебные дела по ФИО не найдены"}
+    return {"title": "Суды (ГАС)", "status": "manual", "summary": f"Найдено {len(data)} дел. Требуется ручная сверка"}
 
-# ---------- СКОРИНГ ----------
 def compute_score(checklist: List[dict]) -> dict:
     score = 0
     for item in checklist:
@@ -242,22 +239,18 @@ def compute_score(checklist: List[dict]) -> dict:
 # ---------- ОСНОВНОЙ ЭНДПОИНТ ----------
 @app.post("/check-report")
 async def check_report(request: CheckRequest, http_request: Request):
-    # 1. Проверка ключа виджета
     widget_key = http_request.headers.get("X-Widget-Key")
     if widget_key != PUBLIC_WIDGET_KEY:
         raise HTTPException(401, "Invalid X-Widget-Key")
 
-    # 2. Логируем входящие данные (без паспорта для безопасности)
-    logger.info(f"Запрос от {request.last} {request.first}, дата {request.dob}, объект: {request.address or request.cadastral_number}")
+    logger.info(f"Запрос от {request.last} {request.first}, дата {request.dob}")
 
-    # 3. Проверяем, есть ли обязательные поля
     if not request.last or not request.first or not request.dob:
         return {"success": False, "error": "Заполните фамилию, имя и дату рождения"}
     series, number = get_passport(request)
     if not series or len(series) != 4 or not number or len(number) != 6:
         return {"success": False, "error": "Введите серию (4 цифры) и номер (6 цифр) паспорта"}
 
-    # 4. Запускаем параллельные проверки
     complex_payload = build_complex_payload(request)
     pravo_payload = build_pravo_payload(request)
 
@@ -266,21 +259,19 @@ async def check_report(request: CheckRequest, http_request: Request):
         newdb_request("pravo_search", pravo_payload, 120) if pravo_payload else asyncio.sleep(0, {"state": "skipped"}),
     )
 
-    # 5. Разбор ответов
     checklist = []
     if complex_resp and complex_resp.get("state") != "skipped":
         checklist.extend(parse_complex_result(complex_resp))
     else:
-        checklist.append({"title": "Комплексная проверка", "status": "error", "summary": "Не удалось запустить (нет паспортных данных)"})
+        checklist.append({"title": "Комплексная проверка", "status": "error", "summary": "Не удалось запустить"})
 
     if pravo_resp and pravo_resp.get("state") != "skipped":
         checklist.append(parse_pravo_result(pravo_resp))
     else:
-        checklist.append({"title": "Суды", "status": "manual", "summary": "Проверка не выполнялась (нет ФИО)"})
+        checklist.append({"title": "Суды", "status": "manual", "summary": "Проверка не выполнялась"})
 
-    # 6. Скоринг и формирование отчёта
     scoring = compute_score(checklist)
-    report = {
+    return {
         "success": True,
         "report_id": str(uuid.uuid4()),
         "checklist": checklist,
@@ -288,13 +279,12 @@ async def check_report(request: CheckRequest, http_request: Request):
         "recommendations": [
             {"title": "Проверьте оригинал паспорта", "text": "Сравните с данными из МВД"},
             {"title": "Запросите выписку ЕГРН", "text": "Актуальную на день сделки"},
-            {"title": "Аванс – только по письменному соглашению", "text": "С условиями возврата"}
+            {"title": "Аванс только по письменному соглашению", "text": "С условиями возврата"}
         ]
     }
-    logger.info(f"Отчёт сформирован, риск-счёт = {scoring['score']}")
-    return report
 
-# ---------- ЗАПУСК (для локального теста, на Render не нужно) ----------
+# ---------- ЗАПУСК ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
