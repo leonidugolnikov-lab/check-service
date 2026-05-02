@@ -405,8 +405,68 @@ def is_balance_error(data: dict) -> bool:
 
 
 def has_result_status_500(data: dict) -> bool:
-    t = flatten_text(data).lower()
-    return "service is unavailable" in t or "parsing failed" in t or '"status": 500' in t
+    """Проверяет ошибку 500 ТОЛЬКО на верхнем уровне ответа.
+    Не заглядывает в results.*.result — там субметоды могут иметь
+    собственные 500 (например fssp_person) не блокируя остальные данные.
+    """
+    if not isinstance(data, dict):
+        return False
+    # Верхний уровень: _http_status, state, errors_info
+    if data.get("_http_status") == 500:
+        return True
+    top_state = str(data.get("state") or "").lower()
+    if top_state in {"error", "failed"}:
+        err_text = flatten_text(data.get("errors_info") or data.get("error") or "").lower()
+        if "service is unavailable" in err_text or "parsing failed" in err_text:
+            return True
+    # Проверяем errors_info на верхнем уровне
+    err_text = flatten_text(data.get("errors_info") or "").lower()
+    if "service is unavailable" in err_text or "parsing failed" in err_text:
+        return True
+    return False
+
+
+def submethod_has_error_500(data: dict, submethod: str) -> bool:
+    """Проверяет что конкретный субметод вернул 500 (например fssp_person)."""
+    try:
+        block = (data.get("results") or {}).get(submethod) or {}
+        result = block.get("result") or {}
+        return result.get("status") == 500
+    except Exception:
+        return False
+
+
+def is_complex_effectively_complete(resp: dict) -> bool:
+    """Считает complex_by_passport завершённым если все субметоды кроме fssp готовы.
+    Это нужно когда state='in progress' но fssp завис — остальные 10 субметодов уже есть.
+    """
+    if not isinstance(resp, dict):
+        return False
+    state = str(resp.get("state") or "").lower()
+    if state in {"complete", "done"}:
+        return True
+
+    steps = resp.get("steps") or {}
+    if not steps:
+        return False
+
+    # Все субметоды кроме fssp_person должны быть complete
+    KEY_SUBMETHODS = {
+        "terrorist", "passport_mvd", "passport_fns", "pledge_person",
+        "pravo_search", "egrul_ip", "bankrot_person", "arbitr_person",
+        "nalog_debt", "fns_block_person",
+    }
+    for sm in KEY_SUBMETHODS:
+        step = steps.get(sm) or {}
+        if str(step.get("status") or "").lower() not in {"complete", "done"}:
+            return False  # Ключевой субметод ещё не готов
+
+    results = resp.get("results") or {}
+    if not results:
+        return False
+
+    logger.info(f"[complex_by_passport] Эффективно завершён: все ключевые субметоды complete, fssp может быть in progress")
+    return True
 
 
 def result_data(resp: dict, method: str):
@@ -530,6 +590,15 @@ async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dic
             if resp.get("errors_info"):
                 logger.warning(f"[{method}] complete с ошибками: {flatten_text(resp.get('errors_info'))[:300]}")
             return resp
+
+        # Для complex_by_passport: принимаем "in progress" если все ключевые субметоды готовы
+        if method == "complex_by_passport" and state == "in progress":
+            if is_complex_effectively_complete(resp):
+                logger.info(f"[{method}] Принят как complete (fssp завис, остальное готово)")
+                resp["state"] = "complete"
+                resp["_fssp_unavailable"] = True
+                return resp
+
         if state in {"error", "failed"} or is_newdb_error(resp):
             err_info = flatten_text(resp.get("errors_info") or resp.get("error") or resp)[:400]
             if is_balance_error(resp):
@@ -903,10 +972,10 @@ def error_item(title, url, resp: dict):
     return manual_item(title, "Нет данных.", url, details)
 
 
-def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
+def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_resp: dict = None) -> List[dict]:
     """
-    Разбирает ответ complex_by_passport на отдельные чеклист-пункты:
-    паспорт МВД, паспорт ФНС/ИНН, ФССП, залоги, ЕГРИП.
+    Разбирает ответ complex_by_passport на отдельные чеклист-пункты.
+    fssp_retry_resp — результат повторного запроса fssp_person если он завис в complex.
     """
     items = []
 
@@ -930,8 +999,6 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
             items.append(error_item("Комплексная проверка по паспорту", "", resp))
         return items
 
-    # Если таймаут — проверяем есть ли частичные данные в results
-    # Если results пустой, возвращаем timeout-ошибку для каждого субметода
     is_timeout = resp.get("state") == "timeout"
     has_any_results = bool((resp.get("results") or {}))
 
@@ -944,12 +1011,13 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
             ("ЕГРИП / статус ИП", "https://egrul.nalog.ru"),
         ]:
             items.append(manual_item(title,
-                "Проверка не завершилась в срок — NewDB обрабатывает запрос дольше обычного.",
-                url, ["Рекомендуется повторить проверку или проверить вручную по ссылке."]))
+                "Проверка не завершилась в срок.",
+                url, ["Рекомендуется повторить или проверить вручную."]))
         return items
 
-    # Используем extract_submethod_data для правильного извлечения из complex_by_passport
-    # --- Паспорт МВД ---
+    # -----------------------------------------------------------------------
+    # 1. Паспорт МВД
+    # -----------------------------------------------------------------------
     title_mvd = "Паспорт МВД"
     url_mvd = "https://мвд.рф/сервисы-гувм"
     mvd_data, _ = extract_submethod_data(resp, "passport_mvd")
@@ -966,7 +1034,9 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
             items.append(manual_item(title_mvd, "Требуется ручная проверка.", url_mvd,
                                      [flatten_text(mvd_data)[:200]]))
 
-    # --- Паспорт ФНС / ИНН ---
+    # -----------------------------------------------------------------------
+    # 2. Паспорт ФНС / ИНН — показываем ПОЛНЫЙ ИНН на экране и в отчёте
+    # -----------------------------------------------------------------------
     title_fns = "Паспорт / ИНН ФНС"
     url_fns = "https://service.nalog.ru/inn.do"
     fns_data, _ = extract_submethod_data(resp, "passport_fns")
@@ -981,19 +1051,59 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
     else:
         found_inn = extract_inn_from_fns(fns_data)
         if found_inn:
-            items.append(ok_item(title_fns, "ИНН найден по паспорту.", url_fns,
-                                 [f"ИНН: {mask_inn(found_inn)}"],
-                                 {"inn_masked": mask_inn(found_inn)}))
+            items.append(ok_item(
+                title_fns,
+                f"ИНН найден: {found_inn}",
+                url_fns,
+                [f"ИНН: {found_inn}"],
+                {"inn": found_inn, "inn_masked": mask_inn(found_inn)},
+            ))
         else:
             items.append(manual_item(title_fns, "ИНН не найден по паспорту.", url_fns))
 
-    # --- ФССП ---
+    # -----------------------------------------------------------------------
+    # 3. Список террористов / экстремистов (Росфинмониторинг)
+    # -----------------------------------------------------------------------
+    title_terror = "Реестр террористов (Росфинмониторинг)"
+    url_terror = "https://fedsfm.ru/documents/terrorists-catalog-article-6"
+    terror_data, _ = extract_submethod_data(resp, "terrorist")
+    if terror_data is None:
+        items.append(manual_item(title_terror, "Нет данных.", url_terror))
+    else:
+        suggestions = []
+        if isinstance(terror_data, list):
+            for item_t in terror_data:
+                if isinstance(item_t, dict):
+                    suggestions.extend(item_t.get("suggestions") or [])
+        if suggestions:
+            items.append(risk_item(title_terror,
+                f"Найден в реестре террористов: {len(suggestions)} совпадений.",
+                url_terror, [str(s)[:200] for s in suggestions[:3]], {"suggestions": suggestions}))
+        else:
+            items.append(ok_item(title_terror, "В реестре не найден.", url_terror, []))
+
+    # -----------------------------------------------------------------------
+    # 4. ФССП — используем retry если основной завис
+    # -----------------------------------------------------------------------
     title_fssp = "ФССП"
     url_fssp = "https://fssp.gov.ru/iss/ip"
-    fssp_data, _ = extract_submethod_data(resp, "fssp_person")
+
+    # Приоритет: retry > из complex
+    fssp_resp_to_use = None
+    if fssp_retry_resp and str(fssp_retry_resp.get("state") or "").lower() in {"complete", "done"}:
+        fssp_data_raw, _ = result_data(fssp_retry_resp, "fssp_person")
+        fssp_data = fssp_data_raw
+        logger.info(f"[ФССП] Используем retry результат")
+    else:
+        fssp_data, _ = extract_submethod_data(resp, "fssp_person")
+        # Проверяем что это не 500
+        if fssp_data and isinstance(fssp_data, dict) and fssp_data.get("status") == 500:
+            fssp_data = None
 
     if fssp_data is None:
-        items.append(manual_item(title_fssp, "Нет данных ФССП.", url_fssp))
+        fssp_note = "Источник временно недоступен." if resp.get("_fssp_unavailable") else "Нет данных ФССП."
+        items.append(manual_item(title_fssp, fssp_note, url_fssp,
+                                 ["Рекомендуется проверить вручную на сайте ФССП."]))
     elif not isinstance(fssp_data, list):
         items.append(manual_item(title_fssp, "Нестандартный ответ ФССП.", url_fssp))
     elif not fssp_data:
@@ -1027,53 +1137,250 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
         else:
             items.append(ok_item(title_fssp, "Только закрытые ИП.", url_fssp, [], stats))
 
-    # --- Залоги ---
+    # -----------------------------------------------------------------------
+    # 5. Залоги (ФНП) — с прямыми ссылками на уведомления
+    # -----------------------------------------------------------------------
     title_pledge = "Залоги (ФНП)"
     url_pledge = "https://www.reestr-zalogov.ru"
     pledge_data, _ = extract_submethod_data(resp, "pledge_person")
 
+    # Извлекаем fnp_urls из ответа (ссылки на уведомления о залоге)
+    pledge_fnp_urls = []
+    try:
+        results_block = resp.get("results") or {}
+        pledge_block = results_block.get("pledge_person") or {}
+        pledge_result = pledge_block.get("result") or {}
+        pledge_raw = pledge_result.get("data") or []
+        if isinstance(pledge_raw, list) and pledge_raw:
+            first_pledge = pledge_raw[0] if isinstance(pledge_raw[0], dict) else {}
+            pledge_fnp_urls = first_pledge.get("fnp_urls") or []
+    except Exception:
+        pass
+
     if pledge_data is None:
         items.append(manual_item(title_pledge, "Нет данных о залогах.", url_pledge))
-    elif not pledge_data:
+    elif not pledge_data and not pledge_fnp_urls:
         items.append(ok_item(title_pledge, "Залоги не найдены.", url_pledge, []))
     else:
-        # Извлекаем детали каждого залога для отображения
-        pledge_details = ["Проверить предмет залога и кредитора до сделки."]
+        # Есть данные залогов или ссылки на уведомления
+        pledge_details = []
         pledge_display = []
-        for i, p in enumerate(pledge_data if isinstance(pledge_data, list) else [pledge_data], 1):
-            if not isinstance(p, dict):
-                continue
-            detail_parts = []
-            # Предмет залога
-            subj = clean_str(p.get("subject") or p.get("pledgeSubject") or p.get("description") or "")
-            if subj: detail_parts.append(f"Предмет: {subj[:150]}")
-            # Залогодержатель (кредитор)
-            cred = clean_str(p.get("pledgeHolder") or p.get("creditor") or p.get("holderName") or "")
-            if cred: detail_parts.append(f"Залогодержатель: {cred[:100]}")
-            # Залогодатель
-            debtor = clean_str(p.get("pledgeGiver") or p.get("debtor") or p.get("giverName") or "")
-            if debtor: detail_parts.append(f"Залогодатель: {debtor[:100]}")
-            # Дата регистрации
-            reg_date = clean_str(p.get("registrationDate") or p.get("regDate") or p.get("noticeDate") or "")
-            if reg_date: detail_parts.append(f"Дата регистрации: {reg_date}")
-            # Номер уведомления
-            notice = clean_str(p.get("noticeNumber") or p.get("number") or p.get("id") or "")
-            if notice: detail_parts.append(f"Номер уведомления: {notice}")
-            # Статус
-            status = clean_str(p.get("status") or p.get("state") or "")
-            if status: detail_parts.append(f"Статус: {status}")
-            if detail_parts:
-                pledge_details.append(f"Запись {i}: " + "; ".join(detail_parts))
-            pledge_display.append(p)
+        pledge_count = 0
+
+        if isinstance(pledge_data, list) and pledge_data:
+            pledge_count = len(pledge_data)
+            for i, p in enumerate(pledge_data, 1):
+                if not isinstance(p, dict):
+                    continue
+                detail_parts = []
+                subj = clean_str(p.get("subject") or p.get("pledgeSubject") or p.get("description") or "")
+                if subj: detail_parts.append(f"Предмет: {subj[:150]}")
+                cred = clean_str(p.get("pledgeHolder") or p.get("creditor") or p.get("holderName") or "")
+                if cred: detail_parts.append(f"Залогодержатель: {cred[:100]}")
+                debtor = clean_str(p.get("pledgeGiver") or p.get("debtor") or p.get("giverName") or "")
+                if debtor: detail_parts.append(f"Залогодатель: {debtor[:100]}")
+                reg_date = clean_str(p.get("registrationDate") or p.get("regDate") or p.get("noticeDate") or "")
+                if reg_date: detail_parts.append(f"Дата: {reg_date}")
+                notice = clean_str(p.get("noticeNumber") or p.get("number") or p.get("id") or "")
+                if notice: detail_parts.append(f"Уведомление: {notice}")
+                if detail_parts:
+                    pledge_details.append(f"Запись {i}: " + "; ".join(detail_parts))
+                pledge_display.append(p)
+
+        if pledge_fnp_urls:
+            pledge_details.append("Ссылки для ручной проверки залогов:")
+            for url_link in pledge_fnp_urls[:5]:
+                pledge_details.append(f"• {url_link}")
+
+        if not pledge_count and pledge_fnp_urls:
+            pledge_count = len(pledge_fnp_urls)
+            pledge_details.insert(0, "Найдены уведомления о залоге — требуется ручная проверка по ссылкам ниже.")
+
+        pledge_details.insert(0, "Необходима проверка предмета залога до сделки.")
+
         items.append(risk_item(
             title_pledge,
-            f"Найдено залогов: {len(pledge_data) if isinstance(pledge_data, list) else 1}. Необходима проверка до сделки.",
+            f"Найдено уведомлений о залоге: {pledge_count}. Требуется проверка.",
             url_pledge,
             pledge_details,
-            {"pledges": pledge_display, "count": len(pledge_data) if isinstance(pledge_data, list) else 1}
+            {"pledges": pledge_display, "count": pledge_count, "fnp_urls": pledge_fnp_urls},
         ))
 
-    # --- ЕГРИП ---
+    # -----------------------------------------------------------------------
+    # 6. Банкротство (ЕФРСБ) — со ссылками на федресурс и арбитраж
+    # -----------------------------------------------------------------------
+    title_bankrot = "Банкротство (ЕФРСБ)"
+    url_bankrot = "https://fedresurs.ru"
+    bankrot_data, _ = extract_submethod_data(resp, "bankrot_person")
+
+    if bankrot_data is None:
+        items.append(manual_item(title_bankrot, "Нет данных ЕФРСБ.", url_bankrot))
+    elif not bankrot_data or (isinstance(bankrot_data, list) and not any(
+        (d.get("bankruptcy") or []) for d in bankrot_data if isinstance(d, dict)
+    )):
+        items.append(ok_item(title_bankrot, "Банкротных дел не найдено.", url_bankrot, []))
+    else:
+        bankrot_details = []
+        bankrot_links = []
+        bankrot_status_list = []
+
+        for entry in (bankrot_data if isinstance(bankrot_data, list) else [bankrot_data]):
+            if not isinstance(entry, dict):
+                continue
+            for bcase in (entry.get("bankruptcy") or []):
+                if not isinstance(bcase, dict):
+                    continue
+                case_num = clean_str(bcase.get("case_number") or "")
+                case_status = clean_str(bcase.get("status") or "")
+                case_url = clean_str(bcase.get("case_url") or "")
+                bankrot_status_list.append(case_status)
+
+                line = f"Дело {case_num}: {case_status}"
+                bankrot_details.append(line)
+
+                if case_url:
+                    bankrot_links.append({"label": f"Дело {case_num} на Федресурсе", "url": case_url})
+                    bankrot_details.append(f"  → Федресурс: {case_url}")
+
+                # Сообщения о завершении / освобождении от долгов
+                for msg in (bcase.get("messages") or [])[:3]:
+                    if isinstance(msg, dict):
+                        msg_url = clean_str(msg.get("url") or "")
+                        msg_type = clean_str(msg.get("type") or "")
+                        if msg_url and "освобожд" in msg_type.lower():
+                            bankrot_details.append(f"  → {msg_type}: {msg_url}")
+
+        # Ручная проверка
+        bankrot_details.append(f"Проверить вручную: {url_bankrot}")
+
+        is_completed = any("завершен" in s.lower() or "завершено" in s.lower()
+                          for s in bankrot_status_list)
+        is_active = any("реализац" in s.lower() or "наблюден" in s.lower() or "введен" in s.lower()
+                       for s in bankrot_status_list)
+
+        if is_active:
+            summary = "⚠️ Активное банкротное производство — сделка невозможна до завершения."
+            items.append(risk_item(title_bankrot, summary, url_bankrot, bankrot_details,
+                                   {"cases": bankrot_status_list, "links": bankrot_links, "active": True}))
+        elif is_completed:
+            summary = "Банкротство завершено. Проверить дату — сделки до 3 лет могут быть оспорены."
+            items.append(risk_item(title_bankrot, summary, url_bankrot, bankrot_details,
+                                   {"cases": bankrot_status_list, "links": bankrot_links, "active": False}))
+        else:
+            items.append(manual_item(title_bankrot, "Найдены банкротные дела — требуется ручная проверка.",
+                                     url_bankrot, bankrot_details,
+                                     {"cases": bankrot_status_list, "links": bankrot_links}))
+
+    # -----------------------------------------------------------------------
+    # 7. Арбитражные дела (КАД Арбитр) — со ссылками на kad.arbitr.ru
+    # -----------------------------------------------------------------------
+    title_arbitr = "Арбитражные дела (КАД Арбитр)"
+    url_arbitr = "https://kad.arbitr.ru"
+    arbitr_data, _ = extract_submethod_data(resp, "arbitr_person")
+
+    if arbitr_data is None:
+        items.append(manual_item(title_arbitr, "Нет данных арбитража.", url_arbitr))
+    elif not arbitr_data or (isinstance(arbitr_data, list) and not arbitr_data):
+        items.append(ok_item(title_arbitr, "Арбитражных дел не найдено.", url_arbitr, []))
+    else:
+        arbitr_details = []
+        arbitr_links = []
+        arbitr_case_count = 0
+
+        for acase in (arbitr_data if isinstance(arbitr_data, list) else [arbitr_data]):
+            if not isinstance(acase, dict):
+                continue
+            arbitr_case_count += 1
+            case_num = clean_str(acase.get("case_number") or "")
+            case_status = clean_str(acase.get("status") or "")
+            source_url = clean_str(acase.get("source_url") or "")
+
+            line = f"Дело {case_num}: {case_status}"
+            arbitr_details.append(line)
+
+            if source_url:
+                arbitr_links.append({"label": f"Дело {case_num}", "url": source_url})
+                arbitr_details.append(f"  → КАД Арбитр: {source_url}")
+
+            # PDF ссылки на акты
+            for act in (acase.get("acts") or [])[:2]:
+                if isinstance(act, dict) and act.get("link"):
+                    arbitr_details.append(f"  → Акт {act.get('date','')}: {act['link']}")
+
+        arbitr_details.append(f"Проверить вручную: {url_arbitr}")
+
+        # Проверяем тип дел (банкротство или другое)
+        all_text = flatten_text(arbitr_data).lower()
+        is_bankrupt_arbitr = "банкротств" in all_text or "несостоятел" in all_text
+
+        if is_bankrupt_arbitr:
+            summary = f"Арбитражные дела: {arbitr_case_count} (в т.ч. банкротство). Требуется ручная проверка."
+            items.append(risk_item(title_arbitr, summary, url_arbitr, arbitr_details,
+                                   {"count": arbitr_case_count, "links": arbitr_links}))
+        else:
+            summary = f"Найдено арбитражных дел: {arbitr_case_count}."
+            items.append(manual_item(title_arbitr, summary, url_arbitr, arbitr_details,
+                                     {"count": arbitr_case_count, "links": arbitr_links}))
+
+    # -----------------------------------------------------------------------
+    # 8. Налоговая задолженность (ФНС)
+    # -----------------------------------------------------------------------
+    title_nalog = "Налоговая задолженность (ФНС)"
+    url_nalog = "https://service.nalog.ru/debt"
+    nalog_data, _ = extract_submethod_data(resp, "nalog_debt")
+
+    if nalog_data is None:
+        items.append(manual_item(title_nalog, "Нет данных о налоговой задолженности.", url_nalog))
+    else:
+        nalog_text = flatten_text(nalog_data).lower()
+        # Проверяем наличие долга
+        has_debt = False
+        debt_amount = None
+        if isinstance(nalog_data, list):
+            for nd in nalog_data:
+                if isinstance(nd, dict):
+                    debt_info = nd.get("debt") or {}
+                    if isinstance(debt_info, dict):
+                        amount = debt_info.get("amount") or {}
+                        if isinstance(amount, dict) and amount.get("value"):
+                            has_debt = True
+                            debt_amount = amount.get("value")
+
+        if has_debt:
+            items.append(risk_item(title_nalog,
+                f"Налоговая задолженность: {debt_amount}.",
+                url_nalog, [f"Сумма долга: {debt_amount}"], nalog_data))
+        else:
+            # Нет долга
+            updated_text = ""
+            if isinstance(nalog_data, list) and nalog_data:
+                debt_block = nalog_data[0].get("debt") or {} if isinstance(nalog_data[0], dict) else {}
+                updated_text = clean_str(debt_block.get("updated_text") or "")
+            note = f"Долгов нет ({updated_text})" if updated_text else "Долгов нет."
+            items.append(ok_item(title_nalog, note, url_nalog, []))
+
+    # -----------------------------------------------------------------------
+    # 9. Блокировка счетов ФНС
+    # -----------------------------------------------------------------------
+    title_block = "Блокировка счетов (ФНС)"
+    url_block = "https://service.nalog.ru/zd.do"
+    block_data, _ = extract_submethod_data(resp, "fns_block_person")
+
+    if block_data is None:
+        items.append(manual_item(title_block, "Нет данных о блокировках.", url_block))
+    elif isinstance(block_data, list) and not block_data:
+        items.append(ok_item(title_block, "Блокировок счетов не найдено.", url_block, []))
+    else:
+        block_text = flatten_text(block_data)
+        if block_text and block_text != "[]":
+            items.append(risk_item(title_block, "Найдена блокировка счетов ФНС.", url_block,
+                                   [block_text[:300]], block_data))
+        else:
+            items.append(ok_item(title_block, "Блокировок счетов не найдено.", url_block, []))
+
+    # -----------------------------------------------------------------------
+    # 10. ЕГРИП / статус ИП
+    # -----------------------------------------------------------------------
     title_ip = "ЕГРИП / статус ИП"
     url_ip = "https://egrul.nalog.ru"
     ip_data, _ = extract_submethod_data(resp, "egrul_ip")
@@ -1085,12 +1392,28 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
         if any(w in text for w in ["не найден", "отсутств"]):
             items.append(ok_item(title_ip, "Статус ИП не выявлен.", url_ip, [], ip_data))
         elif any(w in text for w in ["действующ", "зарегистрирован", "огрнип"]):
-            items.append(risk_item(title_ip, "Найден действующий ИП.", url_ip,
-                                   ["Проверить предпринимательские долги."], ip_data))
+            # Извлекаем ОГРНИП и ОКВЭД для деталей
+            ip_details = ["Проверить предпринимательские долги и обязательства."]
+            if isinstance(ip_data, list):
+                for ip_entry in ip_data:
+                    if isinstance(ip_entry, dict):
+                        for match in (ip_entry.get("matches") or []):
+                            if isinstance(match, dict):
+                                ogrn = clean_str(match.get("ogrn") or "")
+                                okved = clean_str(match.get("okved_name") or "")
+                                date = clean_str(match.get("ogrn_date") or "")
+                                if ogrn: ip_details.append(f"ОГРНИП: {ogrn}")
+                                if date: ip_details.append(f"Дата регистрации: {date}")
+                                if okved: ip_details.append(f"Вид деятельности: {okved}")
+            items.append(risk_item(title_ip, "Найден действующий ИП.", url_ip, ip_details, ip_data))
         else:
             items.append(ok_item(title_ip, "Статус ИП не активен.", url_ip, [], ip_data))
 
     return items
+    """
+    Разбирает ответ complex_by_passport на отдельные чеклист-пункты:
+    паспорт МВД, паспорт ФНС/ИНН, ФССП, залоги, ЕГРИП.
+    """
 
 
 def classify_pravo(
@@ -1350,11 +1673,12 @@ def classify_all_v5(
     nspd_resp: dict,
     owner: OwnerRequest,
     filtered_cases: Dict[str, List[dict]],
+    fssp_retry_resp: dict = None,
 ) -> List[dict]:
     checklist = []
 
-    # 1. complex_by_passport → несколько пунктов
-    checklist.extend(classify_complex_by_passport(complex_resp, owner))
+    # 1. complex_by_passport → 10 пунктов
+    checklist.extend(classify_complex_by_passport(complex_resp, owner, fssp_retry_resp=fssp_retry_resp))
 
     # 2. Суды общей юрисдикции
     checklist.append(classify_pravo(pravo_resp, details_resps, owner, filtered_cases))
@@ -1388,7 +1712,8 @@ def risk_scoring_v5(checklist: List[dict], age: Optional[int] = None) -> dict:
             add("Возраст", 6, "60–69: ПНД желательно", "medium")
 
     # Считаем сколько ключевых проверок провалилось или не выполнилось
-    KEY_CHECKS = ["ФССП", "Паспорт МВД", "Паспорт / ИНН", "Суды", "Залоги", "ЕГРН", "ЕГРИП"]
+    KEY_CHECKS = ["ФССП", "Паспорт МВД", "Паспорт / ИНН", "Суды", "Залоги", "ЕГРН", "ЕГРИП",
+                  "Банкротство", "Арбитраж", "Реестр террористов", "Налоговая"]
     failed_key_checks = []
     for item in checklist:
         t = str(item.get("title", ""))
@@ -1440,6 +1765,20 @@ def risk_scoring_v5(checklist: List[dict], age: Optional[int] = None) -> dict:
             add("Паспорт МВД", 40, "Риск недействительности", "critical")
         elif "ИП" in title or "ЕГРИП" in title:
             add("ЕГРИП", 16, "Действующий ИП", "medium")
+        elif "Банкротство" in title:
+            is_active = "активное" in (item.get("summary") or "").lower()
+            if is_active:
+                add("Банкротство", 55, "Активное банкротное производство", "critical")
+            else:
+                add("Банкротство", 30, "Завершённое банкротство — риск оспаривания сделки", "high")
+        elif "Арбитраж" in title:
+            add("Арбитраж", 15, "Арбитражные дела", "medium")
+        elif "Реестр террористов" in title:
+            add("Реестр террористов", 100, "Найден в реестре террористов/экстремистов", "critical")
+        elif "Налоговая задолженность" in title:
+            add("Налоговая", 12, "Налоговая задолженность", "medium")
+        elif "Блокировка" in title:
+            add("Блокировка счетов", 10, "Блокировка счетов ФНС", "medium")
         elif "Суды" in title:
             case_data = item.get("data") or {}
             sig_count = case_data.get("significant_count", 0)
@@ -1989,11 +2328,12 @@ def build_synthetic_complex_response(fallback_results: Dict[str, dict]) -> dict:
 async def run_person_checks(client: httpx.AsyncClient, owner: OwnerRequest) -> Dict[str, Any]:
     """
     Запускает проверки для одного продавца.
-    Несовершеннолетние пропускаются полностью (is_minor=True).
-    Запрос 1: complex_by_passport (основной — 1 запрос вместо 5)
-              При 500 — автоматический fallback на 5 отдельных методов
-    Запрос 2: pravo_search (по ФИО)
-    Запрос 3..N: pravo_cases_details для значимых дел (score >= 50), лимит 10
+
+    Логика:
+    1. Запускаем complex_by_passport (содержит 10+ субметодов)
+    2. Если complex включает pravo_search → НЕ запускаем его отдельно
+    3. Если fssp_person в complex завис/ошибка → запускаем отдельно
+    4. Карточки судебных дел только для значимых (score >= 50)
     """
     result: Dict[str, Any] = {
         "owner_key": owner_person_key(owner),
@@ -2002,32 +2342,24 @@ async def run_person_checks(client: httpx.AsyncClient, owner: OwnerRequest) -> D
         "pravo_search": None,
         "pravo_details": [],
         "filtered_cases": {"significant": [], "weak": []},
+        "fssp_retry": None,
     }
 
-    # Несовершеннолетние — не проверяем совсем
     if is_minor_owner(owner):
         logger.info(f"Пропуск несовершеннолетнего: {owner.last} {owner.first}")
         return result
 
     complex_payload = build_complex_by_passport_payload(owner)
-    pravo_payload = build_pravo_search_payload(owner)
 
     logger.info(f"Запуск проверки: {owner.last} {owner.first} (роль: {owner.role})")
 
-    tasks = [
-        newdb_run(client, complex_payload, "complex_by_passport") if complex_payload else _skipped(),
-        newdb_run(client, pravo_payload, "pravo_search") if pravo_payload else _skipped(),
-    ]
+    # Шаг 1: только complex_by_passport
+    if complex_payload:
+        complex_resp = await newdb_run(client, complex_payload, "complex_by_passport")
+    else:
+        complex_resp = {"state": "skipped"}
 
-    raw = await asyncio.gather(*tasks, return_exceptions=True)
-    complex_resp = raw[0] if not isinstance(raw[0], Exception) else {
-        "state": "failed", "errors_info": [{"error": str(raw[0])}]
-    }
-    result["pravo_search"] = raw[1] if not isinstance(raw[1], Exception) else {
-        "state": "failed", "errors_info": [{"error": str(raw[1])}]
-    }
-
-    # Fallback: если complex_by_passport вернул 500 — запускаем отдельные методы
+    # Fallback: если complex_by_passport вернул настоящий 500 (не субметодный)
     if has_result_status_500(complex_resp) and complex_payload:
         logger.warning(f"[complex_by_passport] 500 → fallback на отдельные методы")
         fallback_payloads = build_fallback_payloads(owner)
@@ -2046,7 +2378,56 @@ async def run_person_checks(client: httpx.AsyncClient, owner: OwnerRequest) -> D
     else:
         result["complex"] = complex_resp
 
-    # Фильтруем и скорируем дела
+    # Шаг 2: Проверяем есть ли pravo_search в результатах complex
+    pravo_in_complex, _ = extract_submethod_data(result["complex"], "pravo_search")
+    if pravo_in_complex is not None:
+        logger.info(f"[pravo_search] Данные уже есть в complex_by_passport — отдельный запрос пропущен")
+        # Создаём синтетический ответ pravo_search из complex для совместимости
+        complex_results = result["complex"].get("results") or {}
+        pravo_block = complex_results.get("pravo_search") or {}
+        result["pravo_search"] = {
+            "state": "complete",
+            "_from_complex": True,
+            "results": {"pravo_search": pravo_block},
+        }
+    else:
+        # Запускаем pravo_search отдельно
+        pravo_payload = build_pravo_search_payload(owner)
+        if pravo_payload:
+            logger.info(f"[pravo_search] Запускаем отдельно (в complex нет)")
+            result["pravo_search"] = await newdb_run(client, pravo_payload, "pravo_search")
+        else:
+            result["pravo_search"] = {"state": "skipped"}
+
+    # Шаг 3: Retry ФССП если в complex он завис или вернул ошибку
+    fssp_retry_needed = False
+    if result["complex"].get("_fssp_unavailable"):
+        fssp_retry_needed = True
+        logger.info(f"[fssp_person] Retry — fssp завис в complex")
+    elif submethod_has_error_500(result["complex"], "fssp_person"):
+        fssp_retry_needed = True
+        logger.info(f"[fssp_person] Retry — fssp вернул 500 в complex")
+
+    if fssp_retry_needed:
+        series, number = normalize_passport_owner(owner)
+        _, dob_iso = normalize_dob(owner.dob)
+        region = normalize_region_owner(owner)
+        if dob_iso:
+            fssp_payload = {
+                "method": "fssp_person",
+                "country": "ru",
+                "seria": series, "number": number,
+                "seriapass": series, "numberpass": number,
+                "firstname": owner.first.strip(),
+                "lastname": owner.last.strip(),
+                "secondname": owner.middle.strip(),
+                "dob": dob_iso,
+                "regioncode": region,
+            }
+            result["fssp_retry"] = await newdb_run(client, fssp_payload, "fssp_person")
+            logger.info(f"[fssp_person] Retry state: {result['fssp_retry'].get('state')}")
+
+    # Шаг 4: Фильтруем и скорируем дела
     pravo_data, _ = result_data(result["pravo_search"], "pravo_search")
     if pravo_data and isinstance(pravo_data, list):
         filtered = filter_and_score_cases(pravo_data, owner)
@@ -2163,6 +2544,7 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
             nspd_resp=nspd_resp,
             owner=owner,
             filtered_cases=person_res.get("filtered_cases") or {},
+            fssp_retry_resp=person_res.get("fssp_retry"),
         )
 
         # Добавляем префикс владельца к каждому пункту если несколько собственников
