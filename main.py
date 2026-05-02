@@ -551,7 +551,8 @@ async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dic
 
     timeout_sec = METHOD_TIMEOUTS.get(method, DEFAULT_TIMEOUT)
     request_id = str(uuid.uuid4())
-    payload = {**params, "requestId": request_id}
+    # NewDB API требует обёртку: {"params": {...}, "requestId": "..."}
+    payload = {"params": params, "requestId": request_id}
 
     # Первый запрос — создаём задачу
     resp = await newdb_post_json(client, payload)
