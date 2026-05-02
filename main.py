@@ -931,7 +931,8 @@ def extract_newdb_qid(resp: dict) -> str:
 # -------------------- Классификаторы --------------------
 
 def make_item(title: str, status: str, summary: str, url: str,
-              details: Optional[List[str]] = None, data: Any = None) -> dict:
+              details: Optional[List[str]] = None, data: Any = None,
+              links: Optional[List[Dict[str, str]]] = None) -> dict:
     item = {
         "title": title,
         "source": title,
@@ -940,22 +941,23 @@ def make_item(title: str, status: str, summary: str, url: str,
         "summary": summary,
         "details": details or [],
         "manual_check_url": url,
+        "manual_links": links or [],
     }
     if data is not None:
         item["data"] = data
     return item
 
 
-def ok_item(title, summary, url, details=None, data=None):
-    return make_item(title, "ok", summary, url, details, data)
+def ok_item(title, summary, url, details=None, data=None, links=None):
+    return make_item(title, "ok", summary, url, details, data, links)
 
 
-def risk_item(title, summary, url, details=None, data=None):
-    return make_item(title, "risk", summary, url, details, data)
+def risk_item(title, summary, url, details=None, data=None, links=None):
+    return make_item(title, "risk", summary, url, details, data, links)
 
 
-def manual_item(title, summary, url, details=None, data=None):
-    return make_item(title, "manual_check", summary, url, details, data)
+def manual_item(title, summary, url, details=None, data=None, links=None):
+    return make_item(title, "manual_check", summary, url, details, data, links)
 
 
 def skipped_item(title, url):
@@ -1199,12 +1201,20 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
 
         pledge_details.insert(0, "Необходима проверка предмета залога до сделки.")
 
+        # Подготавливаем структурированные ссылки для виджета
+        pledge_links_list = []
+        for u in pledge_fnp_urls[:5]:
+            pledge_links_list.append({"label": "Уведомление о залоге (ФНП)", "url": u})
+        # Плюс ссылка на сам реестр
+        pledge_links_list.append({"label": "Реестр залогов (ручная проверка)", "url": url_pledge})
+
         items.append(risk_item(
             title_pledge,
             f"Найдено уведомлений о залоге: {pledge_count}. Требуется проверка.",
             url_pledge,
             pledge_details,
             {"pledges": pledge_display, "count": pledge_count, "fnp_urls": pledge_fnp_urls},
+            links=pledge_links_list,
         ))
 
     # -----------------------------------------------------------------------
@@ -1262,15 +1272,18 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
         if is_active:
             summary = "⚠️ Активное банкротное производство — сделка невозможна до завершения."
             items.append(risk_item(title_bankrot, summary, url_bankrot, bankrot_details,
-                                   {"cases": bankrot_status_list, "links": bankrot_links, "active": True}))
+                                   {"cases": bankrot_status_list, "links": bankrot_links, "active": True},
+                                   links=bankrot_links))
         elif is_completed:
             summary = "Банкротство завершено. Проверить дату — сделки до 3 лет могут быть оспорены."
             items.append(risk_item(title_bankrot, summary, url_bankrot, bankrot_details,
-                                   {"cases": bankrot_status_list, "links": bankrot_links, "active": False}))
+                                   {"cases": bankrot_status_list, "links": bankrot_links, "active": False},
+                                   links=bankrot_links))
         else:
             items.append(manual_item(title_bankrot, "Найдены банкротные дела — требуется ручная проверка.",
                                      url_bankrot, bankrot_details,
-                                     {"cases": bankrot_status_list, "links": bankrot_links}))
+                                     {"cases": bankrot_status_list, "links": bankrot_links},
+                                     links=bankrot_links))
 
     # -----------------------------------------------------------------------
     # 7. Арбитражные дела (КАД Арбитр) — со ссылками на kad.arbitr.ru
@@ -1317,11 +1330,13 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
         if is_bankrupt_arbitr:
             summary = f"Арбитражные дела: {arbitr_case_count} (в т.ч. банкротство). Требуется ручная проверка."
             items.append(risk_item(title_arbitr, summary, url_arbitr, arbitr_details,
-                                   {"count": arbitr_case_count, "links": arbitr_links}))
+                                   {"count": arbitr_case_count, "links": arbitr_links},
+                                   links=arbitr_links))
         else:
             summary = f"Найдено арбитражных дел: {arbitr_case_count}."
             items.append(manual_item(title_arbitr, summary, url_arbitr, arbitr_details,
-                                     {"count": arbitr_case_count, "links": arbitr_links}))
+                                     {"count": arbitr_case_count, "links": arbitr_links},
+                                     links=arbitr_links))
 
     # -----------------------------------------------------------------------
     # 8. Налоговая задолженность (ФНС)
@@ -1927,6 +1942,22 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 • Пиши конкретно: не «возможны риски», а «сделка может быть оспорена по основаниям \
 статьи 61.2 Закона о банкротстве в течение трёх лет с даты её совершения».
 
+ФОРМАТ ВЫВОДА — ЭТО КРИТИЧЕСКИ ВАЖНО ДЛЯ ЧИТАЕМОСТИ
+• Каждый смысловой блок — отдельным абзацем с пустой строкой перед ним. \
+Не пиши длинные простыни текста на 10 строк без разрывов.
+• Заголовки разделов всегда начинай с НОВОЙ строки и оставляй пустую строку перед заголовком \
+и после него.
+• Списки в виде маркеров (•) — каждый пункт с НОВОЙ строки. \
+Не склеивай несколько пунктов в одну строку через символы или запятые.
+• Длинные пункты списка с подпунктами оформляй так: \
+основной пункт с маркером •, подпункты — с НОВОЙ строки с отступом и маркером ◦ или —.
+• После каждого пункта плана действий (Шаг 1, Шаг 2 и т.д.) делай пустую строку \
+перед следующим шагом.
+• Внутри одного шага пункты «Действие», «Кто делает», «Срок», «Что получить на руки» — \
+каждый с НОВОЙ строки, с маркером •.
+• Не используй markdown-разметку (звёздочки, решётки, дефисы для заголовков) — \
+только обычный текст с переносами строк и символом •.
+
 ПРАВИЛА РАБОТЫ С ДАННЫМИ
 • Строго опирайся на переданные данные. Не придумывай угрозы которых нет в данных.
 • Не раскрывай паспортные данные, ИНН, дату рождения продавца.
@@ -1975,18 +2006,51 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Если есть препятствие для регистрации (арест или запрет в ЕГРН, недействительный паспорт, активное банкротство):
 Объясни что именно и по какой норме блокирует сделку. \
 Дай последовательность действий по устранению препятствия с ответственными и сроками. \
-Чётко укажи: до устранения препятствия передавать задаток или аванс напрямую продавцу категорически \
-не рекомендуется — покупатель рискует потерять деньги без возможности защиты.
+Чётко укажи: сделка ВОЗМОЖНА, но только при условии полного и грамотного юридического сопровождения, \
+с обязательным привлечением профильных специалистов в сфере недвижимости \
+(юрист по сделкам, нотариус, при необходимости — финансовый агент банка). \
+Расчёты с продавцом должны быть строго регламентированы и контролируемы: \
+сначала из средств покупателя — через механизмы условного депонирования \
+(аккредитив по статье 867 Гражданского кодекса Российской Федерации, \
+депозит нотариуса по статье 327 Гражданского кодекса Российской Федерации, \
+эскроу по статье 860.7 Гражданского кодекса Российской Федерации) — \
+снимаются все запреты и обременения, затем проводится регистрация перехода права, \
+и только после регистрации деньги становятся доступны продавцу. \
+Прямая передача средств продавцу до снятия ограничений категорически недопустима — \
+покупатель рискует потерять деньги без правовой защиты.
 
-Если есть управляемые угрозы (долги ФССП, залоги, судебные дела, недавняя регистрация права, банкротство менее трёх лет):
+Если есть управляемые угрозы (долги ФССП, залоги, ипотека, судебные дела, \
+недавняя регистрация права, банкротство менее трёх лет, арбитражные дела, \
+налоговая задолженность, блокировка счетов):
+Главный тезис: сделка возможна и не требует отказа, но требует управляемого сценария \
+с привлечением специалистов. Опиши конкретный механизм:
+
+1. Привлечение юриста по сделкам с недвижимостью или нотариуса для сопровождения — \
+обязательно для составления договора и контроля порядка расчётов.
+2. Использование защищённой схемы расчётов: аккредитив, депозит нотариуса или эскроу — \
+выбор зависит от ситуации; деньги уходят продавцу только после регистрации перехода права \
+и снятия всех обременений.
+3. Если есть долги или залоги, которые продавец не может погасить из своих средств — \
+расчёт строится по схеме «гашение из суммы покупателя через защищённый счёт»: \
+часть средств направляется напрямую кредитору или приставу, остаток — продавцу \
+после регистрации.
+4. Письменная фиксация всех условий в предварительном договоре или соглашении о задатке: \
+порядок снятия обременений, сроки, ответственность сторон.
+
 Раздели план на два горизонта:
 
-ДО ПЕРЕДАЧИ ЗАДАТКА ИЛИ АВАНСА — что обязательно закрыть до того как деньги уйдут продавцу. \
+ДО ПЕРЕДАЧИ ЗАДАТКА ИЛИ АВАНСА — что обязательно закрыть или зафиксировать письменно \
+до того как деньги уйдут продавцу. \
 Для каждого пункта: действие → кто делает → срок → что получить на руки. \
-Без закрытия этих пунктов аванс не передавать.
+Подчеркни что задаток/аванс при наличии обременений передаётся только после: \
+а) подписания письменного соглашения с конкретным перечнем обязательств продавца; \
+б) согласования схемы расчётов с использованием защищённого счёта; \
+в) подтверждения возможности снятия обременений (справки от кредитора, приставов).
 
 ПОСЛЕ АВАНСА — ДО ПОДПИСАНИЯ ОСНОВНОГО ДОГОВОРА — что проверять и готовить дальше. \
-Сроки, ответственные, правовые основания.
+Сроки, ответственные, правовые основания. Включи: получение справок об отсутствии \
+задолженностей после погашения, актуальную выписку из ЕГРН после снятия обременений, \
+финальную сверку документов перед регистрацией.
 
 Поскольку аванс обычно передаётся напрямую продавцу — особо укажи: \
 соглашение о задатке (или авансе) должно содержать конкретный перечень документов \
@@ -2702,6 +2766,21 @@ def p(text):
     return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
 
 
+def p_links(text):
+    """Как p(), но превращает URL в кликабельные ссылки (синие, подчёркнутые).
+    reportlab поддерживает <link href="...">текст</link> внутри Paragraph.
+    """
+    safe = p(text)
+    # Находим http(s) URL и заменяем на <link>
+    url_pattern = re.compile(r'(https?://[^\s<>"\']+)')
+    def replace_url(m):
+        url = m.group(1).rstrip('.,;:!?')
+        # короткое отображение если URL длинный
+        display = url if len(url) <= 60 else url[:57] + "..."
+        return f'<link href="{url}" color="#1A4F8F"><u>{display}</u></link>'
+    return url_pattern.sub(replace_url, safe)
+
+
 def build_pdf_bytes(report):
     if not REPORTLAB_AVAILABLE:
         return json.dumps({"error": "PDF generation not available"}, ensure_ascii=False).encode("utf-8")
@@ -2824,10 +2903,10 @@ def build_pdf_bytes(report):
 
         # Детали — только если нет расширенных данных
         if not has_rich_data:
-            details = (item.get("details") or [])[:6]
+            details = (item.get("details") or [])[:8]
             if details:
                 for d in details:
-                    summary_cell.append(Paragraph(p(f"— {d}"), styles["Z_Detail"]))
+                    summary_cell.append(Paragraph(p_links(f"— {d}"), styles["Z_Detail"]))
         if isinstance(data, dict):
             # ФССП
             if data.get("active_count") is not None:
@@ -2835,6 +2914,21 @@ def build_pdf_bytes(report):
                     p(f"Активных: {data.get('active_count',0)}, закрытых: {data.get('closed_count',0)}, долг: {rub(data.get('actual_debt',0))}"),
                     styles["Z_Detail"]
                 ))
+            # Залоги — ссылки на уведомления ФНП
+            fnp_urls = data.get("fnp_urls") or []
+            if fnp_urls:
+                summary_cell.append(Paragraph(p("Ссылки на уведомления ФНП:"), styles["Z_Detail"]))
+                for u in fnp_urls[:5]:
+                    summary_cell.append(Paragraph(p_links(f"  • {u}"), styles["Z_Detail"]))
+            # Структурированные ссылки (банкротство Федресурс, арбитраж КАД)
+            structured_links = data.get("links") or []
+            if structured_links:
+                for ln in structured_links[:6]:
+                    if isinstance(ln, dict) and ln.get("url"):
+                        label = ln.get("label") or ln.get("url")
+                        url = ln["url"]
+                        line = f'  • <link href="{p(url)}" color="#1A4F8F"><u>{p(label)}</u></link>'
+                        summary_cell.append(Paragraph(line, styles["Z_Detail"]))
             # Залоги
             pledges = data.get("pledges")
             if pledges:
