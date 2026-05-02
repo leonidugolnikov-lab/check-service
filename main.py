@@ -392,6 +392,18 @@ def is_newdb_error(data: dict) -> bool:
     return not isinstance(data, dict) or bool(data.get("errors_info")) or data.get("state") in {"failed", "error"}
 
 
+def is_balance_error(data: dict) -> bool:
+    """Проверяет что ошибка связана с нехваткой токенов/баланса NewDB."""
+    if not isinstance(data, dict):
+        return False
+    text = flatten_text(data.get("errors_info") or data.get("error") or "").lower()
+    balance_keywords = [
+        "insufficient", "balance", "credit", "токен", "лимит", "limit exceeded",
+        "not enough", "quota", "funds", "payment", "no credits", "пополни"
+    ]
+    return any(k in text for k in balance_keywords)
+
+
 def has_result_status_500(data: dict) -> bool:
     t = flatten_text(data).lower()
     return "service is unavailable" in t or "parsing failed" in t or '"status": 500' in t
@@ -470,7 +482,11 @@ async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dic
     resp = await newdb_post_json(client, payload)
 
     if is_newdb_error(resp) or has_result_status_500(resp):
-        logger.warning(f"[{method}] Ошибка при первом запросе: {flatten_text(resp)[:300]}")
+        err_text = flatten_text(resp)[:400]
+        if is_balance_error(resp):
+            logger.error(f"[{method}] НЕДОСТАТОЧНО ТОКЕНОВ NEWDB: {err_text}")
+        else:
+            logger.warning(f"[{method}] Ошибка при первом запросе: {err_text}")
         return resp
 
     state = str(resp.get("state") or "").lower()
@@ -518,11 +534,20 @@ def build_complex_by_passport_payload(owner: OwnerRequest) -> Optional[dict]:
     """
     series, number = normalize_passport_owner(owner)
     if not series or not number:
+        logger.warning(
+            f"[complex_by_passport] Пропуск — нет паспорта: "
+            f"last={owner.last!r} passport_series={owner.passport_series!r} "
+            f"seriapass={owner.seriapass!r} seria={owner.seria!r} series={owner.series!r} "
+            f"passport_number={owner.passport_number!r} numberpass={owner.numberpass!r} number={owner.number!r}"
+        )
         return None
 
     dob_ru, dob_iso = normalize_dob(owner.dob)
     if not dob_iso:
+        logger.warning(f"[complex_by_passport] Пропуск — не распознана дата рождения: dob={owner.dob!r}")
         return None
+
+    logger.info(f"[complex_by_passport] Payload OK: {owner.last} {owner.first}, series={series}, dob_iso={dob_iso}")
 
     region = normalize_region_owner(owner)
 
@@ -866,7 +891,19 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
         return items
 
     if is_newdb_error(resp) or has_result_status_500(resp):
-        items.append(error_item("Комплексная проверка по паспорту", "", resp))
+        if is_balance_error(resp):
+            for title, url in [
+                ("Паспорт МВД", "https://мвд.рф/сервисы-гувм"),
+                ("Паспорт / ИНН ФНС", "https://service.nalog.ru/inn.do"),
+                ("ФССП", "https://fssp.gov.ru/iss/ip"),
+                ("Залоги (ФНП)", "https://www.reestr-zalogov.ru"),
+                ("ЕГРИП / статус ИП", "https://egrul.nalog.ru"),
+            ]:
+                items.append(manual_item(title,
+                    "Проверка недоступна — недостаточно токенов NewDB.",
+                    url, ["Пополните баланс NewDB и повторите проверку."]))
+        else:
+            items.append(error_item("Комплексная проверка по паспорту", "", resp))
         return items
 
     # Если таймаут — проверяем есть ли частичные данные в results
@@ -1461,7 +1498,7 @@ def build_recommendations_v5(checklist: List[dict], age: Optional[int] = None) -
             recs.append({"priority": "critical", "title": "Проверить подлинность паспорта",
                          "text": "Нотариальное заверение или оригинал в МВД."})
 
-    recs.append({"priority": "high", "title": "Защитное соглашение о задатке (или авансе)",
+    recs.append({"priority": "high", "title": "Предварительный договор купли-продажи с задатком",
                  "text": "Закрепить условия возврата и ответственность."})
     return recs
 
@@ -1571,16 +1608,13 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 
 Сначала определи сценарий по данным и выбери соответствующую логику:
 
-СЦЕНАРИЙ А — есть препятствие для регистрации \
-(арест или запрет на объект в ЕГРН, недействительный паспорт продавца, активное банкротство):
+Если есть препятствие для регистрации (арест или запрет в ЕГРН, недействительный паспорт, активное банкротство):
 Объясни что именно и по какой норме блокирует сделку. \
 Дай последовательность действий по устранению препятствия с ответственными и сроками. \
 Чётко укажи: до устранения препятствия передавать задаток или аванс напрямую продавцу категорически \
 не рекомендуется — покупатель рискует потерять деньги без возможности защиты.
 
-СЦЕНАРИЙ Б — есть управляемые угрозы \
-(долги по исполнительным производствам, залоги физлица, судебные дела, \
-недавняя регистрация права, завершённое банкротство менее трёх лет):
+Если есть управляемые угрозы (долги ФССП, залоги, судебные дела, недавняя регистрация права, банкротство менее трёх лет):
 Раздели план на два горизонта:
 
 ДО ПЕРЕДАЧИ ЗАДАТКА ИЛИ АВАНСА — что обязательно закрыть до того как деньги уйдут продавцу. \
@@ -1595,7 +1629,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 которые продавец обязан предоставить, и санкцию за непредоставление — \
 иначе деньги будет крайне сложно вернуть.
 
-СЦЕНАРИЙ В — угроз нет или они незначительны:
+Если угроз нет или они незначительны:
 Стандартный план с конкретными сроками:
 • День 1–3: запросить у продавца полный пакет документов — \
 правоустанавливающий документ (договор купли-продажи, дарения, свидетельство о наследстве \
@@ -2315,14 +2349,21 @@ def build_pdf_bytes(report):
         status_cell = [Paragraph(lbl, styles["Z_CardTitle"])]
         summary_cell = [Paragraph(p(item.get("summary","")), styles["Z_CardText"])]
 
-        # Детали
-        details = (item.get("details") or [])[:6]
-        if details:
-            for d in details:
-                summary_cell.append(Paragraph(p(f"— {d}"), styles["Z_Detail"]))
-
-        # Данные из data (залоги, ФССП и тд)
+        # Данные из data (залоги, ФССП и тд) — если есть, детали не дублируем
         data = item.get("data")
+        has_rich_data = isinstance(data, dict) and any([
+            data.get("active_count") is not None,
+            data.get("pledges"),
+            data.get("cadNumber") or data.get("area"),
+            data.get("geo_center"),
+        ])
+
+        # Детали — только если нет расширенных данных
+        if not has_rich_data:
+            details = (item.get("details") or [])[:6]
+            if details:
+                for d in details:
+                    summary_cell.append(Paragraph(p(f"— {d}"), styles["Z_Detail"]))
         if isinstance(data, dict):
             # ФССП
             if data.get("active_count") is not None:
