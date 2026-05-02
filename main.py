@@ -511,10 +511,19 @@ async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dic
         logger.info(f"[{method}] Попытка {attempt}, state={state}")
 
         if state in {"complete", "done"}:
+            # Логируем если есть errors_info даже при complete
+            if resp.get("errors_info"):
+                logger.warning(f"[{method}] complete с ошибками: {flatten_text(resp.get('errors_info'))[:300]}")
             return resp
         if state in {"error", "failed"} or is_newdb_error(resp):
+            err_info = flatten_text(resp.get("errors_info") or resp.get("error") or resp)[:400]
+            if is_balance_error(resp):
+                logger.error(f"[{method}] НЕДОСТАТОЧНО ТОКЕНОВ: {err_info}")
+            else:
+                logger.warning(f"[{method}] Ошибка (state={state}): {err_info}")
             return resp
         if has_result_status_500(resp):
+            logger.warning(f"[{method}] Ошибка 500: {flatten_text(resp)[:200]}")
             return resp
 
     # Таймаут — возвращаем последний ответ с пометкой
@@ -2555,6 +2564,43 @@ async def check_report(req: CheckRequest, request: Request):
             "message": "Ошибка формирования отчёта.",
             "error": str(e) if ENABLE_DEBUG_NEWDB else None,
         }
+
+
+@app.post("/debug-passport")
+async def debug_passport(req: CheckRequest, request: Request):
+    """Отладочный эндпоинт — делает только complex_by_passport и возвращает сырой ответ NewDB."""
+    verify_debug_key(request)
+    owners = owners_from_request(req)
+    if not owners:
+        return {"error": "Нет данных продавца"}
+    owner = owners[0]
+    payload = build_complex_by_passport_payload(owner)
+    if not payload:
+        series, number = normalize_passport_owner(owner)
+        dob_ru, dob_iso = normalize_dob(owner.dob)
+        return {
+            "error": "Payload = None",
+            "debug": {
+                "last": owner.last, "first": owner.first,
+                "passport_series": owner.passport_series,
+                "passport_number": owner.passport_number,
+                "seriapass": owner.seriapass, "numberpass": owner.numberpass,
+                "seria": owner.seria, "number": owner.number,
+                "series_extracted": series, "number_extracted": number,
+                "dob_raw": owner.dob, "dob_iso": dob_iso,
+                "is_minor": is_minor_owner(owner),
+            }
+        }
+    async with httpx.AsyncClient() as client:
+        resp = await newdb_run(client, payload, "complex_by_passport")
+    return {
+        "payload_sent": payload,
+        "raw_response": resp,
+        "state": resp.get("state"),
+        "has_errors_info": bool(resp.get("errors_info")),
+        "errors_info": resp.get("errors_info"),
+        "results_keys": list((resp.get("results") or {}).keys()),
+    }
 
 
 @app.post("/debug-newdb")
