@@ -395,13 +395,56 @@ def has_result_status_500(data: dict) -> bool:
 
 
 def result_data(resp: dict, method: str):
-    """Извлекает data и полный result-блок из ответа NewDB."""
+    """Извлекает data и полный result-блок из ответа NewDB.
+    Поддерживает несколько вариантов структуры ответа:
+    - Стандартный: results.METHOD.result.data
+    - complex_by_passport: results.METHOD.result.data (субметоды внутри)
+    - Прямой: results.METHOD.data
+    """
     try:
         block = (resp.get("results") or {}).get(method)
         if not block:
             return None, None
-        result = block.get("result") or {}
-        return result.get("data"), result
+        # Вариант 1: block.result.data (стандарт)
+        result = block.get("result")
+        if isinstance(result, dict):
+            data = result.get("data")
+            if data is not None:
+                return data, result
+        # Вариант 2: block.data (прямой)
+        if "data" in block:
+            return block["data"], block
+        # Вариант 3: block сам является результатом
+        if isinstance(block, (list, str)):
+            return block, {}
+        return None, None
+    except Exception:
+        return None, None
+
+
+def extract_submethod_data(complex_resp: dict, submethod: str):
+    """Извлекает данные субметода из ответа complex_by_passport.
+    Структура: results.SUBMETHOD.result.data
+    Также пробует: results.SUBMETHOD.data и results.SUBMETHOD напрямую.
+    """
+    try:
+        results = complex_resp.get("results") or {}
+        block = results.get(submethod)
+        if not block:
+            return None, None
+        # Стандарт: block.result.data
+        result = block.get("result")
+        if isinstance(result, dict):
+            data = result.get("data")
+            if data is not None:
+                return data, result
+            # Иногда data — пустой список [], это валидный ответ
+            if "data" in result:
+                return result["data"], result
+        # Прямой: block.data
+        if "data" in block:
+            return block["data"], block
+        return None, None
     except Exception:
         return None, None
 
@@ -823,13 +866,11 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
         items.append(error_item("Комплексная проверка по паспорту", "", resp))
         return items
 
-    results = resp.get("results") or {}
-
+    # Используем extract_submethod_data для правильного извлечения из complex_by_passport
     # --- Паспорт МВД ---
     title_mvd = "Паспорт МВД"
     url_mvd = "https://мвд.рф/сервисы-гувм"
-    mvd_block = results.get("passport_mvd") or {}
-    mvd_data, _ = result_data({"results": {"passport_mvd": mvd_block}}, "passport_mvd")
+    mvd_data, _ = extract_submethod_data(resp, "passport_mvd")
     if mvd_data is None:
         items.append(manual_item(title_mvd, "Нет данных от МВД.", url_mvd))
     else:
@@ -846,8 +887,7 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
     # --- Паспорт ФНС / ИНН ---
     title_fns = "Паспорт / ИНН ФНС"
     url_fns = "https://service.nalog.ru/inn.do"
-    fns_block = results.get("passport_fns") or {}
-    fns_data, _ = result_data({"results": {"passport_fns": fns_block}}, "passport_fns")
+    fns_data, _ = extract_submethod_data(resp, "passport_fns")
 
     def extract_inn_from_fns(data):
         text = flatten_text(data)
@@ -868,8 +908,7 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
     # --- ФССП ---
     title_fssp = "ФССП"
     url_fssp = "https://fssp.gov.ru/iss/ip"
-    fssp_block = results.get("fssp_person") or {}
-    fssp_data, _ = result_data({"results": {"fssp_person": fssp_block}}, "fssp_person")
+    fssp_data, _ = extract_submethod_data(resp, "fssp_person")
 
     if fssp_data is None:
         items.append(manual_item(title_fssp, "Нет данных ФССП.", url_fssp))
@@ -909,22 +948,53 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest) -> List[dict]:
     # --- Залоги ---
     title_pledge = "Залоги (ФНП)"
     url_pledge = "https://www.reestr-zalogov.ru"
-    pledge_block = results.get("pledge_person") or {}
-    pledge_data, _ = result_data({"results": {"pledge_person": pledge_block}}, "pledge_person")
+    pledge_data, _ = extract_submethod_data(resp, "pledge_person")
 
     if pledge_data is None:
         items.append(manual_item(title_pledge, "Нет данных о залогах.", url_pledge))
     elif not pledge_data:
         items.append(ok_item(title_pledge, "Залоги не найдены.", url_pledge, []))
     else:
-        items.append(risk_item(title_pledge, f"Найдены залоги: {len(pledge_data)} записей.", url_pledge,
-                               ["Проверить предмет залога и кредитора."], pledge_data))
+        # Извлекаем детали каждого залога для отображения
+        pledge_details = ["Проверить предмет залога и кредитора до сделки."]
+        pledge_display = []
+        for i, p in enumerate(pledge_data if isinstance(pledge_data, list) else [pledge_data], 1):
+            if not isinstance(p, dict):
+                continue
+            detail_parts = []
+            # Предмет залога
+            subj = clean_str(p.get("subject") or p.get("pledgeSubject") or p.get("description") or "")
+            if subj: detail_parts.append(f"Предмет: {subj[:150]}")
+            # Залогодержатель (кредитор)
+            cred = clean_str(p.get("pledgeHolder") or p.get("creditor") or p.get("holderName") or "")
+            if cred: detail_parts.append(f"Залогодержатель: {cred[:100]}")
+            # Залогодатель
+            debtor = clean_str(p.get("pledgeGiver") or p.get("debtor") or p.get("giverName") or "")
+            if debtor: detail_parts.append(f"Залогодатель: {debtor[:100]}")
+            # Дата регистрации
+            reg_date = clean_str(p.get("registrationDate") or p.get("regDate") or p.get("noticeDate") or "")
+            if reg_date: detail_parts.append(f"Дата регистрации: {reg_date}")
+            # Номер уведомления
+            notice = clean_str(p.get("noticeNumber") or p.get("number") or p.get("id") or "")
+            if notice: detail_parts.append(f"Номер уведомления: {notice}")
+            # Статус
+            status = clean_str(p.get("status") or p.get("state") or "")
+            if status: detail_parts.append(f"Статус: {status}")
+            if detail_parts:
+                pledge_details.append(f"Запись {i}: " + "; ".join(detail_parts))
+            pledge_display.append(p)
+        items.append(risk_item(
+            title_pledge,
+            f"Найдено залогов: {len(pledge_data) if isinstance(pledge_data, list) else 1}. Необходима проверка до сделки.",
+            url_pledge,
+            pledge_details,
+            {"pledges": pledge_display, "count": len(pledge_data) if isinstance(pledge_data, list) else 1}
+        ))
 
     # --- ЕГРИП ---
     title_ip = "ЕГРИП / статус ИП"
     url_ip = "https://egrul.nalog.ru"
-    ip_block = results.get("egrul_ip") or {}
-    ip_data, _ = result_data({"results": {"egrul_ip": ip_block}}, "egrul_ip")
+    ip_data, _ = extract_submethod_data(resp, "egrul_ip")
 
     if ip_data is None:
         items.append(manual_item(title_ip, "Нет данных ЕГРИП.", url_ip))
@@ -1340,7 +1410,7 @@ def build_recommendations_v5(checklist: List[dict], age: Optional[int] = None) -
             recs.append({"priority": "critical", "title": "Проверить подлинность паспорта",
                          "text": "Нотариальное заверение или оригинал в МВД."})
 
-    recs.append({"priority": "high", "title": "Защитное авансовое соглашение",
+    recs.append({"priority": "high", "title": "Защитное соглашение о задатке (или авансе)",
                  "text": "Закрепить условия возврата и ответственность."})
     return recs
 
@@ -1379,7 +1449,7 @@ def build_advance_decision(scoring: dict) -> dict:
 DEEPSEEK_SYSTEM_PROMPT = """\
 Ты — старший юрист по сделкам с недвижимостью с 15-летним опытом сопровождения покупателей жилья. \
 Ты составляешь экспертное юридическое заключение для покупателя, который планирует приобрести \
-объект недвижимости и хочет понять риски до передачи аванса продавцу. \
+объект недвижимости и хочет понять риски до передачи задатка или аванса продавцу. \
 Заключение читают двое: сам покупатель и сопровождающий его риелтор. \
 Для покупателя важна понятность и практичность, для риелтора — профессиональная точность и ссылки на нормы. \
 Совмести оба требования: пиши грамотно и конкретно, объясняй термины, не оставляй читателя \
@@ -1450,7 +1520,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 (арест или запрет на объект в ЕГРН, недействительный паспорт продавца, активное банкротство):
 Объясни что именно и по какой норме блокирует сделку. \
 Дай последовательность действий по устранению препятствия с ответственными и сроками. \
-Чётко укажи: до устранения препятствия передавать аванс напрямую продавцу категорически \
+Чётко укажи: до устранения препятствия передавать задаток или аванс напрямую продавцу категорически \
 не рекомендуется — покупатель рискует потерять деньги без возможности защиты.
 
 СЦЕНАРИЙ Б — есть управляемые угрозы \
@@ -1458,7 +1528,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 недавняя регистрация права, завершённое банкротство менее трёх лет):
 Раздели план на два горизонта:
 
-ДО ПЕРЕДАЧИ АВАНСА — что обязательно закрыть до того как деньги уйдут продавцу. \
+ДО ПЕРЕДАЧИ ЗАДАТКА ИЛИ АВАНСА — что обязательно закрыть до того как деньги уйдут продавцу. \
 Для каждого пункта: действие → кто делает → срок → что получить на руки. \
 Без закрытия этих пунктов аванс не передавать.
 
@@ -1466,7 +1536,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Сроки, ответственные, правовые основания.
 
 Поскольку аванс обычно передаётся напрямую продавцу — особо укажи: \
-соглашение об авансе должно содержать конкретный перечень документов \
+соглашение о задатке (или авансе) должно содержать конкретный перечень документов \
 которые продавец обязан предоставить, и санкцию за непредоставление — \
 иначе деньги будет крайне сложно вернуть.
 
@@ -1498,7 +1568,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 
 Если есть несовершеннолетние собственники:
 Разрешение органов опеки и попечительства — обязательно до подписания любых договоров, \
-включая соглашение об авансе. Без разрешения сделка ничтожна \
+включая соглашение о задатке (или авансе). Без разрешения сделка ничтожна \
 (статья 37 Гражданского кодекса Российской Федерации, статья 21 Федерального закона \
 от 24.04.2008 № 48-ФЗ «Об опеке и попечительстве»). \
 Срок рассмотрения органами опеки — от 15 до 30 рабочих дней. \
@@ -1516,10 +1586,10 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Если альтернативная сделка (цепочка):
 Все звенья цепочки должны быть проверены — особенно конечный продавец. \
 Аванс передаётся только при наличии письменных договорённостей по всей цепочке. \
-Условие о том что аванс возвращается если сделка не состоится \
+Условие о том что задаток/аванс возвращается если сделка не состоится \
 по причине разрыва цепочки — обязательно фиксировать письменно. \
 Срок экспозиции альтернативной сделки как правило 30–60 дней — \
-следить чтобы соглашение об авансе покрывало этот срок.
+следить чтобы соглашение о задатке (или авансе) покрывало этот срок.
 
 Если продавцу 70 лет и более:
 Справки из психоневрологического и наркологического диспансеров — \
@@ -1535,14 +1605,14 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Все собственники подписывают договор купли-продажи либо выдают нотариальную доверенность \
 с правом получения денег.
 
-Как передавать аванс
+Как передавать задаток / аванс
 Конкретные условия для данной ситуации — с учётом того что аванс передаётся напрямую продавцу:
-• Форма: письменное соглашение об авансе — обязательно. \
+• Форма: письменное соглашение о задатке (или авансе) — обязательно. \
 Устная договорённость не имеет юридической силы.
 • Что прописать в соглашении: сумму, срок действия, точный адрес и кадастровый номер объекта, \
 перечень документов которые продавец обязан предоставить до основного договора, \
 срок и условия возврата аванса, ответственность за нарушение срока.
-• Разница между авансом и задатком: аванс возвращается в любом случае \
+• Разница между авансом и задатком: задаток/аванс возвращается в любом случае \
 в той же сумме (статья 380 Гражданского кодекса Российской Федерации); \
 задаток при отказе продавца возвращается в двойном размере \
 (статья 381 Гражданского кодекса Российской Федерации) — \
@@ -1693,8 +1763,8 @@ def build_local_legal_report(owner: OwnerRequest, checklist: list, scoring: dict
         + ["Логика сделки",
            "• Получить документы-основания, выписку ЕГРН, справки по зарегистрированным лицам.",
            "• Закрыть все вопросы из раздела ручной проверки.",
-           "• Только после этого подписывать авансовое соглашение.", "",
-           "Как передавать аванс",
+           "• Только после этого подписывать соглашение о задатке (или авансе).", "",
+           "Как передавать задаток / аванс",
            "• Передавать аванс только по письменному соглашению с условиями возврата.", "",
            "Итоговое заключение"]
     )
@@ -1963,11 +2033,11 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
 
     result = {
         "success": True,
-        "report_id": report_id,
         "pdf_available": REPORTLAB_AVAILABLE,
         "pdf_url": f"/download-pdf/{report_id}" if REPORTLAB_AVAILABLE else None,
         "created_at": now_ru(),
         "api_version": APP_VERSION,
+        "_report_id": report_id,
         "executive_summary": {
             "label": combined_scoring["label"],
             "level": combined_scoring["level"],
@@ -2005,7 +2075,7 @@ def pdf_report_blocks(text):
     headings = {
         "Краткий вывод", "Что подтверждено автоматическими источниками",
         "Что не подтверждено и требует ручной проверки", "Ключевые риски",
-        "Что проверить до аванса", "Логика сделки", "Как передавать аванс",
+        "Что проверить до аванса", "Логика сделки", "Как передавать задаток / аванс",
         "Итоговое заключение", "Важно"
     }
     blocks = []
@@ -2086,24 +2156,36 @@ def build_pdf_bytes(report):
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm,
                             topMargin=13*mm, bottomMargin=14*mm)
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle("Z_Title", fontName=font, fontSize=21, leading=26, textColor=Palette.DARK_BLUE))
-    styles.add(ParagraphStyle("Z_Subtitle", fontName=font, fontSize=9, leading=12, textColor=Palette.MID_GRAY))
-    styles.add(ParagraphStyle("Z_H1", fontName=font, fontSize=14, leading=18, spaceBefore=8, spaceAfter=5, textColor=Palette.DARK_BLUE))
-    styles.add(ParagraphStyle("Z_Body", fontName=font, fontSize=9.2, leading=13.5, textColor=Palette.DARK_TEXT, spaceAfter=3))
-    styles.add(ParagraphStyle("Z_CardTitle", fontName=font, fontSize=10.5, leading=13.5, textColor=Palette.DARK_BLUE))
-    styles.add(ParagraphStyle("Z_CardText", fontName=font, fontSize=8.8, leading=12.5, textColor=Palette.DARK_TEXT))
+    styles.add(ParagraphStyle("Z_Title", fontName=font, fontSize=20, leading=25, textColor=Palette.DARK_BLUE))
+    styles.add(ParagraphStyle("Z_Subtitle", fontName=font, fontSize=8.5, leading=11, textColor=Palette.MID_GRAY))
+    styles.add(ParagraphStyle("Z_H1", fontName=font, fontSize=13, leading=17, spaceBefore=10, spaceAfter=5, textColor=Palette.DARK_BLUE))
+    styles.add(ParagraphStyle("Z_H2", fontName=font, fontSize=10.5, leading=14, spaceBefore=7, spaceAfter=3, textColor=Palette.DARK_BLUE))
+    styles.add(ParagraphStyle("Z_Body", fontName=font, fontSize=9.5, leading=14, textColor=Palette.DARK_TEXT, spaceAfter=4))
+    styles.add(ParagraphStyle("Z_CardTitle", fontName=font, fontSize=10, leading=13, textColor=Palette.DARK_BLUE))
+    styles.add(ParagraphStyle("Z_CardText", fontName=font, fontSize=9, leading=13, textColor=Palette.DARK_TEXT))
+    styles.add(ParagraphStyle("Z_Detail", fontName=font, fontSize=8.5, leading=12, textColor=Palette.MID_GRAY, leftIndent=8))
     styles.add(ParagraphStyle("Z_ScoreNum", fontName=font, fontSize=26, leading=30, alignment=TA_CENTER, textColor=Palette.DARK_BLUE))
     styles.add(ParagraphStyle("Z_ScoreLbl", fontName=font, fontSize=9, leading=12, alignment=TA_CENTER, textColor=Palette.WHITE))
-    styles.add(ParagraphStyle("Z_TableHead", fontName=font, fontSize=8, leading=10.5, textColor=Palette.WHITE))
-    styles.add(ParagraphStyle("Z_TableCell", fontName=font, fontSize=8.2, leading=11, textColor=Palette.DARK_TEXT))
+    styles.add(ParagraphStyle("Z_TableHead", fontName=font, fontSize=8.5, leading=11, textColor=Palette.WHITE))
+    styles.add(ParagraphStyle("Z_TableCell", fontName=font, fontSize=8.5, leading=12, textColor=Palette.DARK_TEXT))
+    styles.add(ParagraphStyle("Z_TableSub", fontName=font, fontSize=7.5, leading=10.5, textColor=Palette.MID_GRAY))
 
     scoring = report.get("risk_scoring") or {}
     checklist = report.get("checklist") or []
     legal_text = report.get("legal_report") or ""
     score = scoring.get("score", 0)
     risk_color = Palette.for_score(score)
+    advance = report.get("advance_decision") or {}
 
     story = []
+
+    STATUS_LABELS = {"ok": "ОК", "risk": "РИСК", "manual_check": "РУЧНАЯ"}
+    STATUS_COLORS = {
+        "ok": (Palette.LOW_BG, Palette.LOW),
+        "risk": (Palette.HIGH_BG, Palette.CRITICAL),
+        "manual_check": (Palette.MANUAL_BG, Palette.MID_GRAY),
+    }
+    STATUS_ICONS = {"ok": "✓", "risk": "!", "manual_check": "?"}
 
     def badge_label(lbl):
         return {"Опасно при самостоятельной сделке": "ОПАСНО",
@@ -2111,95 +2193,211 @@ def build_pdf_bytes(report):
                 "Условно рискованно": "УСЛОВНЫЙ РИСК",
                 "Допустимо к рассмотрению": "ДОПУСТИМО"}.get(lbl, str(lbl).upper())
 
+    def add_section_header(title):
+        story.append(Spacer(1, 4*mm))
+        story.append(Paragraph(p(title), styles["Z_H1"]))
+        story.append(Spacer(1, 2*mm))
+
+    def add_colored_block(title, body_lines, bg, border="#E0DDD6"):
+        content = []
+        if title:
+            content.append(Paragraph(p(title), styles["Z_CardTitle"]))
+            content.append(Spacer(1, 1.5*mm))
+        for line in (body_lines if isinstance(body_lines, list) else [body_lines]):
+            if line:
+                content.append(Paragraph(p(str(line)), styles["Z_CardText"]))
+        tbl = Table([[content]], colWidths=[174*mm])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0),(-1,-1), colors.HexColor(bg)),
+            ("BOX", (0,0),(-1,-1), 0.5, colors.HexColor(border)),
+            ("LEFTPADDING",(0,0),(-1,-1), 9),("RIGHTPADDING",(0,0),(-1,-1), 9),
+            ("TOPPADDING",(0,0),(-1,-1), 7),("BOTTOMPADDING",(0,0),(-1,-1), 7),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 2.5*mm))
+
+    # ── ШАПКА ──
     header_left = [
-        Paragraph("Комплексная проверка<br/>продавца и объекта недвижимости", styles["Z_Title"]),
+        Paragraph("Комплексная проверка продавца<br/>и объекта недвижимости", styles["Z_Title"]),
         Spacer(1, 2*mm),
-        Paragraph(f"Дата: {report.get('created_at', '—')}  •  ID: {report.get('report_id', '—')[:8]}", styles["Z_Subtitle"]),
+        Paragraph(f"Дата формирования: {report.get('created_at', '—')}", styles["Z_Subtitle"]),
     ]
     score_badge = Table([
-        [Paragraph(badge_label(str(scoring.get("label", ""))), styles["Z_ScoreLbl"])],
+        [Paragraph(badge_label(str(scoring.get("label",""))), styles["Z_ScoreLbl"])],
         [Paragraph(str(score), styles["Z_ScoreNum"])],
         [Paragraph("из 100", styles["Z_Subtitle"])],
     ], colWidths=[42*mm])
     score_badge.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(risk_color)),
-        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor(Palette.OFF_WHITE)),
-        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#E0DDD6")),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("BACKGROUND",(0,0),(-1,0), colors.HexColor(risk_color)),
+        ("BACKGROUND",(0,1),(-1,-1), colors.HexColor(Palette.OFF_WHITE)),
+        ("BOX",(0,0),(-1,-1), 0.6, colors.HexColor("#E0DDD6")),
+        ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+        ("ALIGN",(0,0),(-1,-1),"CENTER"),
     ]))
     story.append(Table([[header_left, score_badge]], colWidths=[130*mm, 46*mm]))
-    story.append(Spacer(1, 6*mm))
+    story.append(Spacer(1, 5*mm))
 
-    def add_card(title, body, bg=Palette.WHITE, border="#E0DDD6"):
-        content = []
-        if title:
-            content.append(Paragraph(p(title), styles["Z_CardTitle"]))
-            content.append(Spacer(1, 2*mm))
-        if isinstance(body, list):
-            for line in body:
-                content.append(Paragraph(p(line), styles["Z_CardText"]))
-        else:
-            content.append(Paragraph(p(body), styles["Z_CardText"]))
-        tbl = Table([[content]], colWidths=[174*mm])
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(bg)),
-            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor(border)),
-            ("LEFTPADDING", (0, 0), (-1, -1), 8),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-            ("TOPPADDING", (0, 0), (-1, -1), 7),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-        ]))
-        story.append(tbl)
-        story.append(Spacer(1, 3.5*mm))
+    # ── ВЫВОД И ЗАДАТОК ──
+    add_colored_block("Главный вывод", scoring.get("conclusion","—"), Palette.OFF_WHITE)
+    adv_bg = Palette.HIGH_BG if score >= 60 else (Palette.MEDIUM_BG if score >= 35 else Palette.LOW_BG)
+    add_colored_block(
+        "Решение по задатку / авансу",
+        [f"{advance.get('decision','—')}.", advance.get('comment','')],
+        adv_bg
+    )
 
-    add_card("Главный вывод", scoring.get("conclusion", "—"), bg=Palette.OFF_WHITE)
-
-    advance = report.get("advance_decision") or {}
-    add_card("Решение по авансу", f"{advance.get('decision', '')}. {advance.get('comment', '')}",
-             bg=Palette.HIGH_BG if score >= 35 else Palette.LOW_BG)
-
-    story.append(Paragraph("Карта проверок", styles["Z_H1"]))
-    ch = [Paragraph("Источник", styles["Z_TableHead"]),
-          Paragraph("Статус", styles["Z_TableHead"]),
-          Paragraph("Вывод", styles["Z_TableHead"])]
-    cd = [ch]
+    # ── КАРТА ПРОВЕРОК С ДЕТАЛЯМИ ──
+    add_section_header("Результаты проверок")
     for item in checklist:
-        st = item.get("status", "")
-        cd.append([
-            Paragraph(item.get("title", ""), styles["Z_TableCell"]),
-            Paragraph({"ok": "ОК", "risk": "РИСК", "manual_check": "РУЧНАЯ"}.get(st, "?"), styles["Z_TableCell"]),
-            Paragraph(item.get("summary", ""), styles["Z_TableCell"]),
-        ])
-    ct = Table(cd, colWidths=[55*mm, 20*mm, 99*mm], repeatRows=1)
-    ct_style = [
-        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#E0DDD6")),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(Palette.DARK_BLUE)),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]
-    for idx, item in enumerate(checklist, start=1):
-        st = item.get("status", "")
-        ct_style.append(("BACKGROUND", (0, idx), (2, idx),
-                         colors.HexColor({"ok": Palette.LOW_BG, "risk": Palette.HIGH_BG,
-                                          "manual_check": Palette.MANUAL_BG}.get(st, Palette.OFF_WHITE))))
-    ct.setStyle(TableStyle(ct_style))
-    story.append(ct)
-    story.append(Spacer(1, 4*mm))
+        st = item.get("status","")
+        bg_col, fg_col = STATUS_COLORS.get(st, (Palette.OFF_WHITE, Palette.MID_GRAY))
+        icon = STATUS_ICONS.get(st,"?")
+        lbl = STATUS_LABELS.get(st,"?")
 
-    story.append(Paragraph("Экспертное заключение", styles["Z_H1"]))
+        # Заголовок строки
+        title_cell = [Paragraph(p(f"{icon}  {item.get('title','')}"), styles["Z_CardTitle"])]
+        status_cell = [Paragraph(lbl, styles["Z_CardTitle"])]
+        summary_cell = [Paragraph(p(item.get("summary","")), styles["Z_CardText"])]
+
+        # Детали
+        details = (item.get("details") or [])[:6]
+        if details:
+            for d in details:
+                summary_cell.append(Paragraph(p(f"— {d}"), styles["Z_Detail"]))
+
+        # Данные из data (залоги, ФССП и тд)
+        data = item.get("data")
+        if isinstance(data, dict):
+            # ФССП
+            if data.get("active_count") is not None:
+                summary_cell.append(Paragraph(
+                    p(f"Активных: {data.get('active_count',0)}, закрытых: {data.get('closed_count',0)}, долг: {rub(data.get('actual_debt',0))}"),
+                    styles["Z_Detail"]
+                ))
+            # Залоги
+            pledges = data.get("pledges")
+            if pledges:
+                for pl in pledges[:3]:
+                    parts = []
+                    for k,label in [("subject","Предмет"),("pledgeHolder","Залогодержатель"),
+                                    ("pledgeGiver","Залогодатель"),("registrationDate","Дата"),
+                                    ("noticeNumber","Номер уведомления")]:
+                        v = clean_str(pl.get(k,""))
+                        if v: parts.append(f"{label}: {v[:80]}")
+                    if parts:
+                        summary_cell.append(Paragraph(p(" | ".join(parts)), styles["Z_Detail"]))
+            # ЕГРН объект
+            if data.get("cadNumber") or data.get("area") or data.get("objType_text"):
+                egrn_parts = []
+                if data.get("cadNumber"): egrn_parts.append(f"Кад. номер: {data['cadNumber']}")
+                if data.get("objType_text"): egrn_parts.append(f"Тип: {data['objType_text']}")
+                if data.get("area"): egrn_parts.append(f"Площадь: {data['area']} кв.м")
+                if data.get("rights"):
+                    rights = data["rights"] if isinstance(data["rights"], list) else []
+                    for r in rights[:2]:
+                        if isinstance(r, dict):
+                            owner_n = clean_str(r.get("rightHolder") or r.get("owner") or "")
+                            reg_d = clean_str(r.get("registrationDate") or r.get("regDate") or "")
+                            right_t = clean_str(r.get("rightType") or r.get("type") or "")
+                            if owner_n: egrn_parts.append(f"Правообладатель: {owner_n[:60]}")
+                            if right_t: egrn_parts.append(f"Вид права: {right_t}")
+                            if reg_d: egrn_parts.append(f"Дата регистрации: {reg_d}")
+                if data.get("encumbrances"):
+                    enc = data["encumbrances"] if isinstance(data["encumbrances"], list) else []
+                    for e in enc[:2]:
+                        if isinstance(e, dict):
+                            enc_t = clean_str(e.get("type") or e.get("encumbranceType") or "")
+                            enc_h = clean_str(e.get("holder") or e.get("encumbranceHolder") or "")
+                            if enc_t: egrn_parts.append(f"Обременение: {enc_t}")
+                            if enc_h: egrn_parts.append(f"Держатель: {enc_h[:60]}")
+                for ep in egrn_parts:
+                    summary_cell.append(Paragraph(p(ep), styles["Z_Detail"]))
+            # Геоданные
+            if data.get("geo_center"):
+                gc = data["geo_center"]
+                obj = data.get("object") or {}
+                geo_parts = []
+                if obj.get("address"): geo_parts.append(f"Адрес: {obj['address'][:100]}")
+                if obj.get("cad_cost"): geo_parts.append(f"Кад. стоимость: {rub(obj['cad_cost'])}")
+                if obj.get("year_built"): geo_parts.append(f"Год постройки: {obj['year_built']}")
+                if gc.get("lat") and gc.get("lon"):
+                    geo_parts.append(f"Координаты: {gc['lat']}, {gc['lon']}")
+                for gp in geo_parts:
+                    summary_cell.append(Paragraph(p(gp), styles["Z_Detail"]))
+
+        row = [[title_cell, status_cell, summary_cell]]
+        rt = Table(row, colWidths=[52*mm, 18*mm, 104*mm])
+        rt.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,-1), colors.HexColor(bg_col)),
+            ("GRID",(0,0),(-1,-1), 0.3, colors.HexColor("#E0DDD6")),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+            ("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6),
+        ]))
+        story.append(rt)
+        story.append(Spacer(1, 1.5*mm))
+
+    # ── ЮРИДИЧЕСКОЕ ЗАКЛЮЧЕНИЕ ──
+    add_section_header("Юридическое заключение")
+    HEADINGS_PDF = ["Краткий вывод","Что подтверждено автоматическими источниками",
+        "Что не подтверждено и требует ручной проверки","Ключевые угрозы для покупателя",
+        "Логика сделки","Как передавать задаток / аванс","Как передавать аванс",
+        "Итоговое заключение","Важно"]
     for block_type, text in pdf_report_blocks(legal_text):
         if not text.strip():
             continue
         if block_type == "h":
-            story.append(Paragraph(p(text), styles["Z_CardTitle"]))
+            story.append(Spacer(1, 3*mm))
+            story.append(Paragraph(p(text), styles["Z_H2"]))
         elif block_type == "bullet":
-            story.append(Paragraph(f"• {p(text)}", styles["Z_CardText"]))
+            story.append(Paragraph(f"• {p(text)}", styles["Z_Body"]))
         else:
             story.append(Paragraph(p(text), styles["Z_Body"]))
+
+    # ── РЕКОМЕНДАЦИИ ──
+    recs = report.get("recommendations") or []
+    if recs:
+        add_section_header("Рекомендации")
+        for rec in recs:
+            pri = rec.get("priority","")
+            bg = Palette.CRITICAL_BG if pri=="critical" else (Palette.HIGH_BG if pri=="high" else Palette.OFF_WHITE)
+            add_colored_block(rec.get("title",""), rec.get("text",""), bg)
+
+    # ── РУЧНАЯ ПРОВЕРКА ──
+    hidden = report.get("hidden_risks") or []
+    if hidden:
+        add_section_header("Также рекомендуется проверить вручную")
+        hr_data = [[
+            Paragraph("Что проверить", styles["Z_TableHead"]),
+            Paragraph("Зачем", styles["Z_TableHead"]),
+            Paragraph("Норма", styles["Z_TableHead"]),
+        ]]
+        for r in hidden:
+            hr_data.append([
+                Paragraph(p(r.get("risk","")), styles["Z_TableCell"]),
+                Paragraph(p(r.get("why","")), styles["Z_TableCell"]),
+                Paragraph(p(r.get("law","")), styles["Z_TableSub"]),
+            ])
+        hr_tbl = Table(hr_data, colWidths=[55*mm, 80*mm, 39*mm], repeatRows=1)
+        hr_tbl.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0), colors.HexColor(Palette.DARK_BLUE)),
+            ("GRID",(0,0),(-1,-1), 0.3, colors.HexColor("#E0DDD6")),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),5),
+            ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.HexColor(Palette.OFF_WHITE), colors.HexColor(Palette.WHITE)]),
+        ]))
+        story.append(hr_tbl)
+
+    # ── ДИСКЛЕЙМЕР ──
+    story.append(Spacer(1, 8*mm))
+    add_colored_block(None,
+        "Настоящее заключение носит информационно-аналитический характер. "
+        "Подготовлено на основании данных из открытых государственных реестров. "
+        "Не заменяет юридическую проверку правоустанавливающих документов. "
+        "Рекомендуется привлечь квалифицированного юриста или нотариуса.",
+        Palette.OFF_WHITE
+    )
 
     doc.build(story)
     return buf.getvalue()
