@@ -2847,7 +2847,7 @@ def build_market_price_check(req: CheckRequest) -> Optional[dict]:
     """Пункт «Рыночная цена»: средняя цена кв.м по региону + ссылка на Росстат.
     Возвращает None если нет ни кадастра ни адреса.
     """
-    cadnum = (req.cadastr or "").strip()
+    cadnum = ((req.cadastral_number or req.cadnum or req.cadastral or "") or "").strip()
     addr = (req.address or "").strip()
     if not cadnum and not addr:
         return None
@@ -3145,7 +3145,7 @@ def build_additional_property_checks(req: CheckRequest) -> List[dict]:
     (программные API недоступны или платные). Каждый возвращает item с manual_links.
     """
     items = []
-    cadnum = (req.cadastr or "").strip()
+    cadnum = ((req.cadastral_number or req.cadnum or req.cadastral or "") or "").strip()
     addr = (req.address or "").strip()
 
     # 1. Аварийные дома (Реформа ЖКХ + ГИС ЖКХ)
@@ -3389,7 +3389,7 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
     # Доп.проверки объекта (аварийность, ЖКХ, история переходов, форма 9, рыночная цена, информация о доме)
     # Выполняются один раз для объекта, добавляются к чеклисту первого собственника.
     additional_property_items = []
-    if (req.cadastr or "").strip() or (req.address or "").strip():
+    if ((req.cadastral_number or req.cadnum or req.cadastral or "") or "").strip() or (req.address or "").strip():
         try:
             additional_property_items = build_additional_property_checks(req)
         except Exception as e:
