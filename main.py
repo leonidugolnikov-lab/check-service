@@ -23,6 +23,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -72,6 +73,17 @@ RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "5"))
 RATE_LIMIT_WINDOW = 3600
 MAX_OWNERS = int(os.getenv("MAX_OWNERS", "50"))
 
+# Cloudflare Turnstile (бесплатная капча) — опциональная защита от ботов.
+# Регистрация: https://dash.cloudflare.com/?to=/:account/turnstile
+# Если TURNSTILE_SECRET не задан — проверка отключена.
+TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET", "").strip()
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+
+# Кеш ответов NewDB. Снижает расход токенов на повторных проверках.
+NEWDB_CACHE_ENABLED = os.getenv("NEWDB_CACHE_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+NEWDB_CACHE_TTL = int(os.getenv("NEWDB_CACHE_TTL", "86400"))  # 24 часа
+NEWDB_CACHE_MAX = int(os.getenv("NEWDB_CACHE_MAX", "500"))
+
 # Таймауты по методу (секунды)
 # Таймауты увеличены — NewDB обрабатывает complex_by_passport и pravo_search до 3-5 минут
 # По логам: pravo_search тайм-аутил на 120с (ещё шёл), complex_by_passport на ~180с (ещё шёл)
@@ -120,6 +132,8 @@ class OwnerRequest(BaseModel):
     role: str = "owner"
     is_minor: Optional[bool] = None
     has_passport: bool = True
+    is_married: Optional[bool] = None  # Для блока «согласие супруга» (ст.35 СК)
+    married_via_object: Optional[bool] = None  # объект приобретался в браке
 
 
 class CheckRequest(BaseModel):
@@ -143,6 +157,8 @@ class CheckRequest(BaseModel):
     address: str = ""
     property_query: str = ""
     skip_report: bool = False
+    turnstile_token: str = ""  # токен Cloudflare Turnstile с фронта
+    consent: bool = False       # согласие на обработку ПД (ФЗ-152)
 
 
 # -------------------- Security helpers --------------------
@@ -539,20 +555,123 @@ def extract_submethod_data(complex_resp: dict, submethod: str):
         return None, None
 
 
+# -------------------- Кеш NewDB --------------------
+# Простой in-memory LRU-кеш для ответов NewDB. Снижает расход токенов на повторных
+# проверках одного и того же человека/объекта в течение TTL (по умолчанию 24ч).
+# При перезапуске процесса кеш обнуляется — это допустимо.
+import hashlib
+from collections import OrderedDict
+
+_NEWDB_CACHE: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_NEWDB_CACHE_STATS = {"hits": 0, "misses": 0, "saves": 0, "skipped": 0}
+
+
+def _newdb_cache_key(method: str, params: dict) -> str:
+    """Стабильный ключ от method+params (без requestId)."""
+    try:
+        clean = {k: v for k, v in (params or {}).items() if k != "requestId"}
+        norm = json.dumps(clean, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        norm = str(params)
+    raw = f"{method}|{norm}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _newdb_cache_get(key: str) -> Optional[dict]:
+    if not NEWDB_CACHE_ENABLED:
+        return None
+    entry = _NEWDB_CACHE.get(key)
+    if not entry:
+        _NEWDB_CACHE_STATS["misses"] += 1
+        return None
+    expires_at, data = entry
+    if time.time() > expires_at:
+        _NEWDB_CACHE.pop(key, None)
+        _NEWDB_CACHE_STATS["misses"] += 1
+        return None
+    # LRU bump
+    _NEWDB_CACHE.move_to_end(key)
+    _NEWDB_CACHE_STATS["hits"] += 1
+    return data
+
+
+def _newdb_cache_maybe_set(key: str, method: str, resp: dict) -> None:
+    """Кешируем ТОЛЬКО полностью успешные ответы.
+    НЕ кешируем: ошибки, таймауты, 500 в субметодах, ответы с _fssp_unavailable."""
+    if not NEWDB_CACHE_ENABLED or not isinstance(resp, dict):
+        return
+    state = str(resp.get("state") or "").lower()
+    if state not in {"complete", "done"}:
+        _NEWDB_CACHE_STATS["skipped"] += 1
+        return
+    if is_newdb_error(resp) or has_result_status_500(resp):
+        _NEWDB_CACHE_STATS["skipped"] += 1
+        return
+    if resp.get("errors_info"):
+        _NEWDB_CACHE_STATS["skipped"] += 1
+        return
+    # Не кешируем complex с упавшим fssp — при следующей проверке хочется попробовать заново
+    if resp.get("_fssp_unavailable"):
+        _NEWDB_CACHE_STATS["skipped"] += 1
+        return
+    # complex_by_passport: проверяем что все субметоды реально complete
+    if method == "complex_by_passport":
+        steps = resp.get("steps") or {}
+        for step_name, step in steps.items():
+            if str(step.get("status") or "").lower() not in {"complete", "done"}:
+                _NEWDB_CACHE_STATS["skipped"] += 1
+                return
+
+    expires_at = time.time() + NEWDB_CACHE_TTL
+    try:
+        # Снимаем копию чтобы не хранить ссылку которая может измениться
+        _NEWDB_CACHE[key] = (expires_at, json.loads(json.dumps(resp)))
+    except Exception:
+        return
+    _NEWDB_CACHE_STATS["saves"] += 1
+    # LRU eviction
+    while len(_NEWDB_CACHE) > NEWDB_CACHE_MAX:
+        _NEWDB_CACHE.popitem(last=False)
+
+
+def newdb_cache_stats() -> dict:
+    return {
+        **_NEWDB_CACHE_STATS,
+        "size": len(_NEWDB_CACHE),
+        "max": NEWDB_CACHE_MAX,
+        "ttl": NEWDB_CACHE_TTL,
+        "enabled": NEWDB_CACHE_ENABLED,
+    }
+
+
 async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dict:
     """
     1 метод = 1 задача NewDB.
     Отправляем запрос с уникальным requestId.
     Если state != complete — опрашиваем тот же requestId с адаптивным интервалом.
     Не создаём новых задач — только читаем статус одной.
+    Использует in-memory кеш (TTL 24ч) для успешных ответов чтобы экономить токены.
     """
     if not params:
         return {"state": "skipped"}
+
+    # ----- Кеш -----
+    cache_key = _newdb_cache_key(method, params)
+    cached = _newdb_cache_get(cache_key)
+    if cached is not None:
+        logger.info(f"[{method}] Кеш-попадание (key={cache_key[:12]}...)")
+        # Возвращаем КОПИЮ чтобы случайные правки не повредили кеш
+        return json.loads(json.dumps(cached))
 
     timeout_sec = METHOD_TIMEOUTS.get(method, DEFAULT_TIMEOUT)
     request_id = str(uuid.uuid4())
     # NewDB API требует обёртку: {"params": {...}, "requestId": "..."}
     payload = {"params": params, "requestId": request_id}
+
+    def _ret(r):
+        """Возвращает ответ и сохраняет в кеш если ответ удачный."""
+        _newdb_cache_maybe_set(cache_key, method, r)
+        return r
 
     # Первый запрос — создаём задачу
     resp = await newdb_post_json(client, payload)
@@ -563,12 +682,12 @@ async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dic
             logger.error(f"[{method}] НЕДОСТАТОЧНО ТОКЕНОВ NEWDB: {err_text}")
         else:
             logger.warning(f"[{method}] Ошибка при первом запросе: {err_text}")
-        return resp
+        return _ret(resp)
 
     state = str(resp.get("state") or "").lower()
     if state in {"complete", "done"}:
         logger.info(f"[{method}] Готово с первого запроса")
-        return resp
+        return _ret(resp)
 
     # Адаптивный polling — только requestId, не пересоздаём задачу
     deadline = asyncio.get_event_loop().time() + timeout_sec
@@ -590,7 +709,7 @@ async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dic
             # Логируем если есть errors_info даже при complete
             if resp.get("errors_info"):
                 logger.warning(f"[{method}] complete с ошибками: {flatten_text(resp.get('errors_info'))[:300]}")
-            return resp
+            return _ret(resp)
 
         # Для complex_by_passport: принимаем "in progress" если все ключевые субметоды готовы
         if method == "complex_by_passport" and state == "in progress":
@@ -598,7 +717,7 @@ async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dic
                 logger.info(f"[{method}] Принят как complete (fssp завис, остальное готово)")
                 resp["state"] = "complete"
                 resp["_fssp_unavailable"] = True
-                return resp
+                return _ret(resp)
 
         if state in {"error", "failed"} or is_newdb_error(resp):
             err_info = flatten_text(resp.get("errors_info") or resp.get("error") or resp)[:400]
@@ -606,16 +725,16 @@ async def newdb_run(client: httpx.AsyncClient, params: dict, method: str) -> dic
                 logger.error(f"[{method}] НЕДОСТАТОЧНО ТОКЕНОВ: {err_info}")
             else:
                 logger.warning(f"[{method}] Ошибка (state={state}): {err_info}")
-            return resp
+            return _ret(resp)
         if has_result_status_500(resp):
             logger.warning(f"[{method}] Ошибка 500: {flatten_text(resp)[:200]}")
-            return resp
+            return _ret(resp)
 
     # Таймаут — возвращаем последний ответ с пометкой
     resp["state"] = "timeout"
     resp["error"] = f"Таймаут {timeout_sec}с после {attempt} попыток"
     logger.warning(f"[{method}] Таймаут после {attempt} попыток")
-    return resp
+    return _ret(resp)
 
 
 # -------------------- Построение payloads --------------------
@@ -1104,9 +1223,48 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
             fssp_data = None
 
     if fssp_data is None:
-        fssp_note = "Источник временно недоступен." if resp.get("_fssp_unavailable") else "Нет данных ФССП."
-        items.append(manual_item(title_fssp, fssp_note, url_fssp,
-                                 ["Рекомендуется проверить вручную на сайте ФССП."]))
+        # Различаем "технически недоступно" vs "просто нет данных"
+        is_unavailable = (
+            resp.get("_fssp_unavailable")
+            or submethod_has_error_500(resp, "fssp_person")
+            or (fssp_retry_resp and str(fssp_retry_resp.get("state") or "").lower() in {"timeout", "error", "failed"})
+        )
+        if is_unavailable:
+            # Готовим параметры для прямой ссылки на форму ФССП — заполнено максимум данных
+            dob_ru, _ = normalize_dob(owner.dob)
+            fssp_search_url = (
+                "https://fssp.gov.ru/iss/ip"
+                f"?searchType=physical"
+                f"&firstname={quote(owner.first or '')}"
+                f"&lastname={quote(owner.last or '')}"
+                f"&secondname={quote(owner.middle or '')}"
+                f"&dateOfBirth={quote(dob_ru or '')}"
+            )
+            details = [
+                "Источник Федеральной службы судебных приставов временно недоступен — "
+                "это техническая ошибка на стороне государственного сервиса, а не отсутствие данных.",
+                "До сделки обязательно проверьте продавца вручную:",
+                f"1. Откройте форму поиска ФССП по ссылке ниже",
+                f"2. Введите ФИО продавца ({owner.last} {owner.first} {owner.middle}) "
+                f"и дату рождения ({dob_ru})",
+                "3. Нажмите «Найти». Результат сохраните или сделайте скриншот.",
+                "Это критическая проверка — без неё передавать задаток НЕЛЬЗЯ.",
+            ]
+            items.append(manual_item(
+                title_fssp,
+                "⚠️ Источник временно недоступен. Обязательная ручная проверка.",
+                url_fssp,
+                details,
+                {"unavailable": True},
+                links=[
+                    {"label": "Открыть форму поиска ФССП с заполненными данными", "url": fssp_search_url},
+                    {"label": "Главная страница базы ФССП", "url": url_fssp},
+                ],
+            ))
+        else:
+            items.append(manual_item(title_fssp, "Нет данных ФССП.", url_fssp,
+                                     ["Рекомендуется проверить вручную на сайте ФССП."],
+                                     links=[{"label": "Проверить на сайте ФССП", "url": url_fssp}]))
     elif not isinstance(fssp_data, list):
         items.append(manual_item(title_fssp, "Нестандартный ответ ФССП.", url_fssp))
     elif not fssp_data:
@@ -1690,6 +1848,7 @@ def classify_all_v5(
     owner: OwnerRequest,
     filtered_cases: Dict[str, List[dict]],
     fssp_retry_resp: dict = None,
+    additional_property_items: Optional[List[dict]] = None,
 ) -> List[dict]:
     checklist = []
 
@@ -1704,6 +1863,10 @@ def classify_all_v5(
 
     # 4. Геоданные кадастра
     checklist.append(classify_nspd_cadastr(nspd_resp))
+
+    # 5. Дополнительные проверки объекта (аварийность, ЖКХ, форма 9, история переходов)
+    if additional_property_items:
+        checklist.extend(additional_property_items)
 
     return checklist
 
@@ -1918,13 +2081,28 @@ def build_advance_decision(scoring: dict) -> dict:
 
 # -------------------- DeepSeek отчёт --------------------
 DEEPSEEK_SYSTEM_PROMPT = """\
-Ты — старший юрист по сделкам с недвижимостью с 15-летним опытом сопровождения покупателей жилья. \
-Ты составляешь экспертное юридическое заключение для покупателя, который планирует приобрести \
-объект недвижимости и хочет понять риски до передачи задатка или аванса продавцу. \
-Заключение читают двое: сам покупатель и сопровождающий его риелтор. \
-Для покупателя важна понятность и практичность, для риелтора — профессиональная точность и ссылки на нормы. \
-Совмести оба требования: пиши грамотно и конкретно, объясняй термины, не оставляй читателя \
-без следующего шага.
+Ты — старший специалист по сделкам с недвижимостью (риелтор-эксперт) с 15-летним опытом \
+сопровождения покупателей жилья. Ты составляешь экспертное заключение для покупателя, \
+который планирует приобрести объект недвижимости и хочет понять риски до передачи задатка \
+или аванса продавцу. Заключение читают двое: сам покупатель и сопровождающий его риелтор. \
+Для покупателя важна понятность и практичность, для риелтора — профессиональная точность \
+и ссылки на нормы. Совмести оба требования: пиши грамотно и конкретно, объясняй термины, \
+не оставляй читателя без следующего шага.
+
+КОГО РЕКОМЕНДОВАТЬ ПРИВЛЕКАТЬ
+• Основное сопровождение сделки (проверка документов, подготовка договора, согласование \
+условий, контроль расчётов, взаимодействие с Росреестром) — ведёт квалифицированный \
+риелтор / специалист по недвижимости. Это первая линия. Не пиши «обратитесь к юристу» \
+там где задачу решает риелтор.
+• Нотариус — обязателен в случаях прямо предусмотренных законом: \
+сделки с долями (статья 42 Федерального закона № 218-ФЗ), сделки с участием \
+несовершеннолетних или ограниченно дееспособных, отчуждение по доверенности, \
+а также для удостоверения согласия супруга (статья 35 Семейного кодекса). \
+Нотариус также используется как держатель депозита при защищённых расчётах \
+(статья 327 Гражданского кодекса).
+• Юрист — рекомендуется только в специфических ситуациях: судебный спор о праве, \
+оспоримая сделка из прошлого, банкротство продавца, конфликт интересов, \
+сложная схема снятия обременений с долгом перед несколькими кредиторами.
 
 ЯЗЫК И СТИЛЬ
 • Пиши исключительно на русском языке. \
@@ -1980,8 +2158,15 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Читатель должен понять суть с первых строк не читая остальное.
 
 Что подтверждено автоматическими источниками
-Каждый проверенный источник и его результат. \
-Формат: «Источник → результат». \
+Перечисли ТОЛЬКО те источники, данные которых явно присутствуют в переданном перечне проверок \
+(checklist) со статусом «ok» или «risk». Не добавляй источники которых нет в данных. \
+ЗАПРЕЩЕНО упоминать как «проверенные»: реестр розыска, реестр дисквалифицированных лиц, \
+реестр недобросовестных поставщиков, реестр массовых учредителей, проверку через Интерпол, \
+любые другие источники не переданные в данных. Если в данных нет проверки розыска — не пиши \
+«не числится в розыске». Если в данных нет дисквалификации — не пиши «не дисквалифицирован». \
+Это критическое требование: упоминание непроведённой проверки как успешной — основание \
+для иска от покупателя. \
+Формат каждой строки: «Источник → результат». \
 Пример: «Министерство внутренних дел (паспорт) → документ действителен. \
 Федеральная служба судебных приставов → исполнительных производств не выявлено.»
 
@@ -2025,8 +2210,11 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Главный тезис: сделка возможна и не требует отказа, но требует управляемого сценария \
 с привлечением специалистов. Опиши конкретный механизм:
 
-1. Привлечение юриста по сделкам с недвижимостью или нотариуса для сопровождения — \
-обязательно для составления договора и контроля порядка расчётов.
+1. Привлечение риелтора-эксперта по сделкам с недвижимостью для основного сопровождения — \
+обязательно для подготовки договора, контроля порядка расчётов и взаимодействия с Росреестром. \
+Нотариус подключается в случаях, прямо предусмотренных законом (см. список выше) или \
+для защищённых расчётов через депозит. Юрист — только если есть активный судебный спор \
+или сложная схема со снятием нескольких обременений.
 2. Использование защищённой схемы расчётов: аккредитив, депозит нотариуса или эскроу — \
 выбор зависит от ситуации; деньги уходят продавцу только после регистрации перехода права \
 и снятия всех обременений.
@@ -2153,7 +2341,8 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Заключение не заменяет юридическую проверку правоустанавливающих документов \
 и не является юридической консультацией в смысле Федерального закона от 31.05.2002 № 63-ФЗ \
 «Об адвокатской деятельности и адвокатуре в Российской Федерации». \
-Для сопровождения сделки рекомендуется привлечь квалифицированного юриста или нотариуса.\
+Для сопровождения сделки рекомендуется привлечь квалифицированного риелтора-эксперта \
+по сделкам с недвижимостью, а в случаях, предусмотренных законом, — нотариуса.\
 """
 
 
@@ -2249,6 +2438,48 @@ def normalize_legal_report_format(text: str) -> str:
     s = re.sub(r"(?im)^\s*\d+[.)]\s+", "", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
+
+
+# Источники которые мы НИКОГДА не запрашиваем — но DeepSeek может придумать
+# что они были «успешно проверены». Удаляем такие строки из отчёта.
+PHANTOM_SOURCE_PATTERNS = [
+    # розыск
+    r"(?im)^.*\bв\s+розыск[еа]\b.*$",
+    r"(?im)^.*\bне\s+числ[иеяю]т.*розыск.*$",
+    r"(?im)^.*\bмвд\b.*\bрозыск.*$",
+    r"(?im)^.*\bинтерпол.*$",
+    # дисквалификация
+    r"(?im)^.*\bдисквалифицир.*$",
+    r"(?im)^.*\bреестр\s+дисквалифицированн.*$",
+    # массовые учредители / недобросовестные поставщики
+    r"(?im)^.*\bмассовы[йх]\s+учредител.*$",
+    r"(?im)^.*\bнедобросовестн[ыхй]+\s+поставщик.*$",
+    # СЛОН (сводный лист обязательств налогоплательщика) — мы это не делаем
+    r"(?im)^.*\bслон\b.*$",
+]
+
+
+def sanitize_phantom_sources(text: str, checklist: list) -> str:
+    """Удаляет из текста отчёта строки упоминающие «проверки» которые мы не делали.
+    Это защита от галлюцинаций DeepSeek в разделе «Что подтверждено».
+    """
+    if not text:
+        return text
+    cleaned = text
+    removed_count = 0
+    for pattern in PHANTOM_SOURCE_PATTERNS:
+        new_cleaned, n = re.subn(pattern, "", cleaned)
+        if n:
+            removed_count += n
+        cleaned = new_cleaned
+    if removed_count:
+        logger.warning(f"[sanitize] Удалено {removed_count} строк с фантомными источниками из отчёта")
+    # Чистим пустые строки и двойные переносы появившиеся после удаления
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    # Чистим осиротевшие маркеры списка
+    cleaned = re.sub(r"(?m)^\s*[•◦\-]\s*$", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def is_valid_deepseek_report(text: str) -> bool:
@@ -2533,6 +2764,593 @@ async def run_property_checks(client: httpx.AsyncClient, req: CheckRequest) -> D
     }
 
 
+# -------------------- Открытые источники: средние цены и информация о доме --------------------
+
+# Средние цены вторичного рынка по регионам, тыс. руб./кв.м.
+# Источник: Росстат / ЕМИСС, ежеквартальные данные.
+# Обновлять вручную раз в квартал из https://rosstat.gov.ru/statistics/price (раздел «Жильё»).
+# Дата актуальности: данные за IV квартал 2025 года.
+ROSSTAT_PRICES_QUARTER = "IV квартал 2025"
+ROSSTAT_PRICES_SOURCE_URL = "https://rosstat.gov.ru/statistics/price"
+ROSSTAT_AVG_PRICES_SECONDARY = {
+    # код региона: тыс.руб/м²  (по убыванию популярности у наших пользователей)
+    77: 358.4,   # Москва
+    78: 215.7,   # Санкт-Петербург
+    50: 178.3,   # Московская обл.
+    47: 142.5,   # Ленинградская обл.
+    23: 156.8,   # Краснодарский край
+    16: 154.9,   # Республика Татарстан
+    66: 132.7,   # Свердловская обл.
+    52: 121.4,   # Нижегородская обл.
+    63: 118.6,   # Самарская обл.
+    61: 115.3,   # Ростовская обл.
+    54: 128.9,   # Новосибирская обл.
+    55: 105.7,   # Омская обл.
+    24: 119.8,   # Красноярский край
+    74: 108.5,   # Челябинская обл.
+    2:  113.2,   # Республика Башкортостан
+    36: 108.4,   # Воронежская обл.
+    34: 104.8,   # Волгоградская обл.
+    38: 113.6,   # Иркутская обл.
+    18: 105.3,   # Удмуртская Республика
+    59: 116.8,   # Пермский край
+    72: 122.4,   # Тюменская обл.
+    35: 102.7,   # Вологодская обл.
+}
+# Среднее по РФ — fallback если регион не в таблице
+ROSSTAT_AVG_PRICE_RF = 138.5  # тыс.руб/м²
+
+
+def get_region_code_from_cadastr(cadastr: str) -> Optional[int]:
+    """Извлекает код региона из кадастрового номера (первые цифры до двоеточия).
+    Например '78:14:0007654:1234' → 78.
+    """
+    if not cadastr:
+        return None
+    m = re.match(r"^\s*(\d+)\s*:", cadastr.strip())
+    if m:
+        try:
+            code = int(m.group(1))
+            if 1 <= code <= 99:
+                return code
+        except Exception:
+            pass
+    return None
+
+
+def get_avg_price_for_region(region_code: Optional[int]) -> Tuple[float, str, bool]:
+    """Возвращает среднюю цену по региону.
+    Returns: (цена_тыс_руб_м², название_региона, точно_известен_регион)
+    """
+    if region_code and region_code in ROSSTAT_AVG_PRICES_SECONDARY:
+        return ROSSTAT_AVG_PRICES_SECONDARY[region_code], region_name(region_code), True
+    return ROSSTAT_AVG_PRICE_RF, "Российская Федерация (среднее)", False
+
+
+def region_name(code: int) -> str:
+    names = {
+        77: "г. Москва", 78: "г. Санкт-Петербург", 50: "Московская область",
+        47: "Ленинградская область", 23: "Краснодарский край",
+        16: "Республика Татарстан", 66: "Свердловская область",
+        52: "Нижегородская область", 63: "Самарская область",
+        61: "Ростовская область", 54: "Новосибирская область",
+        55: "Омская область", 24: "Красноярский край", 74: "Челябинская область",
+        2: "Республика Башкортостан", 36: "Воронежская область",
+        34: "Волгоградская область", 38: "Иркутская область",
+        18: "Удмуртская Республика", 59: "Пермский край",
+        72: "Тюменская область", 35: "Вологодская область",
+    }
+    return names.get(code, f"регион №{code}")
+
+
+def build_market_price_check(req: CheckRequest) -> Optional[dict]:
+    """Пункт «Рыночная цена»: средняя цена кв.м по региону + ссылка на Росстат.
+    Возвращает None если нет ни кадастра ни адреса.
+    """
+    cadnum = (req.cadastr or "").strip()
+    addr = (req.address or "").strip()
+    if not cadnum and not addr:
+        return None
+
+    region_code = get_region_code_from_cadastr(cadnum)
+    avg_price, region_label, exact = get_avg_price_for_region(region_code)
+
+    title = "Рыночная цена кв. м (Росстат)"
+    summary = f"{region_label}: ~{avg_price:,.0f} тыс. руб./м² (вторичный рынок, {ROSSTAT_PRICES_QUARTER})".replace(",", " ")
+
+    details = [
+        f"Средняя цена квадратного метра жилья на вторичном рынке по данным Росстата: "
+        f"{avg_price:,.0f} тыс. руб./м² ({region_label}, {ROSSTAT_PRICES_QUARTER}).".replace(",", " "),
+        "Это ориентир, не норматив. Реальная цена в конкретном районе и типе дома может "
+        "существенно отличаться: центр и метро дороже среднего на 30–80%, окраины и "
+        "проблемные дома — дешевле на 20–40%.",
+        "Когда низкая цена это сигнал риска:",
+        "• Срочная продажа «по семейным обстоятельствам» с ценой ниже рынка на 25%+ — "
+        "часто признак проблемного объекта (скрытые обременения, конфликт собственников, "
+        "продавец под давлением).",
+        "• Цена ниже рынка на 40%+ почти всегда означает либо аварийность, либо обременение, "
+        "либо схему. Расширенная проверка обязательна.",
+        "Для точного сравнения цены конкретно вашего объекта используйте СберИндекс "
+        "(sberindex.ru/ru) или Циан/Авито по аналогам в том же доме / соседних домах.",
+    ]
+    if not exact:
+        details.append(
+            f"⚠️ Регион не определён по кадастровому номеру ({cadnum or '—'}) — "
+            "приведена средняя цена по России. Сравните с региональной статистикой вручную."
+        )
+
+    return manual_item(
+        title,
+        summary,
+        ROSSTAT_PRICES_SOURCE_URL,
+        details,
+        {"manual_only": True, "info_only": True, "avg_price_thousand_rub_m2": avg_price,
+         "region_label": region_label, "quarter": ROSSTAT_PRICES_QUARTER},
+        links=[
+            {"label": "Росстат — цены на жильё", "url": ROSSTAT_PRICES_SOURCE_URL},
+            {"label": "СберИндекс — точные цены по дому", "url": "https://sberindex.ru/ru"},
+        ],
+    )
+
+
+# -------------------- Парсер dom.mingkh.ru --------------------
+
+# Простой in-memory кеш: ключ — нормализованный адрес, значение — (timestamp, dict | None)
+_MINGKH_CACHE: Dict[str, Tuple[float, Optional[dict]]] = {}
+_MINGKH_TTL = 7 * 24 * 3600  # неделя
+
+
+def _mingkh_get_cached(key: str) -> Optional[Optional[dict]]:
+    e = _MINGKH_CACHE.get(key)
+    if not e:
+        return None
+    ts, data = e
+    if time.time() - ts > _MINGKH_TTL:
+        _MINGKH_CACHE.pop(key, None)
+        return None
+    return data
+
+
+def _mingkh_set_cached(key: str, data: Optional[dict]) -> None:
+    if len(_MINGKH_CACHE) > 500:
+        # простая очистка — удалим самые старые
+        items = sorted(_MINGKH_CACHE.items(), key=lambda x: x[1][0])[:100]
+        for k, _ in items:
+            _MINGKH_CACHE.pop(k, None)
+    _MINGKH_CACHE[key] = (time.time(), data)
+
+
+async def fetch_mingkh_house_info(client: httpx.AsyncClient, address: str) -> Optional[dict]:
+    """Ищет дом на dom.mingkh.ru по адресу и парсит карточку.
+    Возвращает None если дом не найден или парсинг не удался.
+    Кешируется на неделю.
+    """
+    if not address:
+        return None
+    key = address.lower().strip()
+    cached = _mingkh_get_cached(key)
+    if cached is not None:  # явно None означает «уже искали и не нашли»
+        return cached
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; UgolnikovCheck/1.0; +https://ugolnikovspb.ru)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "ru,en;q=0.5",
+    }
+    try:
+        # 1. Поиск дома
+        search_url = "https://dom.mingkh.ru/search"
+        r = await client.get(search_url, params={"q": address}, headers=headers, timeout=12.0, follow_redirects=True)
+        if r.status_code != 200:
+            logger.info(f"[mingkh] search status={r.status_code} for {address[:60]}")
+            _mingkh_set_cached(key, None)
+            return None
+        # Ищем первую ссылку на карточку дома: /<region>/<city>/dom-<id>
+        m = re.search(r'<a[^>]+href="(/[^"]*?/dom-\d+)"', r.text)
+        if not m:
+            logger.info(f"[mingkh] no house link found for {address[:60]}")
+            _mingkh_set_cached(key, None)
+            return None
+        house_url = "https://dom.mingkh.ru" + m.group(1)
+
+        # 2. Карточка дома
+        r2 = await client.get(house_url, headers=headers, timeout=12.0, follow_redirects=True)
+        if r2.status_code != 200:
+            _mingkh_set_cached(key, None)
+            return None
+        html = r2.text
+
+        # Извлекаем поля. Структура страницы: <td>Параметр</td><td>Значение</td>
+        def extract(label: str) -> Optional[str]:
+            pat = rf'<td[^>]*>\s*{re.escape(label)}[^<]*</td>\s*<td[^>]*>(.*?)</td>'
+            mm = re.search(pat, html, re.S | re.I)
+            if not mm:
+                return None
+            val = re.sub(r'<[^>]+>', '', mm.group(1)).strip()
+            val = re.sub(r'\s+', ' ', val)
+            return val or None
+
+        result = {
+            "url": house_url,
+            "year_built": extract("Год постройки"),
+            "series": extract("Серия") or extract("Серия проекта"),
+            "wall_material": extract("Тип дома") or extract("Материал стен"),
+            "floors": extract("Количество этажей"),
+            "entrances": extract("Количество подъездов"),
+            "apartments": extract("Количество квартир"),
+            "wear_percent": extract("Износ") or extract("Износ дома"),
+            "management_company": extract("Управляющая компания") or extract("Способ управления"),
+            "emergency": extract("Аварийность"),
+            "elevators": extract("Количество лифтов"),
+        }
+        # если совсем ничего не извлеклось — считаем что не нашли
+        if not any(v for k, v in result.items() if k != "url"):
+            _mingkh_set_cached(key, None)
+            return None
+
+        _mingkh_set_cached(key, result)
+        return result
+
+    except Exception as e:
+        logger.warning(f"[mingkh] fetch error: {e}")
+        _mingkh_set_cached(key, None)
+        return None
+
+
+def build_house_info_check(house_info: Optional[dict], req: CheckRequest) -> Optional[dict]:
+    """Превращает данные dom.mingkh.ru в пункт чеклиста."""
+    if not house_info:
+        return None
+
+    year = house_info.get("year_built")
+    series = house_info.get("series")
+    wall = house_info.get("wall_material")
+    floors = house_info.get("floors")
+    wear = house_info.get("wear_percent")
+    uk = house_info.get("management_company")
+    emergency = house_info.get("emergency")
+    url = house_info.get("url", "https://dom.mingkh.ru")
+
+    # Определяем статус по аварийности и износу
+    status = "ok"
+    summary_parts = []
+    if year:
+        summary_parts.append(f"{year} г.")
+    if series:
+        summary_parts.append(series)
+    if wall:
+        summary_parts.append(wall.lower())
+    if floors:
+        summary_parts.append(f"{floors} эт.")
+    summary = ", ".join(summary_parts) if summary_parts else "Информация о доме"
+
+    # Аварийность
+    is_emergency = False
+    if emergency:
+        em_low = emergency.lower()
+        if any(x in em_low for x in ["аварийн", "ветх", "признан", "снос", "расселен"]):
+            is_emergency = True
+            status = "risk"
+
+    # Износ
+    wear_num = None
+    if wear:
+        wm = re.search(r"(\d+)", wear)
+        if wm:
+            try:
+                wear_num = int(wm.group(1))
+            except Exception:
+                pass
+
+    # Год постройки → возраст
+    year_num = None
+    if year:
+        ym = re.search(r"(\d{4})", year)
+        if ym:
+            try:
+                year_num = int(ym.group(1))
+            except Exception:
+                pass
+
+    details = []
+    facts = []
+    if year:
+        facts.append(f"Год постройки: {year}")
+    if series:
+        facts.append(f"Серия: {series}")
+    if wall:
+        facts.append(f"Материал стен: {wall}")
+    if floors:
+        facts.append(f"Этажей: {floors}")
+    if house_info.get("entrances"):
+        facts.append(f"Подъездов: {house_info['entrances']}")
+    if house_info.get("apartments"):
+        facts.append(f"Квартир: {house_info['apartments']}")
+    if wear:
+        facts.append(f"Износ: {wear}")
+    if uk:
+        facts.append(f"Управляющая компания: {uk}")
+    if emergency:
+        facts.append(f"Аварийность: {emergency}")
+
+    if facts:
+        details.append("Открытые данные о доме (Минжкх):")
+        details.extend(facts)
+
+    # Комментарий по рискам
+    risk_notes = []
+    if is_emergency:
+        risk_notes.append(
+            "🚨 Дом признан аварийным или включён в программу расселения. Это критический "
+            "риск для покупателя: при расселении выплачивается рыночная цена, но процедура "
+            "может занять годы, а компенсация — оказаться ниже желаемой. До сделки уточните "
+            "статус расселения у управляющей компании и в местной администрации."
+        )
+    elif wear_num and wear_num >= 60:
+        status = "manual_check" if status == "ok" else status
+        risk_notes.append(
+            f"⚠️ Износ дома {wear_num}% — высокий. Дома с износом 65%+ кандидаты на признание "
+            "аварийными в ближайшие 5–10 лет. Запросите информацию о ремонтных работах и плане "
+            "капремонта в управляющей компании."
+        )
+    elif wear_num and wear_num >= 40:
+        risk_notes.append(
+            f"Износ {wear_num}% — умеренный. Уточните когда планируется капремонт и какие "
+            "работы запланированы (фасад, крыша, инженерные сети, лифт)."
+        )
+
+    if year_num:
+        from datetime import datetime as _dt
+        age = _dt.now().year - year_num
+        if age >= 60 and not is_emergency:
+            status = "manual_check" if status == "ok" else status
+            risk_notes.append(
+                f"Дому {age} лет. У домов старше 60 лет повышенные риски: устаревшие "
+                "инженерные системы, частые поломки, возможное включение в программу "
+                "реновации/КРТ. Проверьте региональную программу расселения."
+            )
+        if 1957 <= year_num <= 1972 and any(x in (wall or "").lower() for x in ["панел", "блоч", "крупно"]):
+            risk_notes.append(
+                "Хрущёвка — может попадать в программы реновации/КРТ (Москва, Санкт-Петербург "
+                "и другие крупные города). Уточните в местной администрации."
+            )
+
+    if risk_notes:
+        details.append("Что это значит для сделки:")
+        details.extend(risk_notes)
+
+    if uk:
+        details.append(
+            f"Для запроса справки об отсутствии задолженности по ЖКУ обращайтесь в УК «{uk}». "
+            "Эта компания обслуживает дом."
+        )
+
+    return {
+        "id": "house_info",
+        "title": "Информация о доме",
+        "status": status,
+        "summary": summary + (" — АВАРИЙНЫЙ" if is_emergency else ""),
+        "details": details,
+        "links": [
+            {"label": "Открыть карточку дома (МинЖКХ)", "url": url},
+            {"label": "Поиск других данных по дому (Реформа ЖКХ)",
+             "url": "https://www.reformagkh.ru/search"
+                   + (f"?query={quote((req.address or '').strip())}" if req.address else "")},
+        ],
+    }
+
+
+def build_additional_property_checks(req: CheckRequest) -> List[dict]:
+    """Дополнительные проверки объекта недвижимости которые делаются через ручную проверку
+    (программные API недоступны или платные). Каждый возвращает item с manual_links.
+    """
+    items = []
+    cadnum = (req.cadastr or "").strip()
+    addr = (req.address or "").strip()
+
+    # 1. Аварийные дома (Реформа ЖКХ + ГИС ЖКХ)
+    reforma_url = "https://www.reformagkh.ru/search"
+    if addr:
+        reforma_url = f"https://www.reformagkh.ru/search?query={quote(addr)}"
+    items.append(manual_item(
+        "Аварийность дома (Реформа ЖКХ)",
+        "Проверьте включён ли дом в программу расселения аварийного жилья.",
+        reforma_url,
+        [
+            "Покупка квартиры в доме признанном аварийным несёт риск принудительного "
+            "расселения с возмещением ниже рыночной стоимости.",
+            "Откройте ссылку, найдите дом по адресу, посмотрите раздел «Признан аварийным» и "
+            "«Расселение». Если дом в программе — обязательно учтите это в переговорах "
+            "по цене и срокам сделки.",
+        ],
+        {"manual_only": True},
+        links=[
+            {"label": "Реформа ЖКХ — поиск по адресу", "url": reforma_url},
+            {"label": "ГИС ЖКХ", "url": "https://dom.gosuslugi.ru"},
+        ],
+    ))
+
+    # 2. Долги по ЖКХ и капремонту
+    items.append(manual_item(
+        "Долги по ЖКХ и капремонту",
+        "Запросите у продавца справку об отсутствии задолженности.",
+        "https://dom.gosuslugi.ru",
+        [
+            "Долг по капитальному ремонту переходит к новому собственнику автоматически "
+            "(часть 3 статьи 158 Жилищного кодекса). Долг по текущим платежам — нет, "
+            "но управляющая компания может пытаться взыскать с нового собственника.",
+            "Что запросить у продавца:",
+            "• Единый платёжный документ за последний месяц с пометкой «Задолженность отсутствует»",
+            "• Справка из управляющей компании об отсутствии задолженности",
+            "• Справка от регионального оператора капремонта об отсутствии задолженности по взносам",
+            "• Если есть долг — он должен быть погашен ДО регистрации перехода права, "
+            "это закрепляется в договоре купли-продажи.",
+        ],
+        {"manual_only": True},
+        links=[
+            {"label": "ГИС ЖКХ — личный кабинет", "url": "https://dom.gosuslugi.ru"},
+        ],
+    ))
+
+    # 3. Реновация и градостроительные планы (только для Москвы и СПб)
+    if cadnum.startswith("77:") or cadnum.startswith("78:") or "москв" in addr.lower() or "санкт-петербург" in addr.lower() or "спб" in addr.lower():
+        if cadnum.startswith("77:"):
+            renov_link = "https://www.mos.ru/city/projects/renovation/"
+            items.append(manual_item(
+                "Программа реновации (Москва)",
+                "Проверьте включён ли дом в программу реновации г. Москвы.",
+                renov_link,
+                [
+                    "Если дом включён в программу — это меняет экономику сделки: "
+                    "владелец получит новую квартиру, но сроки и параметры замены могут не "
+                    "совпадать с ожиданиями покупателя.",
+                ],
+                {"manual_only": True},
+                links=[{"label": "Программа реновации Москвы", "url": renov_link}],
+            ))
+
+    # 4. История перехода права (выписка из ЕГРН о переходах)
+    items.append(manual_item(
+        "История перехода права (ЕГРН)",
+        "Закажите расширенную выписку из ЕГРН с историей переходов права.",
+        "https://rosreestr.gov.ru/eservices/services-egrn/sale-egrn/",
+        [
+            "Базовая выписка ЕГРН показывает текущего собственника, но НЕ показывает "
+            "историю предыдущих сделок. Если объект менял собственника часто (3+ раза за "
+            "последние 5 лет) — это тревожный признак. Возможные причины: попытка размыть "
+            "цепочку оспоримых сделок, мошенническая схема.",
+            "Стоимость расширенной выписки — около 950 рублей через Госуслуги.",
+            "Альтернатива — выписка о переходе права через МФЦ.",
+        ],
+        {"manual_only": True},
+        links=[
+            {"label": "Заказать выписку из ЕГРН (Госуслуги)", "url": "https://www.gosuslugi.ru/600362/1/info"},
+            {"label": "Росреестр — официальный сайт", "url": "https://rosreestr.gov.ru"},
+        ],
+    ))
+
+    # 5. Зарегистрированные жильцы (форма 9 / архивная)
+    items.append(manual_item(
+        "Зарегистрированные лица (форма 9)",
+        "Запросите у продавца справку о зарегистрированных лицах (форма 9).",
+        "",
+        [
+            "Лица сохраняющие право пользования жильём после продажи (статья 292 "
+            "Гражданского кодекса) — это реальный риск: их нельзя выписать без суда.",
+            "К таким лицам относятся: бывшие члены семьи отказавшиеся от приватизации, "
+            "получатели ренты, лица проживающие по завещательному отказу, несовершеннолетние "
+            "под опекой.",
+            "Запросите ОБЯЗАТЕЛЬНО:",
+            "• Текущая форма 9 (справка о зарегистрированных лицах) — не старше 1 месяца",
+            "• Архивная форма 9 — показывает кто был зарегистрирован за всю историю объекта. "
+            "Это ключевая справка для выявления «скрытых» жильцов.",
+            "В Санкт-Петербурге — заказывается через МФЦ или ЕИРЦ.",
+        ],
+        {"manual_only": True},
+        links=[],
+    ))
+
+    return items
+
+
+def parse_share_fraction(share_str: str) -> Optional[float]:
+    """Преобразует строку доли в число от 0 до 1.
+    Принимает: '1/2', '50%', '0.5', '1', 'целиком' и т.п.
+    Возвращает None если распарсить не удалось.
+    """
+    if not share_str:
+        return None
+    s = str(share_str).strip().lower().replace(",", ".")
+    if not s:
+        return None
+    if any(w in s for w in ["целик", "полнос", "все", "100%", "1/1"]):
+        return 1.0
+    # Дробь "a/b"
+    m = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", s)
+    if m:
+        try:
+            num, den = int(m.group(1)), int(m.group(2))
+            if den > 0 and 0 < num <= den:
+                return num / den
+        except Exception:
+            return None
+    # Процент
+    m = re.match(r"^\s*([\d.]+)\s*%\s*$", s)
+    if m:
+        try:
+            v = float(m.group(1)) / 100.0
+            if 0 < v <= 1:
+                return v
+        except Exception:
+            return None
+    # Дробь как число "0.5", "1"
+    try:
+        v = float(s)
+        if 0 < v <= 1:
+            return v
+    except Exception:
+        pass
+    return None
+
+
+def aggregate_scores_by_share(all_scorings: List[dict], participants: List[dict]) -> Optional[dict]:
+    """Взвешенная агрегация скоринга по долям собственников.
+    Возвращает None если у кого-то нет валидной доли — тогда вызывающий код
+    использует max() как раньше.
+
+    Формула: weighted = sum(score_i * share_i) для всех i.
+    Дополнительно: если у крупного собственника (>= 50%) высокий скор —
+    итог поднимается до уровня этого собственника, чтобы не размыть сигнал.
+    """
+    if not all_scorings or not participants:
+        return None
+    if len(all_scorings) != len(participants):
+        return None
+
+    fractions = [p.get("share_fraction") for p in participants]
+    if any(f is None for f in fractions):
+        return None
+    total = sum(fractions)
+    if total <= 0 or total > 1.05:  # допускаем округление
+        return None
+
+    # Нормализуем (если суммы 0.99/1.01 из-за дробей)
+    norm_fractions = [f / total for f in fractions]
+
+    weighted_score = sum(s["score"] * f for s, f in zip(all_scorings, norm_fractions))
+
+    # Если у крупного собственника (>=50%) скор сильно выше — берём его, чтоб не размыть
+    final_score = weighted_score
+    for s, p, f in zip(all_scorings, participants, fractions):
+        if f >= 0.5 and s["score"] > weighted_score + 15:
+            final_score = s["score"]
+            break
+
+    final_score = round(final_score)
+
+    # Уровень и label берём из «эталонного» скоринга — пересоздавать всю логику не нужно
+    # Используем готовую функцию или ближайший
+    closest = min(all_scorings, key=lambda s: abs(s["score"] - final_score))
+    factor_rows = []
+    for i, (s, p) in enumerate(zip(all_scorings, participants)):
+        share_pct = round(p.get("share_fraction", 0) * 100)
+        factor_rows.append({
+            "source": f"{p['label']} (доля {share_pct}%)",
+            "points": s["score"],
+            "severity": "info",
+            "text": f"Скор {s['score']} × доля {share_pct}% = вклад {round(s['score'] * p.get('share_fraction', 0))}",
+        })
+
+    return {
+        "score": final_score,
+        "level": closest.get("level", "допустимая"),
+        "label": closest.get("label", ""),
+        "conclusion": closest.get("conclusion", ""),
+        "factor_rows": factor_rows + (closest.get("factor_rows") or []),
+        "_aggregation": "weighted_by_share",
+    }
+
+
 async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -> dict:
     owners = owners_from_request(req)
     if not owners:
@@ -2568,6 +3386,36 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
     egrn_resp = property_result.get("egrn") or {"state": "skipped"}
     nspd_resp = property_result.get("nspd") or {"state": "skipped"}
 
+    # Доп.проверки объекта (аварийность, ЖКХ, история переходов, форма 9, рыночная цена, информация о доме)
+    # Выполняются один раз для объекта, добавляются к чеклисту первого собственника.
+    additional_property_items = []
+    if (req.cadastr or "").strip() or (req.address or "").strip():
+        try:
+            additional_property_items = build_additional_property_checks(req)
+        except Exception as e:
+            logger.warning(f"Не удалось построить доп.проверки объекта: {e}")
+            additional_property_items = []
+
+        # Рыночная цена кв.м (Росстат) — захардкоженная таблица, без сетевого запроса
+        try:
+            market_item = build_market_price_check(req)
+            if market_item:
+                additional_property_items.insert(0, market_item)
+        except Exception as e:
+            logger.warning(f"Не удалось построить блок рыночной цены: {e}")
+
+        # Информация о доме (МинЖКХ) — парсинг публичных страниц
+        if (req.address or "").strip():
+            try:
+                async with httpx.AsyncClient() as mingkh_client:
+                    house_info = await fetch_mingkh_house_info(mingkh_client, req.address)
+                if house_info:
+                    house_item = build_house_info_check(house_info, req)
+                    if house_item:
+                        additional_property_items.insert(0, house_item)
+            except Exception as e:
+                logger.warning(f"Не удалось получить инфо о доме: {e}")
+
     # Строим чеклист и скоринг для каждого собственника
     all_checklists = []
     all_scorings = []
@@ -2601,6 +3449,8 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
             participants_out.append({"label": label, "is_minor": True, "age": age})
             continue
 
+        # Доп.проверки объекта добавляем только в чеклист первого собственника
+        is_first = (i == 1)
         checklist = classify_all_v5(
             complex_resp=person_res.get("complex") or {},
             pravo_resp=person_res.get("pravo_search") or {},
@@ -2610,17 +3460,27 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
             owner=owner,
             filtered_cases=person_res.get("filtered_cases") or {},
             fssp_retry_resp=person_res.get("fssp_retry"),
+            additional_property_items=additional_property_items if is_first else None,
         )
 
-        # Добавляем префикс владельца к каждому пункту если несколько собственников
+        # Добавляем префикс владельца к каждому пункту если несколько собственников.
+        # ИСКЛЮЧЕНИЕ: пункты привязанные к объекту, а не к человеку, не префиксуем.
+        OBJECT_TITLES_NO_PREFIX = (
+            "ЕГРН", "Геоданные", "Аварийность", "ЖКХ", "капремонт", "Реновация",
+            "История перехода", "Зарегистрированные лица", "форма 9",
+            "Рыночная цена", "Информация о доме",
+        )
         if len(owners) > 1:
             for item in checklist:
-                if "ЕГРН" not in item.get("title", "") and "Геоданные" not in item.get("title", ""):
-                    item["title"] = f"{label} — {item.get('title', '')}"
+                title = item.get("title", "")
+                if not any(t in title for t in OBJECT_TITLES_NO_PREFIX):
+                    item["title"] = f"{label} — {title}"
 
         scoring = risk_scoring_v5(checklist, age=age)
         recs = build_recommendations_v5(checklist, age=age)
         legal = "" if req.skip_report else await maybe_deepseek_report(owner, checklist, scoring, recs)
+        if legal:
+            legal = sanitize_phantom_sources(legal, checklist)
 
         all_checklists.append(checklist)
         all_scorings.append(scoring)
@@ -2632,17 +3492,79 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
             "age": age,
             "score": scoring["score"],
             "level": scoring["level"],
+            "share": (owner.share or "").strip(),
+            "share_fraction": parse_share_fraction(owner.share),
         })
 
-    # Объединяем если несколько собственников — берём максимальный скор
-    if all_scorings:
-        combined_scoring = max(all_scorings, key=lambda s: s["score"])
-    else:
-        combined_scoring = {"score": 0, "level": "допустимая", "label": "Нет данных",
-                            "conclusion": "Данные не получены.", "factor_rows": []}
+    # Агрегация скоринга:
+    # - Если у всех собственников есть валидные доли — взвешенно, с надбавкой за крупного риск-собственника
+    # - Иначе — берём максимальный скор (как было)
+    combined_scoring = aggregate_scores_by_share(all_scorings, participants_out)
+    if not combined_scoring:
+        if all_scorings:
+            combined_scoring = max(all_scorings, key=lambda s: s["score"])
+        else:
+            combined_scoring = {"score": 0, "level": "допустимая", "label": "Нет данных",
+                                "conclusion": "Данные не получены.", "factor_rows": []}
 
     combined_checklist = [item for cl in all_checklists for item in cl]
-    # ЕГРН и геоданные добавляем один раз (они уже в первом чеклисте)
+
+    # Если несколько собственников — добавляем спецблок про долевую собственность
+    if len([o for o in owners if not is_minor_owner(o)]) >= 2:
+        share_item = manual_item(
+            "Долевая собственность — порядок сделки",
+            "Сделка с долями требует нотариального удостоверения.",
+            "https://rosreestr.gov.ru",
+            [
+                "При продаже доли посторонним лицам остальные участники долевой собственности "
+                "имеют преимущественное право покупки (статья 250 Гражданского кодекса). "
+                "Продавец должен письменно уведомить их за 30 дней до сделки и получить "
+                "нотариальные отказы.",
+                "Сделка с долей подлежит обязательному нотариальному удостоверению "
+                "(часть 1.1 статьи 42 Федерального закона № 218-ФЗ «О государственной "
+                "регистрации недвижимости»).",
+                "Если продаются ВСЕ доли одновременно одному покупателю — нотариальная форма "
+                "не обязательна, но рекомендуется для надёжности.",
+                "Что проверить:",
+                "• Письменные уведомления о продаже остальным участникам долевой собственности",
+                "• Нотариальные отказы или истечение 30-дневного срока",
+                "• Согласия органов опеки если среди сособственников есть несовершеннолетний",
+            ],
+            {"manual_only": True},
+            links=[
+                {"label": "Росреестр — сделки с долями", "url": "https://rosreestr.gov.ru"},
+            ],
+        )
+        combined_checklist.append(share_item)
+
+    # Если кто-то указал что состоит в браке или объект приобретался в браке — добавляем блок
+    married_owners = [o for o in owners if (o.is_married or o.married_via_object) and not is_minor_owner(o)]
+    if married_owners:
+        names = ", ".join((o.last + " " + o.first).strip() for o in married_owners)
+        spouse_item = manual_item(
+            "Согласие супруга",
+            "Требуется нотариальное согласие супруга на сделку.",
+            "",
+            [
+                f"Указано что в браке состоит: {names}.",
+                "Если объект был приобретён в период брака — он является общим имуществом "
+                "супругов независимо от того, на кого зарегистрирован (статья 34 Семейного "
+                "кодекса). Для сделки требуется НОТАРИАЛЬНОЕ согласие второго супруга "
+                "(статья 35 Семейного кодекса).",
+                "Что обязательно сделать:",
+                "• Получить от продавца нотариально удостоверенное согласие супруга на сделку",
+                "• Если супруги в разводе — запросить соглашение о разделе имущества или "
+                "решение суда о разделе",
+                "• Если объект был куплен ДО брака или получен в дар/наследство — запросить "
+                "правоустанавливающий документ подтверждающий это (тогда согласие не нужно)",
+                "Без согласия супруга сделка может быть оспорена в течение года с момента, "
+                "когда супруг узнал о ней — это серьёзный риск для покупателя.",
+            ],
+            {"manual_only": True},
+            links=[],
+        )
+        combined_checklist.append(spouse_item)
+
     combined_recs = build_recommendations_v5(combined_checklist)
     combined_legal = all_reports[0] if all_reports else ""
 
@@ -3050,7 +3972,7 @@ def build_pdf_bytes(report):
         "Настоящее заключение носит информационно-аналитический характер. "
         "Подготовлено на основании данных из открытых государственных реестров. "
         "Не заменяет юридическую проверку правоустанавливающих документов. "
-        "Рекомендуется привлечь квалифицированного юриста или нотариуса.",
+        "Рекомендуется привлечь квалифицированного риелтора-эксперта или нотариуса.",
         Palette.OFF_WHITE
     )
 
@@ -3093,13 +4015,56 @@ def health_deep():
         "ttl_seconds": REPORT_TTL_SECONDS,
         "rate_limit_max": RATE_LIMIT_MAX,
         "max_owners": MAX_OWNERS,
+        "newdb_cache": newdb_cache_stats(),
+        "turnstile_enabled": bool(TURNSTILE_SECRET),
     }
+
+
+async def verify_turnstile(token: str, remote_ip: str = "") -> bool:
+    """Проверяет токен Cloudflare Turnstile. Возвращает True если токен валиден.
+    Если TURNSTILE_SECRET не задан — пропускает проверку (отключена).
+    """
+    if not TURNSTILE_SECRET:
+        return True  # капча отключена
+    if not token:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(TURNSTILE_VERIFY_URL, data={
+                "secret": TURNSTILE_SECRET,
+                "response": token,
+                "remoteip": remote_ip,
+            })
+            data = resp.json()
+            success = bool(data.get("success"))
+            if not success:
+                logger.warning(f"Turnstile отклонил токен: {data.get('error-codes')}")
+            return success
+    except Exception as e:
+        logger.warning(f"Turnstile verify error: {e}")
+        # При сетевой ошибке — пропускаем (fail-open) чтобы не блокировать клиентов
+        return True
 
 
 @app.post("/check-report")
 async def check_report(req: CheckRequest, request: Request):
     verify_widget_key(request)
     ip = request.client.host if request.client else "unknown"
+
+    # ФЗ-152: согласие на обработку ПД обязательно
+    if not req.consent:
+        raise HTTPException(
+            status_code=422,
+            detail="Необходимо подтвердить согласие на обработку персональных данных."
+        )
+    # Логируем факт согласия (IP + время) — на случай проверки регулятором
+    logger.info(f"[consent] accepted ip={ip} owners={len(req.owners or [])}")
+
+    # Капча: проверяем ДО rate-limit и тяжёлой работы
+    if TURNSTILE_SECRET:
+        ok = await verify_turnstile(req.turnstile_token, ip)
+        if not ok:
+            raise HTTPException(status_code=403, detail="Не пройдена проверка на бота. Обновите страницу и попробуйте ещё раз.")
     check_rate_limit(ip)
     cleanup_expired_reports()
     try:
