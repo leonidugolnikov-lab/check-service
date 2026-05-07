@@ -3400,7 +3400,18 @@ async def send_report_pdf_email(to_email: str, report: dict) -> dict:
         )
     if resp.status_code >= 400:
         logger.warning(f"Resend email error {resp.status_code}: {resp.text[:500]}")
-        return {"sent": False, "reason": "resend_error", "status_code": resp.status_code}
+        reason = "resend_error"
+        try:
+            err_data = resp.json()
+            reason = (
+                err_data.get("message")
+                or err_data.get("error")
+                or err_data.get("name")
+                or reason
+            )
+        except Exception:
+            pass
+        return {"sent": False, "reason": reason, "status_code": resp.status_code}
     data = resp.json()
     return {"sent": True, "id": data.get("id")}
 
