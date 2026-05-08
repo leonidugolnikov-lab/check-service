@@ -2238,7 +2238,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 • По судебным делам не пересказывай технические причины совпадения. Объясняй коротко: \
 роль в деле, степень совпадения, регион и почему нужна ручная сверка.
 • Пиши компактно: только существенные выводы, без повторов и длинных общих рассуждений.
-• Жёсткий лимит: всё заключение не больше 1800–2200 знаков. Не пиши учебник, не объясняй \
+• Жёсткий лимит: всё заключение не больше 3200–4200 знаков. Не пиши учебник, не объясняй \
 очевидные нормы, не повторяй один и тот же риск в разных разделах.
 • Не расписывай детально все реестры в юридическом заключении. Полная фактура уже есть \
 в таблице проверок. В заключении нужны только смысловые выводы и действия.
@@ -2727,7 +2727,7 @@ async def maybe_deepseek_report(owner: OwnerRequest, checklist: list, scoring: d
                 {"role": "user", "content": build_deepseek_user_prompt(owner, checklist, scoring, recs)},
             ],
             "temperature": 0.25,
-            "max_tokens": min(DEEPSEEK_MAX_TOKENS, 1400),
+            "max_tokens": min(DEEPSEEK_MAX_TOKENS, 2200),
         }
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post(
@@ -4394,6 +4394,8 @@ def health():
         "version": APP_VERSION,
         "newdb_token": bool(NEWDB_TOKEN),
         "deepseek_key": bool(DEEPSEEK_API_KEY),
+        "deepseek_enabled": bool(USE_DEEPSEEK_REPORT and DEEPSEEK_API_KEY),
+        "deepseek_model": DEEPSEEK_MODEL if USE_DEEPSEEK_REPORT and DEEPSEEK_API_KEY else None,
         "reportlab": REPORTLAB_AVAILABLE,
         "max_owners": MAX_OWNERS,
     }
