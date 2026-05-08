@@ -68,7 +68,15 @@ REPORT_FROM_EMAIL = os.getenv("REPORT_FROM_EMAIL", "Ugolnikov SPb <reports@ugoln
 REPORT_REPLY_TO_EMAIL = os.getenv("REPORT_REPLY_TO_EMAIL", "").strip()
 
 # Безопасность
-ALLOWED_ORIGINS = ["https://ugolnikovspb.ru", "https://www.ugolnikovspb.ru"]
+ALLOWED_ORIGINS = [
+    "https://ugolnikovspb.ru",
+    "https://www.ugolnikovspb.ru",
+    "null",  # local file:// widget during testing
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
 PUBLIC_WIDGET_API_KEY = os.getenv("PUBLIC_WIDGET_API_KEY", "")
 ENABLE_DEBUG_NEWDB = os.getenv("ENABLE_DEBUG_NEWDB", "0").lower() in {"1", "true", "yes", "on"}
 DEBUG_API_KEY = os.getenv("DEBUG_API_KEY", "")
