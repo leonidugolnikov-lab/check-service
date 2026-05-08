@@ -1298,6 +1298,19 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
                     pass
             return 0.0
 
+        def summarize_fssp_item(x):
+            if not isinstance(x, dict):
+                return {}
+            return {
+                "subject": clean_str(x.get("SubjectAndDebtAmount") or x.get("subject") or x.get("debt") or ""),
+                "department": clean_str(x.get("Department") or x.get("department") or ""),
+                "bailiff": clean_str(x.get("Bailiff") or x.get("bailiff") or ""),
+                "ip_number": clean_str(x.get("IpNumber") or x.get("ip_number") or x.get("number") or ""),
+                "start_date": clean_str(x.get("StartDate") or x.get("start_date") or x.get("ExcitedDate") or ""),
+                "completion": clean_str(x.get("CompletionDateOrReason") or x.get("completion") or ""),
+                "sum": round(item_sum(x), 2),
+            }
+
         active = [x for x in fssp_data if isinstance(x, dict) and not clean_str(x.get("CompletionDateOrReason"))]
         closed = [x for x in fssp_data if isinstance(x, dict) and clean_str(x.get("CompletionDateOrReason"))]
         active_sum = sum(item_sum(x) for x in active)
@@ -1306,12 +1319,16 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
             "active_count": len(active),
             "closed_count": len(closed),
             "actual_debt": round(active_sum, 2),
+            "active_items": [summarize_fssp_item(x) for x in active[:20]],
+            "closed_items": [summarize_fssp_item(x) for x in closed[:20]],
         }
         if active:
             items.append(risk_item(title_fssp, f"Активные ИП: {rub(active_sum)}.", url_fssp,
-                                   [f"Активных: {len(active)}, сумма: {rub(active_sum)}"], stats))
+                                   [f"Активных: {len(active)}, сумма: {rub(active_sum)}",
+                                    f"Закрытых: {len(closed)}"], stats))
         else:
-            items.append(ok_item(title_fssp, "Только закрытые ИП.", url_fssp, [], stats))
+            items.append(ok_item(title_fssp, f"Активных ИП нет. Закрытых: {len(closed)}.", url_fssp,
+                                 ["Закрытые ИП не являются текущим долгом, но показываются для полной картины."], stats))
 
     # -----------------------------------------------------------------------
     # 5. Залоги продавца (ФНП) — это реестр движимого имущества, не ЕГРН
@@ -1368,8 +1385,9 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
             for url_link in pledge_fnp_urls[:5]:
                 pledge_details.append(f"• {url_link}")
 
+        if pledge_fnp_urls:
+            pledge_count = max(pledge_count, len(pledge_fnp_urls))
         if not pledge_count and pledge_fnp_urls:
-            pledge_count = len(pledge_fnp_urls)
             pledge_details.insert(0, "Найдены уведомления ФНП — требуется ручная сверка залогодателя и предмета залога.")
 
         pledge_details.insert(0, "Это не обременение объекта недвижимости и не ипотека по ЕГРН.")
@@ -1768,6 +1786,10 @@ def classify_egrn(resp: dict) -> dict:
         f"Тип: {obj.get('objType_text', '—')}",
         f"Площадь: {obj.get('area', '—')} кв.м",
     ]
+    if obj.get("address") or obj.get("address_text"):
+        details.append(f"Адрес: {obj.get('address') or obj.get('address_text')}")
+    if obj.get("cadCost") or obj.get("cad_cost") or obj.get("cadCostValue"):
+        details.append(f"Кадастровая стоимость: {rub(obj.get('cadCost') or obj.get('cad_cost') or obj.get('cadCostValue'))}")
 
     has_ban = any(w in enc_text for w in ["запрещ", "арест", "ограничение регистрац"])
     has_mortgage = any(w in enc_text for w in ["ипотек", "залог"])
@@ -1775,6 +1797,8 @@ def classify_egrn(resp: dict) -> dict:
 
     # Анализ дат прав
     rights = obj.get("rights") if isinstance(obj.get("rights"), list) else []
+    if rights:
+        details.append(f"Зарегистрированных прав: {len(rights)}")
     right_dates = []
     for r in rights:
         if isinstance(r, dict):
@@ -2165,6 +2189,10 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 • По судебным делам не пересказывай технические причины совпадения. Объясняй коротко: \
 роль в деле, степень совпадения, регион и почему нужна ручная сверка.
 • Пиши компактно: только существенные выводы, без повторов и длинных общих рассуждений.
+• Жёсткий лимит: всё заключение не больше 1800–2200 знаков. Не пиши учебник, не объясняй \
+очевидные нормы, не повторяй один и тот же риск в разных разделах.
+• Не расписывай детально все реестры в юридическом заключении. Полная фактура уже есть \
+в таблице проверок. В заключении нужны только смысловые выводы и действия.
 • Завершённое банкротство не называй действующим. Оцениваю срок: \
 менее трёх лет — повышенная осторожность, сделка оспорима по статье 61.2 Закона о банкротстве; \
 более трёх лет — срок исковой давности истёк по статье 196 Гражданского кодекса \
@@ -2184,7 +2212,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Читатель должен понять суть с первых строк не читая остальное.
 
 Что подтверждено автоматическими источниками
-Перечисли ТОЛЬКО те источники, данные которых явно присутствуют в переданном перечне проверок \
+Перечисли только 3–6 самых важных источников из переданного перечня проверок \
 (checklist) со статусом «ok» или «risk». Не добавляй источники которых нет в данных. \
 ЗАПРЕЩЕНО упоминать как «проверенные»: реестр розыска, реестр дисквалифицированных лиц, \
 реестр недобросовестных поставщиков, реестр массовых учредителей, проверку через Интерпол, \
@@ -2197,11 +2225,11 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Федеральная служба судебных приставов → исполнительных производств не выявлено.»
 
 Что не подтверждено и требует ручной проверки
-Для каждого непроверенного пункта: что именно → где проверить → почему важно для сделки. \
+Для каждого непроверенного пункта: что именно → где проверить. Максимум 4 пункта. \
 Если всё проверено — раздел пропустить.
 
 Ключевые угрозы для покупателя
-Только если угрозы есть в данных. Для каждой строго по шаблону:
+Только если угрозы есть в данных. Максимум 3 угрозы. Для каждой строго по шаблону:
 
 Угроза: [конкретное описание что обнаружено]
 Правовые последствия: [что может произойти со сделкой или правом собственности покупателя]
@@ -2209,8 +2237,8 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Что сделать: [конкретное действие покупателя или продавца для снятия угрозы]
 
 Логика сделки
-Это самый важный раздел — пиши его конкретно под данную ситуацию на основе результатов проверки. \
-Не шаблон, а персональный план.
+Это самый важный раздел — пиши 3–5 конкретных действий под данную ситуацию. \
+Не шаблон, а короткий персональный план.
 
 Сначала определи сценарий по данным и выбери соответствующую логику:
 
@@ -2650,7 +2678,7 @@ async def maybe_deepseek_report(owner: OwnerRequest, checklist: list, scoring: d
                 {"role": "user", "content": build_deepseek_user_prompt(owner, checklist, scoring, recs)},
             ],
             "temperature": 0.25,
-            "max_tokens": DEEPSEEK_MAX_TOKENS,
+            "max_tokens": min(DEEPSEEK_MAX_TOKENS, 1400),
         }
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post(
@@ -4059,12 +4087,29 @@ def build_pdf_bytes(report):
                     p(f"Активных: {data.get('active_count',0)}, закрытых: {data.get('closed_count',0)}, долг: {rub(data.get('actual_debt',0))}"),
                     styles["Z_Detail"]
                 ))
+                for group_title, rows in [
+                    ("Активные записи ФССП", data.get("active_items") or []),
+                    ("Закрытые записи ФССП", data.get("closed_items") or []),
+                ]:
+                    if rows:
+                        summary_cell.append(Paragraph(p(group_title), styles["Z_Detail"]))
+                        for ip in rows[:6]:
+                            parts = []
+                            if ip.get("ip_number"): parts.append(f"ИП: {ip.get('ip_number')}")
+                            if ip.get("subject"): parts.append(f"Предмет: {ip.get('subject')[:90]}")
+                            if ip.get("completion"): parts.append(f"Окончание: {ip.get('completion')[:90]}")
+                            if parts:
+                                summary_cell.append(Paragraph(p(" | ".join(parts)), styles["Z_Detail"]))
             # Залоги — ссылки на уведомления ФНП
             fnp_urls = data.get("fnp_urls") or []
             if fnp_urls:
                 summary_cell.append(Paragraph(p("Ссылки на уведомления ФНП:"), styles["Z_Detail"]))
                 for u in fnp_urls[:5]:
                     summary_cell.append(Paragraph(p_links(f"  • {u}"), styles["Z_Detail"]))
+                summary_cell.append(Paragraph(
+                    p("ФНП — движимое имущество. Это не ипотека и не обременение объекта по ЕГРН."),
+                    styles["Z_Detail"]
+                ))
             # Структурированные ссылки (банкротство Федресурс, арбитраж КАД)
             structured_links = data.get("links") or []
             if structured_links:
@@ -4094,22 +4139,36 @@ def build_pdf_bytes(report):
                 if data.get("area"): egrn_parts.append(f"Площадь: {data['area']} кв.м")
                 if data.get("rights"):
                     rights = data["rights"] if isinstance(data["rights"], list) else []
-                    for r in rights[:2]:
+                    egrn_parts.append(f"Зарегистрированных прав: {len(rights)}")
+                    for idx, r in enumerate(rights[:8], 1):
                         if isinstance(r, dict):
                             owner_n = clean_str(r.get("rightHolder") or r.get("owner") or "")
                             reg_d = clean_str(r.get("registrationDate") or r.get("regDate") or "")
                             right_t = clean_str(r.get("rightType") or r.get("type") or "")
-                            if owner_n: egrn_parts.append(f"Правообладатель: {owner_n[:60]}")
-                            if right_t: egrn_parts.append(f"Вид права: {right_t}")
-                            if reg_d: egrn_parts.append(f"Дата регистрации: {reg_d}")
+                            share = clean_str(r.get("shareText") or r.get("share") or "")
+                            reg_num = clean_str(r.get("registrationNumber") or r.get("regNumber") or r.get("number") or "")
+                            row = [f"Право {idx}"]
+                            if owner_n: row.append(f"правообладатель: {owner_n[:60]}")
+                            if right_t: row.append(f"вид: {right_t}")
+                            if share: row.append(f"доля: {share}")
+                            if reg_d: row.append(f"дата: {reg_d}")
+                            if reg_num: row.append(f"номер: {reg_num}")
+                            egrn_parts.append(" | ".join(row))
                 if data.get("encumbrances"):
                     enc = data["encumbrances"] if isinstance(data["encumbrances"], list) else []
-                    for e in enc[:2]:
+                    egrn_parts.append(f"Обременений: {len(enc)}")
+                    for idx, e in enumerate(enc[:8], 1):
                         if isinstance(e, dict):
                             enc_t = clean_str(e.get("type") or e.get("encumbranceType") or "")
                             enc_h = clean_str(e.get("holder") or e.get("encumbranceHolder") or "")
-                            if enc_t: egrn_parts.append(f"Обременение: {enc_t}")
-                            if enc_h: egrn_parts.append(f"Держатель: {enc_h[:60]}")
+                            enc_d = clean_str(e.get("startDate") or e.get("date") or e.get("registrationDate") or "")
+                            enc_n = clean_str(e.get("number") or e.get("registrationNumber") or "")
+                            row = [f"Обременение {idx}"]
+                            if enc_t: row.append(f"тип: {enc_t}")
+                            if enc_h: row.append(f"держатель: {enc_h[:60]}")
+                            if enc_d: row.append(f"дата: {enc_d}")
+                            if enc_n: row.append(f"номер: {enc_n}")
+                            egrn_parts.append(" | ".join(row))
                 for ep in egrn_parts:
                     summary_cell.append(Paragraph(p(ep), styles["Z_Detail"]))
             # Геоданные
@@ -4122,6 +4181,10 @@ def build_pdf_bytes(report):
                 if obj.get("year_built"): geo_parts.append(f"Год постройки: {obj['year_built']}")
                 if gc.get("lat") and gc.get("lon"):
                     geo_parts.append(f"Координаты: {gc['lat']}, {gc['lon']}")
+                    geo_parts.append(f"Карта: https://yandex.ru/maps/?ll={gc['lon']},{gc['lat']}&z=17&pt={gc['lon']},{gc['lat']},pm2rdm")
+                points = data.get("geo_points")
+                if isinstance(points, list) and points:
+                    geo_parts.append(f"Точек кадастрового контура: {len(points)}")
                 for gp in geo_parts:
                     summary_cell.append(Paragraph(p(gp), styles["Z_Detail"]))
 
@@ -4143,16 +4206,25 @@ def build_pdf_bytes(report):
         "Что не подтверждено и требует ручной проверки","Ключевые угрозы для покупателя",
         "Логика сделки","Как передавать задаток / аванс","Как передавать аванс",
         "Итоговое заключение","Важно"]
+    rendered_blocks = 0
+    rendered_bullets = 0
     for block_type, text in pdf_report_blocks(legal_text):
         if not text.strip():
             continue
         if block_type == "h":
+            rendered_blocks += 1
+            if rendered_blocks > 7:
+                continue
             story.append(Spacer(1, 3*mm))
             story.append(Paragraph(p(text), styles["Z_H2"]))
         elif block_type == "bullet":
+            rendered_bullets += 1
+            if rendered_bullets > 22:
+                continue
             story.append(Paragraph(f"• {p(text)}", styles["Z_Body"]))
         else:
-            story.append(Paragraph(p(text), styles["Z_Body"]))
+            short_text = text if len(text) <= 650 else text[:647].rstrip() + "..."
+            story.append(Paragraph(p(short_text), styles["Z_Body"]))
 
     # ── РЕКОМЕНДАЦИИ ──
     recs = report.get("recommendations") or []
