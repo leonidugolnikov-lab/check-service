@@ -60,7 +60,7 @@ NEWDB_TOKEN = os.getenv("NEWDB_TOKEN", "").strip()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 USE_DEEPSEEK_REPORT = os.getenv("USE_DEEPSEEK_REPORT", "0").strip().lower() in {"1", "true", "yes", "on"}
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro").strip()
 DEEPSEEK_MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "4096"))
 SHOW_RAW_REGISTRY_DATA = os.getenv("SHOW_RAW_REGISTRY_DATA", "0").strip().lower() in {"1", "true", "yes", "on"}
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
@@ -3004,8 +3004,44 @@ def region_name(code: int) -> str:
     return names.get(code, f"регион №{code}")
 
 
-def build_market_price_check(req: CheckRequest) -> Optional[dict]:
-    """Пункт «Рыночная цена»: средняя цена кв.м по региону + ссылка на Росстат.
+def parse_area_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    s = clean_str(value).replace(",", ".")
+    m = re.search(r"\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        area = float(m.group(0))
+        return area if area > 0 else None
+    except Exception:
+        return None
+
+
+def extract_property_area(egrn_resp: dict, nspd_resp: dict) -> Optional[float]:
+    data, _ = result_data(egrn_resp, "rosreestr")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        area = parse_area_value(data[0].get("area") or data[0].get("areaValue"))
+        if area:
+            return area
+
+    data, _ = result_data(nspd_resp, "nspd_cadastr")
+    if isinstance(data, list) and data:
+        first = data[0] if isinstance(data[0], dict) else {}
+        items_list = first.get("items") if isinstance(first, dict) else []
+        if items_list and isinstance(items_list[0], dict):
+            obj = items_list[0].get("object") or {}
+            if isinstance(obj, dict):
+                area = parse_area_value(obj.get("area") or obj.get("area_value"))
+                if area:
+                    return area
+    return None
+
+
+def build_market_price_check(req: CheckRequest, area_m2: Optional[float] = None) -> Optional[dict]:
+    """Пункт «Рыночная цена»: средняя цена региона + оценка объекта по площади.
     Возвращает None если нет ни кадастра ни адреса.
     """
     cadnum = ((req.cadastral_number or req.cadnum or req.cadastral or "") or "").strip()
@@ -3015,12 +3051,24 @@ def build_market_price_check(req: CheckRequest) -> Optional[dict]:
 
     region_code = get_region_code_from_cadastr(cadnum)
     avg_price, region_label, exact = get_avg_price_for_region(region_code)
+    object_price = round(avg_price * 1000 * area_m2) if area_m2 else None
 
-    title = "Рыночная цена кв. м (Росстат)"
-    summary = f"{region_label}: ~{avg_price:,.0f} тыс. руб./м² (вторичный рынок, {ROSSTAT_PRICES_QUARTER})".replace(",", " ")
+    title = "Ориентир рыночной цены (Росстат)"
+    if object_price:
+        summary = (
+            f"Ориентир по объекту: ~{rub(object_price)} "
+            f"({area_m2:g} м² × {avg_price:,.0f} тыс. руб./м², {region_label})."
+        ).replace(",", " ")
+    else:
+        summary = f"{region_label}: ~{avg_price:,.0f} тыс. руб./м² (площадь объекта не получена).".replace(",", " ")
 
     details = [
-        f"Средняя цена квадратного метра жилья на вторичном рынке по данным Росстата: "
+        (
+            f"Расчёт по объекту: {area_m2:g} м² × {avg_price:,.0f} тыс. руб./м² = "
+            f"{rub(object_price)}."
+        ).replace(",", " ") if object_price else
+        "Стоимость объекта не рассчитана, потому что площадь не получена из ЕГРН/кадастра.",
+        f"Средняя цена квадратного метра по данным Росстата: "
         f"{avg_price:,.0f} тыс. руб./м² ({region_label}, {ROSSTAT_PRICES_QUARTER}).".replace(",", " "),
         "Это ориентир, не норматив. Реальная цена в конкретном районе и типе дома может "
         "существенно отличаться: центр и метро дороже среднего на 30–80%, окраины и "
@@ -3046,6 +3094,7 @@ def build_market_price_check(req: CheckRequest) -> Optional[dict]:
         ROSSTAT_PRICES_SOURCE_URL,
         details,
         {"manual_only": True, "info_only": True, "avg_price_thousand_rub_m2": avg_price,
+         "estimated_object_price": object_price, "area_m2": area_m2,
          "region_label": region_label, "quarter": ROSSTAT_PRICES_QUARTER},
         links=[
             {"label": "Росстат — цены на жильё", "url": ROSSTAT_PRICES_SOURCE_URL},
@@ -3634,7 +3683,8 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
 
         # Рыночная цена кв.м (Росстат) — захардкоженная таблица, без сетевого запроса
         try:
-            market_item = build_market_price_check(req)
+            property_area_m2 = extract_property_area(egrn_resp, nspd_resp)
+            market_item = build_market_price_check(req, area_m2=property_area_m2)
             if market_item:
                 additional_property_items.insert(0, market_item)
         except Exception as e:
