@@ -1314,9 +1314,9 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
             items.append(ok_item(title_fssp, "Только закрытые ИП.", url_fssp, [], stats))
 
     # -----------------------------------------------------------------------
-    # 5. Залоги (ФНП) — с прямыми ссылками на уведомления
+    # 5. Залоги продавца (ФНП) — это реестр движимого имущества, не ЕГРН
     # -----------------------------------------------------------------------
-    title_pledge = "Залоги (ФНП)"
+    title_pledge = "Залоги продавца (ФНП, движимое имущество)"
     url_pledge = "https://www.reestr-zalogov.ru"
     pledge_data, _ = extract_submethod_data(resp, "pledge_person")
 
@@ -1334,9 +1334,9 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
         pass
 
     if pledge_data is None:
-        items.append(manual_item(title_pledge, "Нет данных о залогах.", url_pledge))
+        items.append(manual_item(title_pledge, "Нет данных ФНП о залогах движимого имущества.", url_pledge))
     elif not pledge_data and not pledge_fnp_urls:
-        items.append(ok_item(title_pledge, "Залоги не найдены.", url_pledge, []))
+        items.append(ok_item(title_pledge, "Уведомления ФНП о залогах движимого имущества не найдены.", url_pledge, []))
     else:
         # Есть данные залогов или ссылки на уведомления
         pledge_details = []
@@ -1364,15 +1364,16 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
                 pledge_display.append(p)
 
         if pledge_fnp_urls:
-            pledge_details.append("Ссылки для ручной проверки залогов:")
+            pledge_details.append("Ссылки для ручной проверки уведомлений ФНП:")
             for url_link in pledge_fnp_urls[:5]:
                 pledge_details.append(f"• {url_link}")
 
         if not pledge_count and pledge_fnp_urls:
             pledge_count = len(pledge_fnp_urls)
-            pledge_details.insert(0, "Найдены уведомления о залоге — требуется ручная проверка по ссылкам ниже.")
+            pledge_details.insert(0, "Найдены уведомления ФНП — требуется ручная сверка залогодателя и предмета залога.")
 
-        pledge_details.insert(0, "Необходима проверка предмета залога до сделки.")
+        pledge_details.insert(0, "Это не обременение объекта недвижимости и не ипотека по ЕГРН.")
+        pledge_details.insert(1, "ФНП показывает уведомления о залоге движимого имущества, например автомобиля или оборудования.")
 
         # Подготавливаем структурированные ссылки для виджета
         pledge_links_list = []
@@ -1383,7 +1384,7 @@ def classify_complex_by_passport(resp: dict, owner: OwnerRequest, fssp_retry_res
 
         items.append(risk_item(
             title_pledge,
-            f"Найдено уведомлений о залоге: {pledge_count}. Требуется проверка.",
+            f"Найдены уведомления ФНП: {pledge_count}. Это требует сверки, но не означает залог квартиры.",
             url_pledge,
             pledge_details,
             {"pledges": pledge_display, "count": pledge_count, "fnp_urls": pledge_fnp_urls},
@@ -1954,7 +1955,7 @@ def risk_scoring_v5(checklist: List[dict], age: Optional[int] = None) -> dict:
             else:
                 add("ФССП", 5, "ИП найдены", "attention")
         elif "Залоги" in title:
-            add("Залоги", 12, "Залоги физлица", "medium")
+            add("Залоги ФНП", 10, "Уведомления ФНП по движимому имуществу: нужна ручная сверка", "medium")
         elif "Паспорт МВД" in title:
             add("Паспорт МВД", 40, "Риск недействительности", "critical")
         elif "ИП" in title or "ЕГРИП" in title:
@@ -2046,8 +2047,8 @@ def build_recommendations_v5(checklist: List[dict], age: Optional[int] = None) -
             recs.append({"priority": "high", "title": "Закрыть ИП до сделки",
                          "text": "Прописать порядок погашения в соглашении."})
         elif "Залоги" in title:
-            recs.append({"priority": "high", "title": "Снять залог до сделки",
-                         "text": "Получить справку об отсутствии залогов после снятия."})
+            recs.append({"priority": "medium", "title": "Сверить уведомления ФНП",
+                         "text": "Проверить предмет залога и залогодателя. Если это автомобиль или другое движимое имущество и оно не относится к объекту, не считать это обременением квартиры."})
         elif "Суды" in title:
             recs.append({"priority": "medium", "title": "Проверить судебные дела",
                          "text": "Запросить карточки дел, уточнить актуальный статус."})
@@ -2096,19 +2097,19 @@ def build_advance_decision(scoring: dict) -> dict:
 
 # -------------------- DeepSeek отчёт --------------------
 DEEPSEEK_SYSTEM_PROMPT = """\
-Ты — старший специалист по сделкам с недвижимостью (риелтор-эксперт) с 15-летним опытом \
+Ты — старший специалист по сделкам с недвижимостью с 15-летним опытом \
 сопровождения покупателей жилья. Ты составляешь экспертное заключение для покупателя, \
 который планирует приобрести объект недвижимости и хочет понять риски до передачи задатка \
-или аванса продавцу. Заключение читают двое: сам покупатель и сопровождающий его риелтор. \
-Для покупателя важна понятность и практичность, для риелтора — профессиональная точность \
+или аванса продавцу. Заключение читают двое: сам покупатель и сопровождающий его специалист по недвижимости. \
+Для покупателя важна понятность и практичность, для специалиста по недвижимости — профессиональная точность \
 и ссылки на нормы. Совмести оба требования: пиши грамотно и конкретно, объясняй термины, \
 не оставляй читателя без следующего шага.
 
 КОГО РЕКОМЕНДОВАТЬ ПРИВЛЕКАТЬ
 • Основное сопровождение сделки (проверка документов, подготовка договора, согласование \
 условий, контроль расчётов, взаимодействие с Росреестром) — ведёт квалифицированный \
-риелтор / специалист по недвижимости. Это первая линия. Не пиши «обратитесь к юристу» \
-там где задачу решает риелтор.
+специалист по недвижимости. Это первая линия. Не пиши «обратитесь к юристу» \
+там где задачу решает специалист по недвижимости.
 • Нотариус — обязателен в случаях прямо предусмотренных законом: \
 сделки с долями (статья 42 Федерального закона № 218-ФЗ), сделки с участием \
 несовершеннолетних или ограниченно дееспособных, отчуждение по доверенности, \
@@ -2154,6 +2155,16 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 ПРАВИЛА РАБОТЫ С ДАННЫМИ
 • Строго опирайся на переданные данные. Не придумывай угрозы которых нет в данных.
 • Не раскрывай паспортные данные, ИНН, дату рождения продавца.
+• Соблюдай режим проверки из пользовательского сообщения. Если проверялся только продавец, \
+не делай выводов по объекту. Если проверялся только объект, не делай выводов по продавцу. \
+Если проверялась сделка, разделяй риски продавца и объекта.
+• Не смешивай ФНП и ЕГРН. «Залоги продавца (ФНП, движимое имущество)» — это уведомления \
+о залоге движимого имущества по физическому лицу, например автомобиля или оборудования. \
+Это НЕ ипотека, НЕ залог квартиры и НЕ обременение объекта недвижимости. Обременение объекта \
+можно описывать только если оно прямо найдено в ЕГРН, Росреестре или данных объекта.
+• По судебным делам не пересказывай технические причины совпадения. Объясняй коротко: \
+роль в деле, степень совпадения, регион и почему нужна ручная сверка.
+• Пиши компактно: только существенные выводы, без повторов и длинных общих рассуждений.
 • Завершённое банкротство не называй действующим. Оцениваю срок: \
 менее трёх лет — повышенная осторожность, сделка оспорима по статье 61.2 Закона о банкротстве; \
 более трёх лет — срок исковой давности истёк по статье 196 Гражданского кодекса \
@@ -2216,7 +2227,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 эскроу по статье 860.7 Гражданского кодекса Российской Федерации) — \
 снимаются все запреты и обременения, затем проводится регистрация перехода права, \
 и только после регистрации деньги становятся доступны продавцу. \
-Прямая передача средств продавцу до снятия ограничений категорически недопустима — \
+Прямая передача средств продавцу до снятия ограничений категорически не рекомендуется — \
 покупатель рискует потерять деньги без правовой защиты.
 
 Если есть управляемые угрозы (долги ФССП, залоги, ипотека, судебные дела, \
@@ -2225,7 +2236,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Главный тезис: сделка возможна и не требует отказа, но требует управляемого сценария \
 с привлечением специалистов. Опиши конкретный механизм:
 
-1. Привлечение риелтора-эксперта по сделкам с недвижимостью для основного сопровождения — \
+1. Привлечение специалиста по недвижимости для основного сопровождения — \
 обязательно для подготовки договора, контроля порядка расчётов и взаимодействия с Росреестром. \
 Нотариус подключается в случаях, прямо предусмотренных законом (см. список выше) или \
 для защищённых расчётов через депозит. Юрист — только если есть активный судебный спор \
@@ -2295,7 +2306,7 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Это нужно закладывать в план заранее, а не после передачи аванса.
 
 Если объект в ипотеке:
-Нельзя передавать аванс напрямую продавцу до снятия ипотечного обременения. \
+Не рекомендуется передавать аванс напрямую продавцу до снятия ипотечного обременения. \
 Схема: покупатель гасит ипотеку продавца из собственных средств через депозит нотариуса \
 или аккредитив — только так деньги защищены. Прямая передача наличными \
 для погашения чужого долга создаёт реальную угрозу потери средств без возможности \
@@ -2356,14 +2367,93 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Заключение не заменяет юридическую проверку правоустанавливающих документов \
 и не является юридической консультацией в смысле Федерального закона от 31.05.2002 № 63-ФЗ \
 «Об адвокатской деятельности и адвокатуре в Российской Федерации». \
-Для сопровождения сделки рекомендуется привлечь квалифицированного риелтора-эксперта \
+Для сопровождения сделки рекомендуется привлечь квалифицированного специалиста по недвижимости \
 по сделкам с недвижимостью, а в случаях, предусмотренных законом, — нотариуса.\
 """
 
 
+SELLER_CHECK_MARKERS = (
+    "Паспорт", "ИНН", "ФССП", "Суды", "Залоги продавца", "Банкротство",
+    "ЕФРСБ", "Арбитраж", "ЕГРИП", "Налоговая", "Блокировка", "террорист"
+)
+OBJECT_CHECK_MARKERS = (
+    "ЕГРН", "Росреестр", "Геоданные", "НСПД", "Объект", "дом", "кадастр",
+    "Аварийность", "ЖКХ", "рыночная", "обременен", "ипотек"
+)
+
+
+def detect_check_mode(checklist: list) -> dict:
+    titles = " | ".join(str(i.get("title", "")) for i in checklist)
+    has_seller = any(m.lower() in titles.lower() for m in SELLER_CHECK_MARKERS)
+    has_object = any(m.lower() in titles.lower() for m in OBJECT_CHECK_MARKERS)
+    if has_seller and has_object:
+        return {
+            "code": "deal",
+            "label": "Проверка сделки: продавец + объект",
+            "instruction": "Разделяй выводы по продавцу и объекту. Не переноси риски продавца на объект без данных ЕГРН.",
+        }
+    if has_object:
+        return {
+            "code": "object",
+            "label": "Проверка объекта недвижимости",
+            "instruction": "Пиши только про объект и документы по объекту. Не делай выводов о продавце.",
+        }
+    return {
+        "code": "seller",
+        "label": "Проверка продавца",
+        "instruction": "Пиши только про продавца, паспортные и личные реестры. Не делай выводов об объекте.",
+    }
+
+
+def has_object_encumbrance_signal(checklist: list) -> bool:
+    object_titles = ("ЕГРН", "Росреестр", "Объект", "НСПД")
+    words = ("ипотек", "залог", "обременен", "арест", "запрет")
+    for item in checklist:
+        text = " ".join([
+            str(item.get("title", "")),
+            str(item.get("summary", "")),
+            " ".join(str(x) for x in (item.get("details") or [])),
+        ]).lower()
+        if any(t.lower() in str(item.get("title", "")).lower() for t in object_titles) and any(w in text for w in words):
+            return True
+    return False
+
+
+def has_fnp_pledge_signal(checklist: list) -> bool:
+    return any(
+        "залоги" in str(i.get("title", "")).lower()
+        and "фнп" in str(i.get("title", "")).lower()
+        and i.get("status") == "risk"
+        for i in checklist
+    )
+
+
 def build_deepseek_user_prompt(owner: OwnerRequest, checklist: list, scoring: dict, recs: list) -> str:
     age = calculate_age(normalize_dob(owner.dob)[0])
-    fio_str = " ".join(x for x in [owner.last.strip(), owner.first.strip(), owner.middle.strip()] if x)
+    mode = detect_check_mode(checklist)
+    sensitive_tokens = [
+        owner.last, owner.first, owner.middle, owner.dob, owner.inn,
+        owner.passport_series, owner.passport_number, owner.seria,
+        owner.seriapass, owner.series, owner.number, owner.numberpass,
+    ]
+    sensitive_tokens = [clean_str(x) for x in sensitive_tokens if clean_str(x)]
+
+    def redact_value(value):
+        if value is None:
+            return value
+        if isinstance(value, str):
+            out = value
+            for token in sensitive_tokens:
+                if len(token) >= 2:
+                    out = re.sub(re.escape(token), "[скрыто]", out, flags=re.IGNORECASE)
+            out = re.sub(r"\b\d{4}\s?\d{6}\b", "[паспорт скрыт]", out)
+            out = re.sub(r"\b\d{10,12}\b", "[номер скрыт]", out)
+            return out
+        if isinstance(value, list):
+            return [redact_value(v) for v in value]
+        if isinstance(value, dict):
+            return {k: redact_value(v) for k, v in value.items()}
+        return value
 
     # Разбиваем чеклист на группы для удобства модели
     risks    = [i for i in checklist if i.get("status") == "risk"]
@@ -2371,9 +2461,9 @@ def build_deepseek_user_prompt(owner: OwnerRequest, checklist: list, scoring: di
     manual   = [i for i in checklist if i.get("status") == "manual_check"]
 
     def fmt_item(i):
-        out = {"источник": i.get("title"), "статус": i.get("status"),
-               "вывод": i.get("summary")}
-        details = (i.get("details") or [])[:4]
+        out = {"источник": redact_value(i.get("title")), "статус": i.get("status"),
+               "вывод": redact_value(i.get("summary"))}
+        details = redact_value((i.get("details") or [])[:3])
         if details:
             out["детали"] = details
         # Для судов передаём значимые дела отдельно
@@ -2381,14 +2471,13 @@ def build_deepseek_user_prompt(owner: OwnerRequest, checklist: list, scoring: di
         if isinstance(d, dict) and d.get("significant_cases"):
             out["значимые_дела"] = [
                 {
-                    "номер_дела": c.get("case_summary", {}).get("case_number"),
-                    "категория": c.get("case_summary", {}).get("category_text"),
-                    "регион": c.get("case_summary", {}).get("region_name"),
-                    "результат": c.get("case_summary", {}).get("result_text"),
+                    "номер_дела": redact_value(c.get("case_summary", {}).get("case_number")),
+                    "категория": redact_value(c.get("case_summary", {}).get("category_text")),
+                    "регион": redact_value(c.get("case_summary", {}).get("region_name")),
+                    "результат": redact_value(c.get("case_summary", {}).get("result_text")),
                     "оценка_совпадения": (c.get("scoring") or {}).get("score"),
                     "уровень": (c.get("scoring") or {}).get("match_label"),
-                    "причины": (c.get("scoring") or {}).get("match_reasons"),
-                    "пометка": c.get("warning"),
+                    "пометка": redact_value(c.get("warning")),
                 }
                 for c in d["significant_cases"][:5]
             ]
@@ -2397,8 +2486,10 @@ def build_deepseek_user_prompt(owner: OwnerRequest, checklist: list, scoring: di
     # Признаки сценария — передаём явно чтобы модель не гадала
     scenario_flags = []
     checklist_text = json.dumps(checklist, ensure_ascii=False).lower()
-    if "ипотек" in checklist_text or "залог" in checklist_text:
-        scenario_flags.append("на объекте возможно ипотечное обременение или залог")
+    if has_object_encumbrance_signal(checklist):
+        scenario_flags.append("по объекту в ЕГРН/Росреестре есть признаки обременения")
+    if has_fnp_pledge_signal(checklist):
+        scenario_flags.append("по продавцу найдены уведомления ФНП о залоге движимого имущества; это не обременение объекта")
     if "несовершеннолетн" in checklist_text:
         scenario_flags.append("среди собственников есть несовершеннолетний")
     if "запрет" in checklist_text or "арест" in checklist_text:
@@ -2409,7 +2500,10 @@ def build_deepseek_user_prompt(owner: OwnerRequest, checklist: list, scoring: di
         scenario_flags.append(f"продавец в возрасте {age} лет — требуется проверка дееспособности")
 
     lines = [
-        f"ПРОДАВЕЦ: {fio_str}, возраст: {age or 'не определён'}",
+        f"РЕЖИМ ПРОВЕРКИ: {mode['label']}",
+        f"ОГРАНИЧЕНИЕ ВЫВОДА: {mode['instruction']}",
+        "ПЕРСОНАЛЬНЫЕ ДАННЫЕ: скрыты; не раскрывай ФИО, паспорт, ИНН и дату рождения.",
+        f"ВОЗРАСТ ПРОДАВЦА: {age or 'не определён'}" if mode["code"] != "object" else "ПРОДАВЕЦ: не анализировался в этом режиме",
         "",
         f"ОЦЕНКА НАДЁЖНОСТИ: {scoring.get('score')}/100 — {scoring.get('label')}",
         f"ВЫВОД СИСТЕМЫ: {scoring.get('conclusion')}",
@@ -3358,18 +3452,18 @@ async def send_report_pdf_email(to_email: str, report: dict) -> dict:
 
     html = f"""
         <p>Здравствуйте.</p>
-        <p>Ваш отчёт по проверке недвижимости готов и приложен к письму в PDF.</p>
+        <p>Ваш отчёт по проверке недвижимости готов и приложен к письму в формате PDF.</p>
         <p><strong>Решение по авансу:</strong> {decision}</p>
         <p><strong>Балл риска:</strong> {score if score is not None else "не рассчитан"} из 100</p>
-        <p>Ссылка на скачивание в сервисе может быть доступна ограниченное время, поэтому PDF вложен в это письмо.</p>
+        <p>Файл отчёта приложен к этому письму.</p>
         <p>Это информационно-аналитическое заключение не заменяет юридическую проверку документов.</p>
     """
     text = (
         "Здравствуйте.\n\n"
-        "Ваш отчёт по проверке недвижимости готов и приложен к письму в PDF.\n"
+        "Ваш отчёт по проверке недвижимости готов и приложен к письму в формате PDF.\n"
         f"Решение по авансу: {decision}\n"
         f"Балл риска: {score if score is not None else 'не рассчитан'} из 100\n\n"
-        "Ссылка на скачивание в сервисе может быть доступна ограниченное время, поэтому PDF вложен в это письмо.\n"
+        "Файл отчёта приложен к этому письму.\n"
     )
     payload = {
         "from": REPORT_FROM_EMAIL,
@@ -3847,6 +3941,58 @@ def build_pdf_bytes(report):
         story.append(tbl)
         story.append(Spacer(1, 2.5*mm))
 
+    def add_checked_data_block():
+        mode = detect_check_mode(checklist)
+        participants = report.get("participants") or []
+        rows = [[
+            Paragraph("Что проверялось", styles["Z_TableHead"]),
+            Paragraph("Данные в отчёте", styles["Z_TableHead"]),
+        ]]
+        rows.append([
+            Paragraph("Режим", styles["Z_TableCell"]),
+            Paragraph(p(mode["label"]), styles["Z_TableCell"]),
+        ])
+        if mode["code"] != "object" and participants:
+            seller_lines = []
+            for idx, part in enumerate(participants, 1):
+                label = clean_str(part.get("label") or f"Продавец {idx}")
+                age_txt = f", возраст: {part.get('age')} лет" if part.get("age") else ""
+                share_txt = f", доля: {part.get('share')}" if part.get("share") else ""
+                seller_lines.append(f"{label}{age_txt}{share_txt}")
+            rows.append([
+                Paragraph("Продавец", styles["Z_TableCell"]),
+                Paragraph(p("\n".join(seller_lines)), styles["Z_TableCell"]),
+            ])
+        object_bits = []
+        for item in checklist:
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            if data.get("cadNumber") or data.get("area") or data.get("objType_text"):
+                if data.get("cadNumber"): object_bits.append(f"Кадастровый номер: {data.get('cadNumber')}")
+                if data.get("objType_text"): object_bits.append(f"Тип: {data.get('objType_text')}")
+                if data.get("area"): object_bits.append(f"Площадь: {data.get('area')} кв.м")
+                break
+            obj = data.get("object") if isinstance(data.get("object"), dict) else {}
+            if obj.get("address") or obj.get("cad_cost"):
+                if obj.get("address"): object_bits.append(f"Адрес: {clean_str(obj.get('address'))[:120]}")
+                if obj.get("cad_cost"): object_bits.append(f"Кадастровая стоимость: {rub(obj.get('cad_cost'))}")
+                break
+        if object_bits:
+            rows.append([
+                Paragraph("Объект", styles["Z_TableCell"]),
+                Paragraph(p("\n".join(object_bits)), styles["Z_TableCell"]),
+            ])
+        tbl = Table(rows, colWidths=[48*mm, 126*mm], repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0), colors.HexColor(Palette.DARK_BLUE)),
+            ("GRID",(0,0),(-1,-1), 0.3, colors.HexColor("#D9D3C8")),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+            ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.HexColor(Palette.OFF_WHITE), colors.HexColor(Palette.WHITE)]),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 4*mm))
+
     # ── ШАПКА ──
     header_left = [
         Paragraph("Комплексная проверка продавца<br/>и объекта недвижимости", styles["Z_Title"]),
@@ -3867,6 +4013,7 @@ def build_pdf_bytes(report):
     ]))
     story.append(Table([[header_left, score_badge]], colWidths=[130*mm, 46*mm]))
     story.append(Spacer(1, 5*mm))
+    add_checked_data_block()
 
     # ── ВЫВОД И ЗАДАТОК ──
     add_colored_block("Главный вывод", scoring.get("conclusion","—"), Palette.OFF_WHITE)
@@ -3901,7 +4048,7 @@ def build_pdf_bytes(report):
 
         # Детали — только если нет расширенных данных
         if not has_rich_data:
-            details = (item.get("details") or [])[:8]
+            details = (item.get("details") or [])[:4]
             if details:
                 for d in details:
                     summary_cell.append(Paragraph(p_links(f"— {d}"), styles["Z_Detail"]))
@@ -4048,7 +4195,7 @@ def build_pdf_bytes(report):
         "Настоящее заключение носит информационно-аналитический характер. "
         "Подготовлено на основании данных из открытых государственных реестров. "
         "Не заменяет юридическую проверку правоустанавливающих документов. "
-        "Рекомендуется привлечь квалифицированного риелтора-эксперта или нотариуса.",
+        "Рекомендуется привлечь квалифицированного специалиста по недвижимости или нотариуса.",
         Palette.OFF_WHITE
     )
 
