@@ -272,6 +272,51 @@ def calculate_age(dob_ru: str) -> Optional[int]:
         return None
 
 
+ROSREESTR_CODES = {
+    "001001000000": "Собственность",
+    "001002000000": "Долевая собственность",
+    "001003000000": "Совместная собственность",
+    "206001000000": "Нежилое помещение",
+    "206002000000": "Жилое помещение",
+    "205001000000": "Квартира",
+    "205002000000": "Комната",
+    "022001000000": "Сервитут",
+    "022002000000": "Арест",
+    "022003000000": "Запрещение регистрации",
+    "022006000000": "Аренда",
+    "022007000000": "Ипотека",
+    "022008000000": "Ипотека в силу закона",
+    "022012000000": "Запрет действий в кадастровом учёте",
+    "022098000000": "Иное ограничение / обременение",
+    "022099000000": "Иные ограничения / обременения прав",
+    "1": "Актуальный",
+}
+
+
+def format_registry_value(value: Any, *, kind: str = "") -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        if value.get("readableAddress"):
+            return clean_str(value.get("readableAddress"))
+        if value.get("address"):
+            return clean_str(value.get("address"))
+        parts = [
+            value.get("region"),
+            value.get("locality") or value.get("city"),
+            " ".join(str(x) for x in [value.get("streetType"), value.get("street")] if x),
+            " ".join(str(x) for x in [value.get("houseType"), value.get("house")] if x),
+            " ".join(str(x) for x in [value.get("buildingType"), value.get("building")] if x),
+            " ".join(str(x) for x in [value.get("structureType"), value.get("structure")] if x),
+            " ".join(str(x) for x in [value.get("apartmentType"), value.get("apartment")] if x),
+        ]
+        return ", ".join(clean_str(x) for x in parts if clean_str(x))
+    s = clean_str(value)
+    if kind == "code" or re.match(r"^\d{12}$", s):
+        return f"{ROSREESTR_CODES[s]} ({s})" if s in ROSREESTR_CODES else s
+    return s
+
+
 def parse_date_any(value: Any) -> Optional[datetime]:
     if not value:
         return None
@@ -1787,12 +1832,16 @@ def classify_egrn(resp: dict) -> dict:
         f"Площадь: {obj.get('area', '—')} кв.м",
     ]
     if obj.get("address") or obj.get("address_text"):
-        details.append(f"Адрес: {obj.get('address') or obj.get('address_text')}")
+        details.append(f"Адрес: {format_registry_value(obj.get('address') or obj.get('address_text'))}")
     if obj.get("cadCost") or obj.get("cad_cost") or obj.get("cadCostValue"):
         details.append(f"Кадастровая стоимость: {rub(obj.get('cadCost') or obj.get('cad_cost') or obj.get('cadCostValue'))}")
+    if obj.get("purpose") or obj.get("assignationName"):
+        details.append(f"Назначение: {format_registry_value(obj.get('purpose') or obj.get('assignationName'), kind='code')}")
+    if obj.get("status") or obj.get("state"):
+        details.append(f"Статус: {format_registry_value(obj.get('status') or obj.get('state'), kind='code')}")
 
-    has_ban = any(w in enc_text for w in ["запрещ", "арест", "ограничение регистрац"])
-    has_mortgage = any(w in enc_text for w in ["ипотек", "залог"])
+    has_ban = any(w in enc_text for w in ["запрещ", "арест", "ограничение регистрац", "022002000000", "022003000000"])
+    has_mortgage = any(w in enc_text for w in ["ипотек", "залог", "022007000000", "022008000000"])
     has_other_enc = bool(enc) and not has_ban and not has_mortgage
 
     # Анализ дат прав
@@ -1859,7 +1908,7 @@ def classify_nspd_cadastr(resp: dict) -> dict:
     if obj.get("type"):
         details.append(f"Тип: {obj['type']}")
     if obj.get("address"):
-        details.append(f"Адрес: {obj['address']}")
+        details.append(f"Адрес: {format_registry_value(obj['address'])}")
     if obj.get("area"):
         details.append(f"Площадь: {obj['area']} кв.м")
     if obj.get("year_built"):
@@ -4001,7 +4050,7 @@ def build_pdf_bytes(report):
                 break
             obj = data.get("object") if isinstance(data.get("object"), dict) else {}
             if obj.get("address") or obj.get("cad_cost"):
-                if obj.get("address"): object_bits.append(f"Адрес: {clean_str(obj.get('address'))[:120]}")
+                if obj.get("address"): object_bits.append(f"Адрес: {format_registry_value(obj.get('address'))[:120]}")
                 if obj.get("cad_cost"): object_bits.append(f"Кадастровая стоимость: {rub(obj.get('cad_cost'))}")
                 break
         if object_bits:
@@ -4144,7 +4193,7 @@ def build_pdf_bytes(report):
                         if isinstance(r, dict):
                             owner_n = clean_str(r.get("rightHolder") or r.get("owner") or "")
                             reg_d = clean_str(r.get("registrationDate") or r.get("regDate") or "")
-                            right_t = clean_str(r.get("rightType") or r.get("type") or "")
+                            right_t = format_registry_value(r.get("rightType") or r.get("type") or "", kind="code")
                             share = clean_str(r.get("shareText") or r.get("share") or "")
                             reg_num = clean_str(r.get("registrationNumber") or r.get("regNumber") or r.get("number") or "")
                             row = [f"Право {idx}"]
@@ -4159,7 +4208,7 @@ def build_pdf_bytes(report):
                     egrn_parts.append(f"Обременений: {len(enc)}")
                     for idx, e in enumerate(enc[:8], 1):
                         if isinstance(e, dict):
-                            enc_t = clean_str(e.get("type") or e.get("encumbranceType") or "")
+                            enc_t = format_registry_value(e.get("type") or e.get("encumbranceType") or "", kind="code")
                             enc_h = clean_str(e.get("holder") or e.get("encumbranceHolder") or "")
                             enc_d = clean_str(e.get("startDate") or e.get("date") or e.get("registrationDate") or "")
                             enc_n = clean_str(e.get("number") or e.get("registrationNumber") or "")
@@ -4176,7 +4225,7 @@ def build_pdf_bytes(report):
                 gc = data["geo_center"]
                 obj = data.get("object") or {}
                 geo_parts = []
-                if obj.get("address"): geo_parts.append(f"Адрес: {obj['address'][:100]}")
+                if obj.get("address"): geo_parts.append(f"Адрес: {format_registry_value(obj.get('address'))[:100]}")
                 if obj.get("cad_cost"): geo_parts.append(f"Кад. стоимость: {rub(obj['cad_cost'])}")
                 if obj.get("year_built"): geo_parts.append(f"Год постройки: {obj['year_built']}")
                 if gc.get("lat") and gc.get("lon"):
