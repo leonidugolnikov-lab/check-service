@@ -2142,19 +2142,21 @@ def build_recommendations_v5(checklist: List[dict], age: Optional[int] = None) -
     return recs
 
 
-def build_hidden_risks() -> List[dict]:
-    return [
+def build_hidden_risks(participants: Optional[List[dict]] = None) -> List[dict]:
+    risks = [
         {"category": "обязательно", "risk": "Супруг / согласие",
          "why": "Проверить режим собственности.", "law": "ст. 34, 35 СК РФ"},
         {"category": "обязательно", "risk": "Зарегистрированные лица",
          "why": "Кто прописан и выселение.", "law": "ЖК РФ"},
         {"category": "обязательно", "risk": "Правоустанавливающие документы",
          "why": "Основание приобретения.", "law": "ФЗ №218-ФЗ"},
-        {"category": "критично", "risk": "Несовершеннолетние / опека",
-         "why": "Разрешение органов опеки.", "law": "ст. 37 ГК РФ"},
         {"category": "критично", "risk": "Доверенность",
          "why": "Проверить срок и полномочия.", "law": "ст. 185-189 ГК РФ"},
     ]
+    if any((p or {}).get("is_minor") for p in (participants or [])):
+        risks.append({"category": "критично", "risk": "Несовершеннолетние / опека",
+                      "why": "Разрешение органов опеки.", "law": "ст. 37 ГК РФ"})
+    return risks
 
 
 def build_advance_decision(scoring: dict) -> dict:
@@ -2243,6 +2245,11 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 о залоге движимого имущества по физическому лицу, например автомобиля или оборудования. \
 Это НЕ ипотека, НЕ залог квартиры и НЕ обременение объекта недвижимости. Обременение объекта \
 можно описывать только если оно прямо найдено в ЕГРН, Росреестре или данных объекта.
+• Запрещено упоминать несовершеннолетних собственников, органы опеки или разрешение опеки \
+как выявленную угрозу, если в пользовательском сообщении нет строки \
+«НЕСОВЕРШЕННОЛЕТНИЕ: выявлены» или отдельного источника «Несовершеннолетний собственник». \
+Общие ручные рекомендации про форму 9, зарегистрированных лиц или долевую собственность \
+не являются признаком несовершеннолетнего собственника.
 • По судебным делам не пересказывай технические причины совпадения. Объясняй коротко: \
 роль в деле, степень совпадения, регион и почему нужна ручная сверка.
 • Пиши компактно: только существенные выводы, без повторов и длинных общих рассуждений.
@@ -2380,9 +2387,10 @@ DEEPSEEK_SYSTEM_PROMPT = """\
 Федеральный закон от 13.07.2015 № 218-ФЗ «О государственной регистрации недвижимости»). \
 Расчёт производится только после регистрации перехода права на покупателя.
 
-ДОПОЛНИТЕЛЬНЫЕ БЛОКИ — добавляй к любому сценарию если данные это подтверждают:
+ДОПОЛНИТЕЛЬНЫЕ БЛОКИ — добавляй к любому сценарию только если данные это прямо подтверждают:
 
-Если есть несовершеннолетние собственники:
+Если есть явный маркер «НЕСОВЕРШЕННОЛЕТНИЕ: выявлены» или источник \
+«Несовершеннолетний собственник»:
 Разрешение органов опеки и попечительства — обязательно до подписания любых договоров, \
 включая соглашение о задатке (или авансе). Без разрешения сделка ничтожна \
 (статья 37 Гражданского кодекса Российской Федерации, статья 21 Федерального закона \
@@ -2545,10 +2553,25 @@ def build_deepseek_user_prompt(owner: OwnerRequest, checklist: list, scoring: di
     oks      = [i for i in checklist if i.get("status") == "ok"]
     manual   = [i for i in checklist if i.get("status") == "manual_check"]
 
+    def is_minor_owner_item(item: dict) -> bool:
+        title = str(item.get("title", "")).lower()
+        data = item.get("data")
+        return (
+            "несовершеннолетний собственник" in title
+            or (isinstance(data, dict) and data.get("is_minor_owner") is True)
+        )
+
+    has_minor_owner = has_explicit_minor_owner(checklist)
+
     def fmt_item(i):
         out = {"источник": redact_value(i.get("title")), "статус": i.get("status"),
                "вывод": redact_value(i.get("summary"))}
         details = redact_value((i.get("details") or [])[:3])
+        if details and not is_minor_owner_item(i):
+            details = [
+                d for d in details
+                if not re.search(r"несовершеннолет|орган[а-я\s]+опек|опек[аи]", str(d), re.IGNORECASE)
+            ]
         if details:
             out["детали"] = details
         # Для судов передаём значимые дела отдельно
@@ -2575,7 +2598,7 @@ def build_deepseek_user_prompt(owner: OwnerRequest, checklist: list, scoring: di
         scenario_flags.append("по объекту в ЕГРН/Росреестре есть признаки обременения")
     if has_fnp_pledge_signal(checklist):
         scenario_flags.append("по продавцу найдены уведомления ФНП о залоге движимого имущества; это не обременение объекта")
-    if "несовершеннолетн" in checklist_text:
+    if has_minor_owner:
         scenario_flags.append("среди собственников есть несовершеннолетний")
     if "запрет" in checklist_text or "арест" in checklist_text:
         scenario_flags.append("выявлен запрет или арест регистрационных действий")
@@ -2589,6 +2612,7 @@ def build_deepseek_user_prompt(owner: OwnerRequest, checklist: list, scoring: di
         f"ОГРАНИЧЕНИЕ ВЫВОДА: {mode['instruction']}",
         "ПЕРСОНАЛЬНЫЕ ДАННЫЕ: скрыты; не раскрывай ФИО, паспорт, ИНН и дату рождения.",
         f"ВОЗРАСТ ПРОДАВЦА: {age or 'не определён'}" if mode["code"] != "object" else "ПРОДАВЕЦ: не анализировался в этом режиме",
+        "НЕСОВЕРШЕННОЛЕТНИЕ: выявлены" if has_minor_owner else "НЕСОВЕРШЕННОЛЕТНИЕ: не выявлены; не упоминай опеку как риск",
         "",
         f"ОЦЕНКА НАДЁЖНОСТИ: {scoring.get('score')}/100 — {scoring.get('label')}",
         f"ВЫВОД СИСТЕМЫ: {scoring.get('conclusion')}",
@@ -2653,6 +2677,17 @@ PHANTOM_SOURCE_PATTERNS = [
 ]
 
 
+def has_explicit_minor_owner(checklist: list) -> bool:
+    for item in checklist or []:
+        title = str((item or {}).get("title", "")).lower()
+        data = (item or {}).get("data")
+        if "несовершеннолетний собственник" in title:
+            return True
+        if isinstance(data, dict) and data.get("is_minor_owner") is True:
+            return True
+    return False
+
+
 def sanitize_phantom_sources(text: str, checklist: list) -> str:
     """Удаляет из текста отчёта строки упоминающие «проверки» которые мы не делали.
     Это защита от галлюцинаций DeepSeek в разделе «Что подтверждено».
@@ -2666,6 +2701,17 @@ def sanitize_phantom_sources(text: str, checklist: list) -> str:
         if n:
             removed_count += n
         cleaned = new_cleaned
+    if not has_explicit_minor_owner(checklist):
+        minor_patterns = [
+            r"(?im)^.*несовершеннолетн.*$",
+            r"(?im)^.*орган[а-я\s]+опек.*$",
+            r"(?im)^.*разрешени[ея]\s+опек.*$",
+        ]
+        for pattern in minor_patterns:
+            new_cleaned, n = re.subn(pattern, "", cleaned)
+            if n:
+                removed_count += n
+            cleaned = new_cleaned
     if removed_count:
         logger.warning(f"[sanitize] Удалено {removed_count} строк с фантомными источниками из отчёта")
     # Чистим пустые строки и двойные переносы появившиеся после удаления
@@ -3727,7 +3773,7 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
 
         if is_minor:
             minor_item = {
-                "title": f"{label} — Несовершеннолетний",
+                "title": f"{label} — Несовершеннолетний собственник",
                 "source": label,
                 "status": "manual_check",
                 "ui_status": "manual_check",
@@ -3737,6 +3783,7 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
                     "Без этого разрешения сделка может быть оспорена.",
                     "Рекомендуется нотариальное удостоверение.",
                 ],
+                "data": {"is_minor_owner": True},
                 "manual_check_url": "",
             }
             all_checklists.append([minor_item])
@@ -3882,7 +3929,7 @@ async def build_full_report_v5(req: CheckRequest, include_debug: bool = False) -
         "risk_scoring": combined_scoring,
         "recommendations": combined_recs,
         "advance_decision": build_advance_decision(combined_scoring),
-        "hidden_risks": build_hidden_risks(),
+        "hidden_risks": build_hidden_risks(participants_out),
         "legal_report": combined_legal,
         "participants": participants_out,
         "notes": [f"v{APP_VERSION} — complex_by_passport + pravo_search с scoring + rosreestr + nspd_cadastr"],
