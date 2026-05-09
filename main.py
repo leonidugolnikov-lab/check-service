@@ -4380,6 +4380,11 @@ def build_pdf_bytes(report):
 
     doc.build(story)
     return buf.getvalue()
+  # Красивый PDF через WeasyPrint
+try:
+    from pdf_beautiful import build_pdf_bytes as build_pdf_bytes
+except ImportError:
+    pass
 
 
 # -------------------- Endpoints --------------------
