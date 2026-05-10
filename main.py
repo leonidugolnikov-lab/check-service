@@ -386,6 +386,287 @@ def normalize_property(req: CheckRequest) -> Dict[str, str]:
     }
 
 
+def is_empty_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def compact_data(value: Any) -> Any:
+    """Возвращает копию без пустых значений, но не теряет неизвестные поля NewDB."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            cv = compact_data(v)
+            if not is_empty_value(cv):
+                out[k] = cv
+        return out
+    if isinstance(value, list):
+        return [compact_data(v) for v in value if not is_empty_value(compact_data(v))]
+    return value
+
+
+def first_non_empty(obj: dict, keys: List[str]) -> Any:
+    for key in keys:
+        if isinstance(obj, dict) and not is_empty_value(obj.get(key)):
+            return obj.get(key)
+    return None
+
+
+def as_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        s = str(value).replace(" ", "").replace(",", ".")
+        return float(s)
+    except Exception:
+        return None
+
+
+def extract_rosreestr_object(resp: dict) -> dict:
+    data, _ = result_data(resp, "rosreestr")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    return {}
+
+
+def extract_nspd_item(resp: dict) -> dict:
+    data, _ = result_data(resp, "nspd_cadastr")
+    if not isinstance(data, list) or not data:
+        return {}
+    first = data[0] if isinstance(data[0], dict) else {}
+    items = first.get("items") if isinstance(first.get("items"), list) else []
+    if not items or not isinstance(items[0], dict):
+        return {"count": first.get("count") or len(items)}
+    item = dict(items[0])
+    item["count"] = first.get("count") or len(items)
+    return item
+
+
+def normalize_geometry_points(geometry: dict) -> List[dict]:
+    if not isinstance(geometry, dict):
+        return []
+    coords = geometry.get("coordinates")
+    if not coords:
+        return []
+    if geometry.get("type") == "Polygon" and isinstance(coords, list) and coords:
+        raw_points = coords[0]
+    elif geometry.get("type") == "Point" and isinstance(coords, list) and len(coords) >= 2:
+        raw_points = [coords]
+    else:
+        raw_points = []
+    points = []
+    for pnt in raw_points:
+        if isinstance(pnt, list) and len(pnt) >= 2:
+            lon = as_float(pnt[0])
+            lat = as_float(pnt[1])
+            if lon is not None and lat is not None:
+                points.append({"lon": lon, "lat": lat})
+    if len(points) > 1 and points[0] == points[-1]:
+        points = points[:-1]
+    return points
+
+
+def geometry_center(geometry: dict, geo: dict = None) -> Optional[dict]:
+    geo = geo or {}
+    center = geo.get("center") if isinstance(geo.get("center"), dict) else None
+    if center:
+        lat = as_float(center.get("lat") or center.get("y"))
+        lon = as_float(center.get("lon") or center.get("lng") or center.get("x"))
+        if lat is not None and lon is not None:
+            return {"lat": lat, "lon": lon}
+    points = normalize_geometry_points(geometry)
+    if not points:
+        return None
+    return {
+        "lat": sum(p["lat"] for p in points) / len(points),
+        "lon": sum(p["lon"] for p in points) / len(points),
+    }
+
+
+def normalize_rosreestr_object(raw_object: dict) -> dict:
+    raw = raw_object if isinstance(raw_object, dict) else {}
+    address = first_non_empty(raw, ["address", "address_text", "readableAddress"])
+    rights = raw.get("rights") if isinstance(raw.get("rights"), list) else []
+    encumbrances = raw.get("encumbrances") if isinstance(raw.get("encumbrances"), list) else []
+    old_numbers = first_non_empty(raw, ["oldNumbers", "old_numbers", "cadOldNumbers", "prevCadNumbers"]) or []
+    main_chars = first_non_empty(raw, ["mainCharacters", "mainCharacteristics", "characteristics"]) or []
+
+    obj_type = clean_str(first_non_empty(raw, ["objType_text", "objType", "type"]))
+    purpose = clean_str(first_non_empty(raw, ["purpose_text", "purpose", "assignationName", "assignation"]))
+    status = format_registry_value(first_non_empty(raw, ["status", "state"]), kind="code")
+    cad_number = clean_str(first_non_empty(raw, ["cadNumber", "cad_num", "cadastralNumber"]))
+    area = first_non_empty(raw, ["area", "square", "objectArea"])
+    cad_cost = first_non_empty(raw, ["cadCost", "cad_cost", "cadCostValue"])
+
+    user_fields = [
+        {"label": "Кадастровый номер", "value": cad_number},
+        {"label": "Кадастровый квартал", "value": first_non_empty(raw, ["cadQuarter", "quarter", "kvartal"])},
+        {"label": "Статус объекта", "value": status},
+        {"label": "Тип объекта", "value": obj_type},
+        {"label": "Назначение", "value": format_registry_value(purpose, kind="code")},
+        {"label": "Адрес", "value": format_registry_value(address)},
+        {"label": "Регион", "value": raw.get("region") or ((address or {}).get("region") if isinstance(address, dict) else None)},
+        {"label": "Улица", "value": (address or {}).get("street") if isinstance(address, dict) else None},
+        {"label": "Дом", "value": (address or {}).get("house") if isinstance(address, dict) else None},
+        {"label": "Корпус / литера / строение", "value": " ".join(clean_str(x) for x in [
+            (address or {}).get("building") if isinstance(address, dict) else None,
+            (address or {}).get("structure") if isinstance(address, dict) else None,
+            (address or {}).get("liter") if isinstance(address, dict) else None,
+        ] if clean_str(x))},
+        {"label": "Квартира / помещение", "value": (address or {}).get("apartment") if isinstance(address, dict) else None},
+        {"label": "Площадь", "value": f"{area} кв.м" if not is_empty_value(area) else None},
+        {"label": "Этаж", "value": first_non_empty(raw, ["levelFloor", "floor", "storey"])},
+        {"label": "Подземный этаж", "value": first_non_empty(raw, ["undergroundFloor", "undergroundLevel"])},
+        {"label": "Дата постановки на кадастровый учет", "value": first_non_empty(raw, ["registrationDate", "cadRegistrationDate", "dateRegistration", "regDate"])},
+        {"label": "Дата снятия с учета", "value": first_non_empty(raw, ["cancelDate", "dateRemoved"])},
+        {"label": "Кадастровая стоимость", "value": rub(cad_cost) if not is_empty_value(cad_cost) else None},
+        {"label": "Дата определения кадастровой стоимости", "value": first_non_empty(raw, ["cadCostDeterminationDate", "costDeterminationDate"])},
+        {"label": "Дата регистрации кадастровой стоимости", "value": first_non_empty(raw, ["cadCostRegistrationDate", "costRegistrationDate"])},
+        {"label": "Дата обновления сведений", "value": first_non_empty(raw, ["dateUpdated", "dateupdated", "updatedAt", "updateDate"])},
+        {"label": "Категория земель", "value": first_non_empty(raw, ["landCategory", "category"])},
+        {"label": "Разрешенное использование", "value": first_non_empty(raw, ["permittedUse", "permitted_use"])},
+        {"label": "Разрешенное использование по документу", "value": first_non_empty(raw, ["permittedUseByDoc", "permitted_use_by_doc"])},
+        {"label": "Родительский кадастровый номер", "value": first_non_empty(raw, ["parentCadNumber", "parent_cad_number"])},
+        {"label": "Дочерние кадастровые номера", "value": first_non_empty(raw, ["childCadNumbers", "childrenCadNumbers"])},
+        {"label": "Кадастровый инженер", "value": first_non_empty(raw, ["cadEngineer", "engineer"])},
+    ]
+    user_fields = [f for f in user_fields if not is_empty_value(f.get("value"))]
+
+    warnings = []
+    cancel_date = first_non_empty(raw, ["cancelDate", "dateRemoved"])
+    if cancel_date:
+        warnings.append("Объект снят с кадастрового учета. Это критический риск для сделки.")
+    enc_text = flatten_text(encumbrances).lower()
+    if isinstance(encumbrances, list) and len(encumbrances) == 0:
+        warnings.append("В полученных данных обременения не отображаются. Для сделки нужна актуальная выписка ЕГРН.")
+    if len(rights) > 1 or "001002000000" in flatten_text(rights):
+        warnings.append("Найдено несколько прав или признаки долевой собственности. Нужно проверить всех правообладателей.")
+
+    right_dates = []
+    for r in rights:
+        if isinstance(r, dict):
+            dt = parse_date_any(first_non_empty(r, ["registrationDate", "dateRegistration", "regDate", "startDate"]))
+            if dt:
+                right_dates.append(dt)
+    if right_dates:
+        latest = max(right_dates)
+        months = months_between_dates(latest)
+        if months is not None and months < 12:
+            warnings.append("Право собственности зарегистрировано недавно. Рекомендуется проверить основание перехода права и выписку о переходе прав.")
+
+    updated = parse_date_any(first_non_empty(raw, ["dateUpdated", "dateupdated", "updatedAt", "updateDate"]))
+    if updated and months_between_dates(updated) is not None and months_between_dates(updated) > 6:
+        warnings.append("Дата обновления сведений старая. Для сделки нужна свежая выписка ЕГРН.")
+
+    land_text = " ".join([
+        obj_type, purpose, clean_str(raw.get("landCategory")),
+        clean_str(raw.get("permittedUse")), clean_str(raw.get("permittedUseByDoc")),
+    ]).lower()
+    is_land = any(x in land_text for x in ["земельный участок", "участок", "земли", "земель"])
+    apt_text = " ".join([obj_type, purpose, format_registry_value(address)]).lower()
+    is_premises = (
+        "помещение" in apt_text or "квартир" in apt_text
+        or bool(first_non_empty(raw, ["levelFloor", "floor", "storey"]))
+        or (isinstance(address, dict) and bool(address.get("apartment")))
+    )
+    if is_land and not first_non_empty(raw, ["landCategory", "permittedUse", "permittedUseByDoc"]):
+        warnings.append("Категория земель и ВРИ не получены в текущем ответе. Для полной проверки участка требуется дополнительная выписка или источник.")
+
+    return {
+        "kind": "land_plot" if is_land else ("premises" if is_premises else "building_or_other"),
+        "is_land_plot": is_land,
+        "is_apartment_or_premises": is_premises,
+        "cadNumber": cad_number,
+        "summary": {
+            "object_type": obj_type,
+            "address": format_registry_value(address),
+            "area": area,
+            "status": status,
+            "cad_cost": rub(cad_cost) if not is_empty_value(cad_cost) else None,
+            "rights_count": len(rights),
+            "encumbrances_count": len(encumbrances),
+        },
+        "userFields": user_fields,
+        "rights": compact_data(rights),
+        "encumbrances": compact_data(encumbrances),
+        "oldNumbers": compact_data(old_numbers),
+        "mainCharacters": compact_data(main_chars),
+        "warnings": warnings,
+        "technicalData": compact_data(raw),
+    }
+
+
+def isLandPlot(rosreestrObject: dict) -> bool:
+    return bool(normalize_rosreestr_object(rosreestrObject).get("is_land_plot"))
+
+
+def isApartmentOrPremises(rosreestrObject: dict) -> bool:
+    return bool(normalize_rosreestr_object(rosreestrObject).get("is_apartment_or_premises"))
+
+
+def shouldFetchNspd(rosreestrObject: dict, force: bool = False) -> bool:
+    if force:
+        return True
+    norm = normalize_rosreestr_object(rosreestrObject)
+    if norm.get("is_apartment_or_premises") and not norm.get("is_land_plot"):
+        return False
+    if norm.get("is_land_plot"):
+        return True
+    text = flatten_text(rosreestrObject).lower()
+    return any(x in text for x in ["здание", "сооружение", "объект незавершенного", "дом"])
+
+
+def normalize_nspd_object(raw_nspd: dict) -> dict:
+    item = raw_nspd if isinstance(raw_nspd, dict) else {}
+    obj = item.get("object") if isinstance(item.get("object"), dict) else {}
+    geo = item.get("geo") if isinstance(item.get("geo"), dict) else {}
+    geometry = geo.get("geometry") if isinstance(geo.get("geometry"), dict) else {}
+    points = normalize_geometry_points(geometry)
+    center = geometry_center(geometry, geo)
+    geom_type = geometry.get("type") if isinstance(geometry, dict) else None
+
+    user_fields = [
+        {"label": "ID объекта", "value": first_non_empty(obj, ["id", "objectId", "cn"])},
+        {"label": "Кадастровый номер", "value": first_non_empty(obj, ["cad_num", "cadNumber", "cn"])},
+        {"label": "Категория / слой", "value": first_non_empty(obj, ["category", "categoryName", "type", "objectType"])},
+        {"label": "Адрес", "value": format_registry_value(first_non_empty(obj, ["address", "readableAddress"]))},
+        {"label": "Статус", "value": first_non_empty(obj, ["status", "state"])},
+        {"label": "Форма собственности", "value": first_non_empty(obj, ["ownership", "ownership_type", "property_type"])},
+        {"label": "Кадастровая стоимость", "value": rub(first_non_empty(obj, ["cad_cost", "cadCost", "cadCostValue"])) if not is_empty_value(first_non_empty(obj, ["cad_cost", "cadCost", "cadCostValue"])) else None},
+        {"label": "Назначение", "value": first_non_empty(obj, ["purpose", "purpose_text", "assignation"])},
+        {"label": "Тип геометрии", "value": geom_type},
+        {"label": "Центр объекта", "value": f"{center['lat']:.8f}, {center['lon']:.8f}" if center else None},
+        {"label": "Количество найденных объектов", "value": item.get("count")},
+    ]
+    user_fields = [f for f in user_fields if not is_empty_value(f.get("value"))]
+
+    warnings = []
+    if not geometry:
+        warnings.append("Границы участка не получены из кадастровых данных.")
+    elif geom_type == "Point":
+        warnings.append("Кадастровые данные вернули только точку объекта. Полигон границ не передан.")
+    elif geom_type == "Polygon" and not points:
+        warnings.append("Кадастровые данные получены, но координаты границ участка не разобраны.")
+
+    return {
+        "object": compact_data(obj),
+        "geo": compact_data(geo),
+        "geometry": compact_data(geometry),
+        "geometryType": geom_type,
+        "center": center,
+        "points": points,
+        "count": item.get("count"),
+        "userFields": user_fields,
+        "warnings": warnings,
+        "technicalData": compact_data(item),
+    }
+
+
 def rub(value: Any) -> str:
     try:
         n = float(value or 0)
@@ -578,6 +859,20 @@ def result_data(resp: dict, method: str):
         return None, None
     except Exception:
         return None, None
+
+
+def newdb_request_meta(resp: dict, method: str) -> dict:
+    if not isinstance(resp, dict):
+        return {}
+    block = (resp.get("results") or {}).get(method) or {}
+    return compact_data({
+        "request_id": resp.get("requestId") or block.get("requestId"),
+        "task_id": resp.get("taskId") or block.get("taskId"),
+        "method": method,
+        "state": resp.get("state") or block.get("state"),
+        "datecreated": resp.get("datecreated") or block.get("datecreated"),
+        "dateupdated": resp.get("dateupdated") or block.get("dateupdated"),
+    })
 
 
 def extract_submethod_data(complex_resp: dict, submethod: str):
@@ -896,6 +1191,36 @@ def build_nspd_cadastr_payload(req: CheckRequest) -> Optional[dict]:
         "country": "ru",
         "cad_num": prop["cadastral_number"],
     }
+
+
+def build_nspd_cadastr_payload_by_cad(cad_number: str) -> Optional[dict]:
+    cad_number = clean_str(cad_number)
+    if not cad_number:
+        return None
+    return {
+        "method": "nspd_cadastr",
+        "country": "ru",
+        "cad_num": cad_number,
+    }
+
+
+async def waitForNewDbResult(client: httpx.AsyncClient, requestPayload: dict, method: str) -> dict:
+    """Единая точка запуска NewDB: newdb_run сам создаёт requestId и poll-ит его до complete."""
+    return await newdb_run(client, requestPayload, method)
+
+
+async def getRosreestrData(client: httpx.AsyncClient, req: CheckRequest) -> dict:
+    payload = build_rosreestr_payload(req)
+    if not payload:
+        return {"state": "skipped", "reason": "Не передан адрес или кадастровый номер объекта"}
+    return await waitForNewDbResult(client, payload, "rosreestr")
+
+
+async def getNspdCadastrData(client: httpx.AsyncClient, cadNumber: str, force: bool = False) -> dict:
+    payload = build_nspd_cadastr_payload_by_cad(cadNumber)
+    if not payload:
+        return {"state": "skipped", "reason": "Нет кадастрового номера для НСПД"}
+    return await waitForNewDbResult(client, payload, "nspd_cadastr")
 
 
 # -------------------- Фильтрация и скоринг судебных дел --------------------
@@ -1831,22 +2156,11 @@ def classify_egrn(resp: dict) -> dict:
         return manual_item(title, "Объект не найден в Росреестре.", url)
 
     obj = data[0] if isinstance(data[0], dict) else {}
+    normalized = normalize_rosreestr_object(obj)
     enc = obj.get("encumbrances") if isinstance(obj.get("encumbrances"), list) else []
     enc_text = flatten_text(enc).lower()
 
-    details = [
-        f"Кадастровый номер: {obj.get('cadNumber', '—')}",
-        f"Тип: {obj.get('objType_text', '—')}",
-        f"Площадь: {obj.get('area', '—')} кв.м",
-    ]
-    if obj.get("address") or obj.get("address_text"):
-        details.append(f"Адрес: {format_registry_value(obj.get('address') or obj.get('address_text'))}")
-    if obj.get("cadCost") or obj.get("cad_cost") or obj.get("cadCostValue"):
-        details.append(f"Кадастровая стоимость: {rub(obj.get('cadCost') or obj.get('cad_cost') or obj.get('cadCostValue'))}")
-    if obj.get("purpose") or obj.get("assignationName"):
-        details.append(f"Назначение: {format_registry_value(obj.get('purpose') or obj.get('assignationName'), kind='code')}")
-    if obj.get("status") or obj.get("state"):
-        details.append(f"Статус: {format_registry_value(obj.get('status') or obj.get('state'), kind='code')}")
+    details = [f"{f['label']}: {f['value']}" for f in normalized.get("userFields", [])[:14]]
 
     has_ban = any(w in enc_text for w in ["запрещ", "арест", "ограничение регистрац", "022002000000", "022003000000"])
     has_mortgage = any(w in enc_text for w in ["ипотек", "залог", "022007000000", "022008000000"])
@@ -1877,17 +2191,17 @@ def classify_egrn(resp: dict) -> dict:
 
     if has_ban:
         details.append("Запрет/арест регистрации.")
-        return risk_item(title, "Объект найден. Есть ограничение регистрации.", url, details, obj)
+        return risk_item(title, "Объект найден. Есть ограничение регистрации.", url, details, {**obj, "_normalized": normalized, "_request_meta": newdb_request_meta(resp, "rosreestr")})
     if has_mortgage:
         details.append("Ипотека/залог.")
-        return risk_item(title, "Объект найден. Есть обременение (ипотека/залог).", url, details, obj)
+        return risk_item(title, "Объект найден. Есть обременение (ипотека/залог).", url, details, {**obj, "_normalized": normalized, "_request_meta": newdb_request_meta(resp, "rosreestr")})
     if has_other_enc:
         details.append("Иное обременение.")
-        return risk_item(title, "Объект найден. Есть обременение.", url, details, obj)
+        return risk_item(title, "Объект найден. Есть обременение.", url, details, {**obj, "_normalized": normalized, "_request_meta": newdb_request_meta(resp, "rosreestr")})
     if recent_months is not None and recent_months < 12:
-        return risk_item(title, "Объект найден. Право зарегистрировано недавно.", url, details, obj)
+        return risk_item(title, "Объект найден. Право зарегистрировано недавно.", url, details, {**obj, "_normalized": normalized, "_request_meta": newdb_request_meta(resp, "rosreestr")})
 
-    return ok_item(title, "Объект найден. Ограничений не выявлено.", url, details, obj)
+    return ok_item(title, "Объект найден. Ограничений не выявлено.", url, details, {**obj, "_normalized": normalized, "_request_meta": newdb_request_meta(resp, "rosreestr")})
 
 
 def classify_nspd_cadastr(resp: dict) -> dict:
@@ -1895,7 +2209,13 @@ def classify_nspd_cadastr(resp: dict) -> dict:
     url = "https://pkk.rosreestr.ru"
 
     if not resp or str(resp.get("state") or "").lower() == "skipped":
-        return skipped_item(title, url)
+        reason = clean_str((resp or {}).get("reason")) if isinstance(resp, dict) else ""
+        item = skipped_item(title, url)
+        if reason:
+            item["summary"] = reason
+            item["details"] = [reason]
+            item["data"] = {"_nspd_skipped_reason": reason}
+        return item
     if is_newdb_error(resp) or has_result_status_500(resp):
         return error_item(title, url, resp)
 
@@ -1909,30 +2229,29 @@ def classify_nspd_cadastr(resp: dict) -> dict:
     if not items_list:
         return manual_item(title, "Объект по кадастровому номеру не найден.", url)
 
-    obj = items_list[0].get("object") or {} if isinstance(items_list[0], dict) else {}
-    geo = items_list[0].get("geo") or {} if isinstance(items_list[0], dict) else {}
+    raw_item = extract_nspd_item(resp)
+    obj = raw_item.get("object") or {} if isinstance(raw_item, dict) else {}
+    geo = raw_item.get("geo") or {} if isinstance(raw_item, dict) else {}
+    normalized = normalize_nspd_object(raw_item)
 
-    details = []
-    if obj.get("type"):
-        details.append(f"Тип: {obj['type']}")
-    if obj.get("address"):
-        details.append(f"Адрес: {format_registry_value(obj['address'])}")
-    if obj.get("area"):
-        details.append(f"Площадь: {obj['area']} кв.м")
-    if obj.get("year_built"):
-        details.append(f"Год постройки: {obj['year_built']}")
-    if obj.get("cad_cost"):
-        details.append(f"Кадастровая стоимость: {rub(obj['cad_cost'])}")
-    if obj.get("status"):
-        details.append(f"Статус: {obj['status']}")
-    if geo.get("center"):
-        c = geo["center"]
-        details.append(f"Координаты: {c.get('lat')}, {c.get('lon')}")
+    details = [f"{f['label']}: {f['value']}" for f in normalized.get("userFields", [])[:12]]
+    details.extend(normalized.get("warnings") or [])
 
-    return ok_item(title, "Геоданные объекта получены.", url, details, {
+    geom_type = normalized.get("geometryType")
+    if geom_type == "Polygon":
+        summary = "Получены кадастровые границы участка."
+    elif geom_type == "Point":
+        summary = "Получена точка объекта, полигон границ не передан."
+    else:
+        summary = "Кадастровые данные получены, но границы участка не переданы."
+
+    return ok_item(title, summary, url, details, {
         "object": obj,
-        "geo_center": geo.get("center"),
-        "geo_points": geo.get("points"),
+        "geo_center": normalized.get("center") or geo.get("center"),
+        "geo_points": normalized.get("points") or geo.get("points"),
+        "geometry": normalized.get("geometry"),
+        "_normalized": normalized,
+        "_request_meta": newdb_request_meta(resp, "nspd_cadastr"),
     })
 
 
@@ -2964,18 +3283,36 @@ async def run_person_checks(client: httpx.AsyncClient, owner: OwnerRequest) -> D
 
 
 async def run_property_checks(client: httpx.AsyncClient, req: CheckRequest) -> Dict[str, Any]:
-    """Параллельно запускает rosreestr и nspd_cadastr для объекта."""
-    egrn_payload = build_rosreestr_payload(req)
-    nspd_payload = build_nspd_cadastr_payload(req)
-    logger.info("Запуск: rosreestr + nspd_cadastr")
-    tasks = [
-        newdb_run(client, egrn_payload, "rosreestr") if egrn_payload else _skipped(),
-        newdb_run(client, nspd_payload, "nspd_cadastr") if nspd_payload else _skipped(),
-    ]
-    raw = await asyncio.gather(*tasks, return_exceptions=True)
+    """Сначала rosreestr, затем НСПД только когда геометрия реально полезна.
+    Для квартир/помещений НСПД по умолчанию не запускаем, чтобы экономить баланс NewDB.
+    """
+    logger.info("Запуск объекта: rosreestr")
+    egrn_resp = await getRosreestrData(client, req)
+    ros_obj = extract_rosreestr_object(egrn_resp)
+    ros_norm = normalize_rosreestr_object(ros_obj)
+    cad_number = ros_norm.get("cadNumber") or normalize_property(req).get("cadastral_number")
+
+    nspd_reason = "skipped"
+    nspd_resp: dict
+    if shouldFetchNspd(ros_obj) and cad_number:
+        logger.info(f"Запуск объекта: nspd_cadastr для {cad_number}")
+        nspd_resp = await getNspdCadastrData(client, cad_number)
+        nspd_reason = "fetched_by_object_type"
+    elif ros_norm.get("is_apartment_or_premises"):
+        nspd_resp = {
+            "state": "skipped",
+            "reason": "Для квартиры/помещения кадастровая схема участка не запрашивалась: НСПД обычно не даёт дополнительных юридически значимых данных.",
+        }
+        nspd_reason = "skipped_premises"
+    else:
+        nspd_resp = {"state": "skipped", "reason": "Объект не определён как земельный участок/здание для кадастровой схемы."}
+        nspd_reason = "skipped_not_useful"
+
     return {
-        "egrn": raw[0] if not isinstance(raw[0], Exception) else {"state": "failed"},
-        "nspd": raw[1] if not isinstance(raw[1], Exception) else {"state": "failed"},
+        "egrn": egrn_resp if not isinstance(egrn_resp, Exception) else {"state": "failed"},
+        "nspd": nspd_resp if not isinstance(nspd_resp, Exception) else {"state": "failed"},
+        "object_type": ros_norm.get("kind"),
+        "nspd_reason": nspd_reason,
     }
 
 
@@ -4055,6 +4392,70 @@ def p_links(text):
     return url_pattern.sub(replace_url, safe)
 
 
+class ParcelSketchFlowable(Flowable if REPORTLAB_AVAILABLE else object):
+    """Лёгкая схема участка без внешних карт: нормализуем lon/lat в PDF-viewport."""
+    def __init__(self, points: List[dict], center: Optional[dict] = None, width: Optional[float] = None, height: Optional[float] = None):
+        if REPORTLAB_AVAILABLE:
+            super().__init__()
+        self.points = points or []
+        self.center = center or {}
+        self.width = width if width is not None else 160*mm
+        self.height = height if height is not None else 70*mm
+
+    def wrap(self, availWidth, availHeight):
+        return min(self.width, availWidth), self.height
+
+    def draw(self):
+        pts = [
+            (as_float(p.get("lon")), as_float(p.get("lat")))
+            for p in self.points
+            if isinstance(p, dict)
+        ]
+        pts = [(lon, lat) for lon, lat in pts if lon is not None and lat is not None]
+        if len(pts) < 3:
+            return
+        c = self.canv
+        w, h, pad = self.width, self.height, 8*mm
+        min_lon, max_lon = min(x for x, _ in pts), max(x for x, _ in pts)
+        min_lat, max_lat = min(y for _, y in pts), max(y for _, y in pts)
+        span_lon = max(max_lon - min_lon, 0.000001)
+        span_lat = max(max_lat - min_lat, 0.000001)
+
+        def xy(lon, lat):
+            x = pad + ((lon - min_lon) / span_lon) * (w - 2 * pad)
+            y = pad + ((lat - min_lat) / span_lat) * (h - 2 * pad)
+            return x, y
+
+        mapped = [xy(lon, lat) for lon, lat in pts]
+        c.setFillColor(colors.HexColor("#F8FBFC"))
+        c.setStrokeColor(colors.HexColor("#D8E4EA"))
+        c.roundRect(0, 0, w, h, 4*mm, stroke=1, fill=1)
+        path = c.beginPath()
+        path.moveTo(mapped[0][0], mapped[0][1])
+        for x, y in mapped[1:]:
+            path.lineTo(x, y)
+        path.close()
+        c.setFillColor(colors.Color(43/255, 108/255, 176/255, alpha=0.14))
+        c.setStrokeColor(colors.HexColor("#2B6CB0"))
+        c.setLineWidth(1.5)
+        c.drawPath(path, stroke=1, fill=1)
+        c.setFillColor(colors.HexColor("#2B6CB0"))
+        for idx, (x, y) in enumerate(mapped, 1):
+            c.circle(x, y, 2.2, stroke=0, fill=1)
+            c.setFillColor(colors.HexColor("#173B52"))
+            c.setFont("Helvetica", 6)
+            c.drawString(x + 3, y + 3, str(idx))
+            c.setFillColor(colors.HexColor("#2B6CB0"))
+        lon_c = as_float(self.center.get("lon"))
+        lat_c = as_float(self.center.get("lat"))
+        if lon_c is not None and lat_c is not None:
+            x, y = xy(lon_c, lat_c)
+            c.setStrokeColor(colors.HexColor("#C2410C"))
+            c.setLineWidth(1.2)
+            c.line(x - 3, y, x + 3, y)
+            c.line(x, y - 3, x, y + 3)
+
+
 def build_pdf_bytes(report):
     if not REPORTLAB_AVAILABLE:
         return json.dumps({"error": "PDF generation not available"}, ensure_ascii=False).encode("utf-8")
@@ -4226,6 +4627,7 @@ def build_pdf_bytes(report):
             data.get("pledges"),
             data.get("cadNumber") or data.get("area"),
             data.get("geo_center"),
+            data.get("_normalized"),
         ])
 
         # Детали — только если нет расширенных данных
@@ -4287,7 +4689,14 @@ def build_pdf_bytes(report):
                         summary_cell.append(Paragraph(p(" | ".join(parts)), styles["Z_Detail"]))
             # ЕГРН объект
             if data.get("cadNumber") or data.get("area") or data.get("objType_text"):
+                norm = data.get("_normalized") if isinstance(data.get("_normalized"), dict) else {}
                 egrn_parts = []
+                if norm.get("kind") == "premises":
+                    egrn_parts.append("Объект является помещением/квартирой. Кадастровая схема участка не запрашивалась, так как для помещений она обычно не даёт дополнительных юридически значимых данных.")
+                for f in (norm.get("userFields") or [])[:18]:
+                    egrn_parts.append(f"{f.get('label')}: {f.get('value')}")
+                for warn in (norm.get("warnings") or [])[:6]:
+                    egrn_parts.append(f"Предупреждение: {warn}")
                 if data.get("cadNumber"): egrn_parts.append(f"Кад. номер: {data['cadNumber']}")
                 if data.get("objType_text"): egrn_parts.append(f"Тип: {data['objType_text']}")
                 if data.get("area"): egrn_parts.append(f"Площадь: {data['area']} кв.м")
@@ -4323,24 +4732,51 @@ def build_pdf_bytes(report):
                             if enc_d: row.append(f"дата: {enc_d}")
                             if enc_n: row.append(f"номер: {enc_n}")
                             egrn_parts.append(" | ".join(row))
+                if norm.get("oldNumbers"):
+                    egrn_parts.append(f"Старые номера: {json.dumps(norm.get('oldNumbers'), ensure_ascii=False)[:500]}")
+                if data.get("_request_meta"):
+                    egrn_parts.append(f"Технические данные запроса: {json.dumps(data.get('_request_meta'), ensure_ascii=False)}")
                 for ep in egrn_parts:
                     summary_cell.append(Paragraph(p(ep), styles["Z_Detail"]))
             # Геоданные
-            if data.get("geo_center"):
-                gc = data["geo_center"]
+            if data.get("_nspd_skipped_reason"):
+                summary_cell.append(Paragraph(p(data.get("_nspd_skipped_reason")), styles["Z_Detail"]))
+            if data.get("geo_center") or data.get("_normalized"):
+                norm = data.get("_normalized") if isinstance(data.get("_normalized"), dict) else {}
+                gc = data.get("geo_center") or {}
                 obj = data.get("object") or {}
                 geo_parts = []
+                for f in (norm.get("userFields") or [])[:14]:
+                    geo_parts.append(f"{f.get('label')}: {f.get('value')}")
+                for warn in (norm.get("warnings") or [])[:4]:
+                    geo_parts.append(f"Предупреждение: {warn}")
                 if obj.get("address"): geo_parts.append(f"Адрес: {format_registry_value(obj.get('address'))[:100]}")
                 if obj.get("cad_cost"): geo_parts.append(f"Кад. стоимость: {rub(obj['cad_cost'])}")
                 if obj.get("year_built"): geo_parts.append(f"Год постройки: {obj['year_built']}")
-                if gc.get("lat") and gc.get("lon"):
+                if isinstance(gc, dict) and gc.get("lat") and gc.get("lon"):
                     geo_parts.append(f"Координаты: {gc['lat']}, {gc['lon']}")
                     geo_parts.append(f"Карта: https://yandex.ru/maps/?ll={gc['lon']},{gc['lat']}&z=17&pt={gc['lon']},{gc['lat']},pm2rdm")
-                points = data.get("geo_points")
+                points = (norm.get("points") or data.get("geo_points"))
                 if isinstance(points, list) and points:
                     geo_parts.append(f"Точек кадастрового контура: {len(points)}")
                 for gp in geo_parts:
                     summary_cell.append(Paragraph(p(gp), styles["Z_Detail"]))
+                if data.get("_request_meta"):
+                    summary_cell.append(Paragraph(p(f"Технические данные запроса: {json.dumps(data.get('_request_meta'), ensure_ascii=False)}"), styles["Z_Detail"]))
+                if norm.get("geometryType") == "Polygon" and isinstance(points, list) and len(points) >= 3:
+                    summary_cell.append(Paragraph(p("Кадастровая схема участка:"), styles["Z_Detail"]))
+                    summary_cell.append(ParcelSketchFlowable(points, norm.get("center") or gc))
+                    coord_rows = [["№", "Долгота", "Широта"]]
+                    for idx, point in enumerate(points[:30], 1):
+                        coord_rows.append([str(idx), f"{as_float(point.get('lon')):.8f}", f"{as_float(point.get('lat')):.8f}"])
+                    ct = Table(coord_rows, colWidths=[12*mm, 42*mm, 42*mm])
+                    ct.setStyle(TableStyle([
+                        ("GRID",(0,0),(-1,-1),0.25,colors.HexColor("#D8E4EA")),
+                        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#EEF5F8")),
+                        ("FONTNAME",(0,0),(-1,-1),font),
+                        ("FONTSIZE",(0,0),(-1,-1),7),
+                    ]))
+                    summary_cell.append(ct)
 
         row = [[title_cell, status_cell, summary_cell]]
         rt = Table(row, colWidths=[52*mm, 18*mm, 104*mm])
